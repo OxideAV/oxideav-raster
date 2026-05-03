@@ -406,8 +406,10 @@ impl Renderer {
     ) {
         // Build a rectangle for the image's user-space bounds, fill
         // it with NonZero, then sample the embedded frame as the
-        // paint source. The actual texture sampling implementation
-        // is nearest-neighbour; bilinear is round 2.
+        // paint source. Sampling filter is configurable on the
+        // [`Renderer`] — defaults to bilinear, with nearest-neighbour
+        // available for callers that want pixel-perfect block
+        // replication.
         let rect_path = rect_to_path(img.bounds);
         let local = transform.compose(&img.transform);
         let contours = flatten_path(&rect_path.commands, &local);
@@ -429,6 +431,7 @@ impl Renderer {
         };
         let bounds = img.bounds;
         let frame = img.frame.clone();
+        let filter = self.image_filter;
         composite_rgba_premultiplied(
             buf,
             stride,
@@ -440,7 +443,10 @@ impl Renderer {
             group_opacity,
             move |x, y| {
                 let user = inv.apply(oxideav_core::Point::new(x as f32 + 0.5, y as f32 + 0.5));
-                sample_image_nearest(&frame, &bounds, user.x, user.y)
+                match filter {
+                    ImageFilter::Nearest => sample_image_nearest(&frame, &bounds, user.x, user.y),
+                    ImageFilter::Bilinear => sample_image_bilinear(&frame, &bounds, user.x, user.y),
+                }
             },
         );
     }
@@ -607,40 +613,133 @@ fn invert_2d(t: &Transform2D) -> Option<Transform2D> {
 /// done in the image's user-space rectangle. Out-of-bounds returns
 /// transparent.
 fn sample_image_nearest(frame: &VideoFrame, bounds: &Rect, ux: f32, uy: f32) -> Rgba {
-    if bounds.width <= 0.0 || bounds.height <= 0.0 {
+    let info = match prepare_image_sample(frame, bounds, ux, uy) {
+        Some(i) => i,
+        None => return Rgba::new(0, 0, 0, 0),
+    };
+    let px = ((info.u * info.width as f32).floor() as i64).clamp(0, info.width as i64 - 1) as usize;
+    let py =
+        ((info.v * info.height as f32).floor() as i64).clamp(0, info.height as i64 - 1) as usize;
+    let i = py * info.stride + px * 4;
+    Rgba::new(
+        info.data[i],
+        info.data[i + 1],
+        info.data[i + 2],
+        info.data[i + 3],
+    )
+}
+
+/// Bilinear sample of an `Rgba` `VideoFrame`. Samples in
+/// premultiplied-alpha space (so the colour stays meaningful when one
+/// of the 4 taps is fully transparent), then un-premultiplies for the
+/// straight-alpha return.
+///
+/// Uses *clamp-to-edge* for samples whose 2×2 footprint extends past
+/// the texture boundary, matching CSS / SVG default sampling.
+/// Out-of-bounds (the user point is outside `bounds`) returns
+/// transparent — same as the nearest-neighbour path.
+fn sample_image_bilinear(frame: &VideoFrame, bounds: &Rect, ux: f32, uy: f32) -> Rgba {
+    let info = match prepare_image_sample(frame, bounds, ux, uy) {
+        Some(i) => i,
+        None => return Rgba::new(0, 0, 0, 0),
+    };
+    // Continuous texture coordinate where integer values land on pixel
+    // centres. (u * width) - 0.5 gives the position relative to the
+    // pixel-centre grid.
+    let tx = info.u * info.width as f32 - 0.5;
+    let ty = info.v * info.height as f32 - 0.5;
+    let x0 = tx.floor() as i64;
+    let y0 = ty.floor() as i64;
+    let x1 = x0 + 1;
+    let y1 = y0 + 1;
+    let wx = (tx - x0 as f32).clamp(0.0, 1.0);
+    let wy = (ty - y0 as f32).clamp(0.0, 1.0);
+    let cx0 = x0.clamp(0, info.width as i64 - 1) as usize;
+    let cx1 = x1.clamp(0, info.width as i64 - 1) as usize;
+    let cy0 = y0.clamp(0, info.height as i64 - 1) as usize;
+    let cy1 = y1.clamp(0, info.height as i64 - 1) as usize;
+    let p00 = fetch_premul(info.data, info.stride, cx0, cy0);
+    let p10 = fetch_premul(info.data, info.stride, cx1, cy0);
+    let p01 = fetch_premul(info.data, info.stride, cx0, cy1);
+    let p11 = fetch_premul(info.data, info.stride, cx1, cy1);
+    let w00 = (1.0 - wx) * (1.0 - wy);
+    let w10 = wx * (1.0 - wy);
+    let w01 = (1.0 - wx) * wy;
+    let w11 = wx * wy;
+    let lerp4 = |a: f32, b: f32, c: f32, d: f32| -> f32 { a * w00 + b * w10 + c * w01 + d * w11 };
+    let pr = lerp4(p00.0, p10.0, p01.0, p11.0);
+    let pg = lerp4(p00.1, p10.1, p01.1, p11.1);
+    let pb = lerp4(p00.2, p10.2, p01.2, p11.2);
+    let pa = lerp4(p00.3, p10.3, p01.3, p11.3);
+    if pa <= 0.5 {
         return Rgba::new(0, 0, 0, 0);
+    }
+    // Un-premultiply for straight-alpha return.
+    let inv = 255.0 / pa;
+    Rgba::new(
+        (pr * inv).round().clamp(0.0, 255.0) as u8,
+        (pg * inv).round().clamp(0.0, 255.0) as u8,
+        (pb * inv).round().clamp(0.0, 255.0) as u8,
+        pa.round().clamp(0.0, 255.0) as u8,
+    )
+}
+
+/// Fetch a single texel and convert to premultiplied-alpha floats.
+#[inline]
+fn fetch_premul(data: &[u8], stride: usize, x: usize, y: usize) -> (f32, f32, f32, f32) {
+    let i = y * stride + x * 4;
+    let r = data[i] as f32;
+    let g = data[i + 1] as f32;
+    let b = data[i + 2] as f32;
+    let a = data[i + 3] as f32;
+    let pm = a / 255.0;
+    (r * pm, g * pm, b * pm, a)
+}
+
+struct ImageSampleInfo<'a> {
+    data: &'a [u8],
+    stride: usize,
+    width: u32,
+    height: u32,
+    u: f32,
+    v: f32,
+}
+
+/// Common bookkeeping for both samplers: validate the frame, project
+/// the user-space point into the `[0, 1]` UV square, and reject
+/// out-of-bounds reads.
+fn prepare_image_sample<'a>(
+    frame: &'a VideoFrame,
+    bounds: &Rect,
+    ux: f32,
+    uy: f32,
+) -> Option<ImageSampleInfo<'a>> {
+    if bounds.width <= 0.0 || bounds.height <= 0.0 {
+        return None;
     }
     let u = (ux - bounds.x) / bounds.width;
     let v = (uy - bounds.y) / bounds.height;
     if !(0.0..=1.0).contains(&u) || !(0.0..=1.0).contains(&v) {
-        return Rgba::new(0, 0, 0, 0);
+        return None;
     }
-    let plane = match frame.planes.first() {
-        Some(p) => p,
-        None => return Rgba::new(0, 0, 0, 0),
-    };
+    let plane = frame.planes.first()?;
     let stride = plane.stride;
     if stride < 4 {
-        return Rgba::new(0, 0, 0, 0);
+        return None;
     }
-    // Infer width / height from the buffer length and stride. The
-    // frame doesn't carry width/height directly; compute height from
-    // the plane data and assume the caller-supplied stride is
-    // `width * 4` for packed Rgba.
     let width = (stride / 4) as u32;
     let height = (plane.data.len() / stride) as u32;
     if width == 0 || height == 0 {
-        return Rgba::new(0, 0, 0, 0);
+        return None;
     }
-    let px = ((u * width as f32).floor() as i64).clamp(0, width as i64 - 1) as usize;
-    let py = ((v * height as f32).floor() as i64).clamp(0, height as i64 - 1) as usize;
-    let i = py * stride + px * 4;
-    Rgba::new(
-        plane.data[i],
-        plane.data[i + 1],
-        plane.data[i + 2],
-        plane.data[i + 3],
-    )
+    Some(ImageSampleInfo {
+        data: &plane.data,
+        stride,
+        width,
+        height,
+        u,
+        v,
+    })
 }
 
 /// Convenience: rasterize a [`VectorFrame`] using the renderer's

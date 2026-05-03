@@ -45,9 +45,15 @@ use oxideav_core::Transform2D;
 /// `rgba` is `width * height * 4` bytes of packed straight-alpha RGBA.
 #[derive(Debug, Clone)]
 pub struct RasterizedSubtree {
+    /// Bitmap width in pixels.
     pub width: u32,
+    /// Bitmap height in pixels.
     pub height: u32,
+    /// Packed straight-alpha RGBA, `width * height * 4` bytes.
     pub rgba: Vec<u8>,
+    /// Effective transform at the moment the bitmap was rasterised —
+    /// kept so debug tooling can confirm the cache key really matches
+    /// the geometry that produced the bitmap.
     pub transform_at_cache_time: Transform2D,
 }
 
@@ -55,9 +61,15 @@ pub struct RasterizedSubtree {
 /// [`crate::Renderer::cache_stats`] for testing and tuning.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CacheStats {
+    /// Number of `get` calls that returned a cached entry.
     pub hits: u64,
+    /// Number of `get` calls that did not find an entry (and the
+    /// associated put-on-miss).
     pub misses: u64,
+    /// Current number of entries in the cache.
     pub entries: usize,
+    /// Maximum number of entries the cache will hold before evicting
+    /// the LRU.
     pub capacity: usize,
 }
 

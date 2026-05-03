@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Bilinear image resampling for `Node::Image`. Selectable via
+  `Renderer::image_filter: ImageFilter`; defaults to
+  `ImageFilter::Bilinear` (matching CSS `image-rendering: auto` and the
+  SVG spec). `ImageFilter::Nearest` retains the round-1 block-replication
+  behaviour for callers that want pixel-perfect sprite rendering.
+  Bilinear samples in premultiplied-alpha space and uses clamp-to-edge
+  for the 2×2 footprint at texture boundaries. Lanczos2 is queued for
+  round 3+.
 - Bitmap cache for memoised group subtrees. When a
   [`Group`](oxideav_core::Group) carries `cache_key: Some(k)`, the
   rendered children are stored under `mix64(k, transform_signature)`
