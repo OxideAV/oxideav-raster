@@ -7,17 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Reverted
-
-- `Node::SoftMask` render path (commit `26d3198`). Reverted because it
-  imports `oxideav_core::MaskKind` and matches on the `Node::SoftMask`
-  variant, which exist on `oxideav-core` master (added by `ec66ef0`)
-  but are not yet on crates.io (latest published is 0.1.15). The
-  render path will be re-applied in a follow-up commit once a
-  published `oxideav-core` exposes those types.
-
 ### Added
 
+- `Node::SoftMask` render path — luminance + alpha mask kinds. The
+  `mask` subtree is rasterised to its own offscreen RGBA buffer and
+  reduced to a per-pixel coverage byte (BT.709 luminance for
+  `MaskKind::Luminance`, the mask's own alpha for `MaskKind::Alpha`);
+  the `content` subtree is then blitted onto the destination with
+  that coverage as a per-pixel alpha modulator. Covers SVG `<mask>`
+  and PDF `SMask` (subtype `Luminosity` vs. `Alpha`). Requires the
+  `Node::SoftMask` variant + `MaskKind` enum landed alongside in
+  `oxideav-core`.
 - Off-centre focal radial gradients (SVG 1.1 §13.2.4 / PDF Type 3
   axial radial). `eval_radial_gradient` now solves the standard
   quadratic in `t` for the unique circle (centre on the focal→centre
