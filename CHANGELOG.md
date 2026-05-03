@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Bitmap cache for memoised group subtrees. When a
+  [`Group`](oxideav_core::Group) carries `cache_key: Some(k)`, the
+  rendered children are stored under `mix64(k, transform_signature)`
+  so a re-render at the same effective transform returns the cached
+  bitmap. Capacity-bounded LRU (default 256 entries; configurable via
+  `Renderer::with_cache_capacity`); thread-safe behind `Arc<Mutex<…>>`
+  so the cache survives `Renderer::clone()`. Cache hits / misses /
+  occupancy are observable through `Renderer::cache_stats()`. Designed
+  to consume scribe's `Group { cache_key: Some(deterministic_hash(face,
+  glyph, size, subpixel)) }` glyph wrappers (#357).
+
+### Initial release
+
 - Initial release: pure-Rust vector→raster rendering kernel.
 - Path flattening: quadratic + cubic de Casteljau subdivision; SVG
   elliptic-arc → cubic-Bezier conversion (Appendix F.6.5).

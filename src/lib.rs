@@ -31,28 +31,29 @@
 //! that ship here in generalised form), but every module is a fresh
 //! implementation that does not depend on `oxideav-scribe`.
 //!
-//! # Round-1 scope
-//!
-//! Implemented:
+//! # Implemented
 //!
 //! * paths (move / line / quad / cubic / arc / close),
 //! * fill (even-odd + non-zero) with configurable supersampling,
 //! * stroke geometry (Butt/Round/Square caps, Miter/Round/Bevel joins,
 //!   dash patterns, miter limit),
-//! * linear + radial gradients (sRGB interpolation, Pad/Reflect/Repeat),
+//! * linear + radial gradients (sRGB interpolation, Pad/Reflect/Repeat
+//!   spread, off-centre focal),
 //! * single-path clip,
 //! * group opacity,
-//! * embedded raster images (`Node::Image`) painted into the canvas
-//!   via nearest-neighbour sampling (round 2 will add bilinear).
+//! * embedded raster images (`Node::Image`) — nearest-neighbour or
+//!   bilinear sampling, configurable via [`Renderer::image_filter`],
+//! * bitmap cache for memoised group subtrees (consumes
+//!   [`oxideav_core::Group::cache_key`]),
+//! * soft masks (luminance + alpha) on `Node::SoftMask`.
 //!
-//! Deferred to round 2:
+//! Deferred to a later round:
 //!
 //! * filters (Gaussian blur, drop shadow, feColorMatrix, etc.),
 //! * `<pattern>` paints,
-//! * soft masks (luminance / alpha),
 //! * full color-managed pipeline (ICC, gamma 2.2 / linear blending —
-//!   round 1 mixes in non-linear sRGB space),
-//! * bilinear / cubic image resampling,
+//!   the rasterizer mixes in non-linear sRGB space today),
+//! * Lanczos2 / bicubic image resampling,
 //! * patterned dashes interacting with miter / round joins beyond
 //!   single-segment dashes.
 
@@ -60,6 +61,7 @@
 #![warn(missing_docs)]
 #![allow(clippy::too_many_arguments)]
 
+mod cache;
 mod composite;
 mod fill;
 mod flatten;
@@ -68,12 +70,13 @@ mod paint;
 mod renderer;
 mod stroke;
 
+pub use cache::{CacheStats, RasterizedSubtree};
 pub use composite::composite_rgba_premultiplied;
 pub use fill::{rasterize_fill, AlphaMask};
 pub use flatten::{flatten_arc_to_cubics, flatten_path, FlatContour};
 pub use gradient::{eval_linear_gradient, eval_radial_gradient};
 pub use paint::sample_paint;
-pub use renderer::{rasterize, Renderer};
+pub use renderer::{rasterize, ImageFilter, Renderer, DEFAULT_CACHE_CAPACITY};
 pub use stroke::stroke_to_fill_path;
 
 use oxideav_core::Rgba;

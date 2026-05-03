@@ -8,6 +8,7 @@ use oxideav_core::{
     VectorFrame, VideoFrame, VideoPlane,
 };
 
+use crate::cache::{composite_key, CacheStats, RasterizedSubtree, SharedCache};
 use crate::composite::composite_rgba_premultiplied;
 use crate::fill::{rasterize_fill, AlphaMask};
 use crate::flatten::{flatten_path, FlatContour};
@@ -20,6 +21,12 @@ use crate::stroke::stroke_to_fill_path;
 /// scene walk; returns the buffer wrapped in a
 /// [`VideoFrame`](oxideav_core::VideoFrame) at the end of
 /// [`Renderer::render`].
+///
+/// Holds a thread-safe bitmap cache shared across `render` calls — when
+/// a [`Group`](oxideav_core::Group) carries a `cache_key` the rendered
+/// children are memoised so a long-lived `Renderer` (subtitle compositor,
+/// scene renderer) avoids re-rasterising the same glyph / decorative
+/// subtree on every frame. See [`Renderer::with_cache_capacity`].
 #[derive(Debug, Clone)]
 pub struct Renderer {
     /// Output canvas width in pixels.
@@ -36,12 +43,38 @@ pub struct Renderer {
     pub subpixel_positioning: bool,
     /// Initial canvas clear color. Defaults to fully transparent.
     pub background: Rgba,
+    /// Texture sampling filter for `Node::Image` paints. Defaults to
+    /// [`ImageFilter::Bilinear`]; nearest-neighbour is available for
+    /// callers that explicitly want pixel-perfect block-replication.
+    pub image_filter: ImageFilter,
+    /// Bitmap cache for memoised group subtrees. Shared via
+    /// `Arc<Mutex<...>>` so the cache survives `Clone`, and so the
+    /// cache lookup remains coherent across the scene walk's
+    /// (otherwise immutable) `&self` borrow.
+    cache: SharedCache,
 }
+
+/// Texture sampling filter for `Node::Image` paints.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ImageFilter {
+    /// Nearest-neighbour. Pixel-perfect block-replication; aliasing
+    /// for non-integer scales but useful for low-resolution sprite
+    /// rendering.
+    Nearest,
+    /// Bilinear. 4-tap weighted by sub-pixel position; the default,
+    /// matching CSS `image-rendering: auto` and the SVG spec.
+    #[default]
+    Bilinear,
+}
+
+/// Default cache capacity (entries) when none is specified.
+pub const DEFAULT_CACHE_CAPACITY: usize = 256;
 
 impl Renderer {
     /// Build a renderer for the given destination size with sane
     /// defaults (`supersampling = 4`, transparent background, no
-    /// sub-pixel positioning).
+    /// sub-pixel positioning, bilinear image filtering, 256-entry
+    /// bitmap cache).
     pub fn new(width: u32, height: u32) -> Self {
         Self {
             width,
@@ -49,7 +82,35 @@ impl Renderer {
             supersampling: 4,
             subpixel_positioning: false,
             background: Rgba::new(0, 0, 0, 0),
+            image_filter: ImageFilter::default(),
+            cache: SharedCache::with_capacity(DEFAULT_CACHE_CAPACITY),
         }
+    }
+
+    /// Build a renderer with the bitmap cache sized to `capacity`
+    /// entries. Useful for long-lived consumers (subtitle compositor,
+    /// scene renderer) that want to widen the cache footprint, or for
+    /// short-lived one-shot renders that want to disable it
+    /// (`capacity = 1` keeps the smallest possible LRU; the cache
+    /// itself never disables — `Group::cache_key = None` is the
+    /// per-node opt-out).
+    pub fn with_cache_capacity(width: u32, height: u32, capacity: usize) -> Self {
+        Self {
+            cache: SharedCache::with_capacity(capacity),
+            ..Self::new(width, height)
+        }
+    }
+
+    /// Snapshot the cache's hit / miss / occupancy statistics. Useful
+    /// for tests and tuning.
+    pub fn cache_stats(&self) -> CacheStats {
+        self.cache.stats()
+    }
+
+    /// Reset the cache's hit / miss counters. The cached entries are
+    /// preserved; only the running tallies are zeroed.
+    pub fn reset_cache_stats(&self) {
+        self.cache.reset_stats();
     }
 
     /// Render a [`VectorFrame`] into a packed `Rgba` `VideoFrame`.
@@ -83,7 +144,7 @@ impl Renderer {
         } else {
             Transform2D::identity()
         };
-        self.draw_group(&frame.root, initial, &mut buf, stride, None);
+        self.draw_group(&frame.root, initial, 1.0, &mut buf, stride, None);
         VideoFrame {
             pts: frame.pts,
             planes: vec![VideoPlane { stride, data: buf }],
@@ -119,11 +180,39 @@ impl Renderer {
         &self,
         g: &Group,
         parent_transform: Transform2D,
+        parent_opacity: f32,
         buf: &mut [u8],
         stride: usize,
         clip_mask: Option<&AlphaMask>,
     ) {
         let local = parent_transform.compose(&g.transform);
+        // Bitmap-cache fast path: when the group is tagged with a
+        // `cache_key`, memoise its rendered children under
+        // `composite_key(g.cache_key, local)` so a re-render at the
+        // same effective transform reuses the prior bitmap. The cache
+        // bakes in the group's *own* opacity (`g.opacity`) but never
+        // the parent's, so parent-opacity changes don't invalidate the
+        // cache; the parent's clip mask is also applied at blit time
+        // (not baked in) for the same reason.
+        if let Some(key) = g.cache_key {
+            let composite = composite_key(key, &local);
+            let bitmap = match self.cache.get(composite) {
+                Some(b) => b,
+                None => self.render_group_offscreen(g, local, composite),
+            };
+            blit_rgba_over(
+                buf,
+                stride,
+                self.width,
+                self.height,
+                &bitmap.rgba,
+                bitmap.width,
+                bitmap.height,
+                clip_mask,
+                parent_opacity,
+            );
+            return;
+        }
         // Build the group's own clip mask if it has one. The clip
         // mask is filled with NonZero of the clip path under the
         // *current* (post-transform) coordinate system, intersected
@@ -147,9 +236,49 @@ impl Renderer {
         } else {
             clip_mask
         };
+        let combined = parent_opacity * g.opacity;
         for child in &g.children {
-            self.draw_node(child, local, g.opacity, buf, stride, effective_clip);
+            self.draw_node(child, local, combined, buf, stride, effective_clip);
         }
+    }
+
+    /// Render `g`'s children onto a fresh canvas-sized RGBA buffer at
+    /// `local` transform, with `g.opacity` as the modulator and the
+    /// group's own clip path (but no inherited clip — that's applied
+    /// at blit time). Stores the result in the bitmap cache and
+    /// returns a clone for immediate reuse.
+    fn render_group_offscreen(
+        &self,
+        g: &Group,
+        local: Transform2D,
+        composite: u64,
+    ) -> RasterizedSubtree {
+        let stride = (self.width as usize) * 4;
+        let mut off = vec![0u8; stride * (self.height as usize)];
+        // Apply the group's own clip mask only — the parent clip is
+        // handled at blit time.
+        let group_clip_storage: Option<AlphaMask> = g.clip.as_ref().map(|clip_path| {
+            let cs = flatten_path(&clip_path.commands, &local);
+            rasterize_fill(
+                &cs,
+                self.width,
+                self.height,
+                FillRule::NonZero,
+                self.supersampling,
+            )
+        });
+        let effective_clip = group_clip_storage.as_ref();
+        for child in &g.children {
+            self.draw_node(child, local, g.opacity, &mut off, stride, effective_clip);
+        }
+        let subtree = RasterizedSubtree {
+            width: self.width,
+            height: self.height,
+            rgba: off,
+            transform_at_cache_time: local,
+        };
+        self.cache.put(composite, subtree.clone());
+        subtree
     }
 
     fn draw_node(
@@ -164,14 +293,7 @@ impl Renderer {
         match node {
             Node::Path(p) => self.draw_path(p, transform, group_opacity, buf, stride, clip_mask),
             Node::Group(g) => {
-                // Compose group opacity with our own. (Each call's
-                // `group_opacity` is the *parent* group's opacity;
-                // inside this group, children get the multiplied
-                // value.)
-                let combined = group_opacity * g.opacity;
-                let mut child = g.clone();
-                child.opacity = combined;
-                self.draw_group(&child, transform, buf, stride, clip_mask);
+                self.draw_group(g, transform, group_opacity, buf, stride, clip_mask);
             }
             Node::Image(img) => {
                 self.draw_image(img, transform, group_opacity, buf, stride, clip_mask)
@@ -347,6 +469,97 @@ fn build_stroke_geometry(
         out.extend(stroke_to_fill_path(c, stroke, width_px));
     }
     out
+}
+
+/// Blit a packed straight-alpha RGBA source buffer over an RGBA
+/// destination using premultiplied source-over.
+///
+/// `clip_mask` (when `Some`) further multiplies the source alpha
+/// per-pixel; `extra_alpha` (in `0.0..=1.0`) modulates the source
+/// alpha globally (used for parent group opacity). The source and
+/// destination share the same canvas size and stride; the blit
+/// touches only pixels where the source alpha (after clip + extra)
+/// is non-zero.
+fn blit_rgba_over(
+    dst: &mut [u8],
+    dst_stride: usize,
+    dst_width: u32,
+    dst_height: u32,
+    src: &[u8],
+    src_width: u32,
+    src_height: u32,
+    clip_mask: Option<&AlphaMask>,
+    extra_alpha: f32,
+) {
+    if src_width == 0 || src_height == 0 {
+        return;
+    }
+    let extra = extra_alpha.clamp(0.0, 1.0);
+    let extra_q = (extra * 255.0).round() as u32;
+    if extra_q == 0 {
+        return;
+    }
+    let w = src_width.min(dst_width) as usize;
+    let h = src_height.min(dst_height) as usize;
+    let src_stride = (src_width as usize) * 4;
+    for y in 0..h {
+        let dst_row = y * dst_stride;
+        let src_row = y * src_stride;
+        for x in 0..w {
+            let si = src_row + x * 4;
+            let sa_raw = src[si + 3] as u32;
+            if sa_raw == 0 {
+                continue;
+            }
+            let cov = match clip_mask {
+                Some(c) => c.get(x as u32, y as u32) as u32,
+                None => 255,
+            };
+            if cov == 0 {
+                continue;
+            }
+            // src_alpha = sa_raw * cov * extra / (255 * 255)
+            let combined = (sa_raw * cov * extra_q + (255 * 255 / 2)) / (255 * 255);
+            if combined == 0 {
+                continue;
+            }
+            let sa = combined;
+            // Promote source RGB into premultiplied space (src is
+            // straight-alpha at sa_raw — re-premultiply with the
+            // *combined* alpha so the over operator behaves).
+            let sr = (src[si] as u32 * sa + 127) / 255;
+            let sg = (src[si + 1] as u32 * sa + 127) / 255;
+            let sb = (src[si + 2] as u32 * sa + 127) / 255;
+
+            let pidx = dst_row + x * 4;
+            let dr0 = dst[pidx] as u32;
+            let dg0 = dst[pidx + 1] as u32;
+            let db0 = dst[pidx + 2] as u32;
+            let da0 = dst[pidx + 3] as u32;
+            let dr = (dr0 * da0 + 127) / 255;
+            let dg = (dg0 * da0 + 127) / 255;
+            let db = (db0 * da0 + 127) / 255;
+
+            let inv = 255 - sa;
+            let or = sr + (dr * inv + 127) / 255;
+            let og = sg + (dg * inv + 127) / 255;
+            let ob = sb + (db * inv + 127) / 255;
+            let oa = sa + (da0 * inv + 127) / 255;
+            let (or_s, og_s, ob_s) = if oa == 0 {
+                (0u32, 0u32, 0u32)
+            } else {
+                (
+                    ((or * 255 + oa / 2) / oa).min(255),
+                    ((og * 255 + oa / 2) / oa).min(255),
+                    ((ob * 255 + oa / 2) / oa).min(255),
+                )
+            };
+            dst[pidx] = or_s as u8;
+            dst[pidx + 1] = og_s as u8;
+            dst[pidx + 2] = ob_s as u8;
+            dst[pidx + 3] = oa.min(255) as u8;
+        }
+    }
 }
 
 /// Intersect two alpha masks (per-pixel min). Both must have the same
