@@ -22,8 +22,10 @@ fn rect_node(x: f32, y: f32, w: f32, h: f32, fill: Rgba) -> Node {
 fn group_opacity_half_blends_with_background() {
     // Background: solid blue (renderer's background fill).
     // Foreground: a red rect inside a group with opacity 0.5.
-    let mut group = Group::default();
-    group.opacity = 0.5;
+    let mut group = Group {
+        opacity: 0.5,
+        ..Default::default()
+    };
     group
         .children
         .push(rect_node(0.0, 0.0, 4.0, 4.0, Rgba::opaque(255, 0, 0)));
@@ -67,14 +69,18 @@ fn group_opacity_half_blends_with_background() {
 fn nested_group_opacities_multiply() {
     // outer.opacity = 0.5, inner.opacity = 0.5 → effective alpha 0.25
     // for the red rect over a transparent background.
-    let mut inner = Group::default();
-    inner.opacity = 0.5;
+    let mut inner = Group {
+        opacity: 0.5,
+        ..Default::default()
+    };
     inner
         .children
         .push(rect_node(0.0, 0.0, 2.0, 2.0, Rgba::opaque(255, 0, 0)));
 
-    let mut outer = Group::default();
-    outer.opacity = 0.5;
+    let mut outer = Group {
+        opacity: 0.5,
+        ..Default::default()
+    };
     outer.children.push(Node::Group(inner));
 
     let mut root = Group::default();
