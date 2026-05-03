@@ -217,8 +217,7 @@ impl Renderer {
         // mask is filled with NonZero of the clip path under the
         // *current* (post-transform) coordinate system, intersected
         // with whatever clip mask is being inherited.
-        let mut group_clip_storage: Option<AlphaMask> = None;
-        let effective_clip: Option<&AlphaMask> = if let Some(clip_path) = &g.clip {
+        let group_clip_storage: Option<AlphaMask> = g.clip.as_ref().map(|clip_path| {
             let cs = flatten_path(&clip_path.commands, &local);
             let m = rasterize_fill(
                 &cs,
@@ -227,15 +226,12 @@ impl Renderer {
                 FillRule::NonZero,
                 self.supersampling,
             );
-            let intersected = match clip_mask {
+            match clip_mask {
                 Some(parent) => intersect_masks(parent, &m),
                 None => m,
-            };
-            group_clip_storage = Some(intersected);
-            group_clip_storage.as_ref()
-        } else {
-            clip_mask
-        };
+            }
+        });
+        let effective_clip: Option<&AlphaMask> = group_clip_storage.as_ref().or(clip_mask);
         let combined = parent_opacity * g.opacity;
         for child in &g.children {
             self.draw_node(child, local, combined, buf, stride, effective_clip);
@@ -615,15 +611,15 @@ fn blit_rgba_over(
             let og = sg + (dg * inv + 127) / 255;
             let ob = sb + (db * inv + 127) / 255;
             let oa = sa + (da0 * inv + 127) / 255;
-            let (or_s, og_s, ob_s) = if oa == 0 {
-                (0u32, 0u32, 0u32)
-            } else {
-                (
-                    ((or * 255 + oa / 2) / oa).min(255),
-                    ((og * 255 + oa / 2) / oa).min(255),
-                    ((ob * 255 + oa / 2) / oa).min(255),
-                )
-            };
+            let or_s = (or * 255 + oa / 2)
+                .checked_div(oa)
+                .map_or(0, |v| v.min(255));
+            let og_s = (og * 255 + oa / 2)
+                .checked_div(oa)
+                .map_or(0, |v| v.min(255));
+            let ob_s = (ob * 255 + oa / 2)
+                .checked_div(oa)
+                .map_or(0, |v| v.min(255));
             dst[pidx] = or_s as u8;
             dst[pidx + 1] = og_s as u8;
             dst[pidx + 2] = ob_s as u8;

@@ -79,6 +79,7 @@ pub use paint::sample_paint;
 pub use renderer::{rasterize, ImageFilter, Renderer, DEFAULT_CACHE_CAPACITY};
 pub use stroke::stroke_to_fill_path;
 
+#[cfg(test)]
 use oxideav_core::Rgba;
 
 /// Premultiply a straight-alpha sRGB color into 16-bit-per-channel
@@ -86,6 +87,7 @@ use oxideav_core::Rgba;
 /// little extra headroom for the multiplications inside the composite
 /// loop.
 #[inline]
+#[cfg(test)]
 fn premultiply(c: Rgba) -> [u16; 4] {
     let a = c.a as u16;
     [
@@ -98,6 +100,7 @@ fn premultiply(c: Rgba) -> [u16; 4] {
 
 /// Reverse the premultiplication. `a == 0` maps to `(0, 0, 0, 0)`.
 #[inline]
+#[cfg(test)]
 fn unpremultiply(c: [u16; 4]) -> Rgba {
     let a = c[3];
     if a == 0 {

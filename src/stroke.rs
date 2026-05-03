@@ -16,11 +16,11 @@
 //!    of "on" sub-polylines.
 //! 2. For each sub-polyline:
 //!    a. Walk forward, offsetting each segment by `+w/2` perpendicular
-//!       to its direction (right-hand normal). Insert a join at every
-//!       interior vertex.
+//!   to its direction (right-hand normal). Insert a join at every
+//!   interior vertex.
 //!    b. Place an end cap.
 //!    c. Walk backward, offsetting by `+w/2` (which on the reversed
-//!       walk lands on the *other* side of the original line).
+//!   walk lands on the *other* side of the original line).
 //!    d. Place a start cap, close.
 //!
 //! For each closed contour:

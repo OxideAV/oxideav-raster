@@ -142,18 +142,16 @@ pub fn flatten_path(commands: &[PathCommand], transform: &Transform2D) -> Vec<Fl
                     pen = *e;
                 }
             }
-            PathCommand::Close => {
-                if have_subpath {
-                    cur.closed = true;
-                    pen = subpath_start;
-                    if cur.points.len() >= 2 {
-                        out.push(std::mem::take(&mut cur));
-                    } else {
-                        cur.points.clear();
-                        cur.closed = false;
-                    }
-                    have_subpath = false;
+            PathCommand::Close if have_subpath => {
+                cur.closed = true;
+                pen = subpath_start;
+                if cur.points.len() >= 2 {
+                    out.push(std::mem::take(&mut cur));
+                } else {
+                    cur.points.clear();
+                    cur.closed = false;
                 }
+                have_subpath = false;
             }
             // `PathCommand` is #[non_exhaustive]; future shorthand
             // variants (smooth-curve, etc.) become a no-op until

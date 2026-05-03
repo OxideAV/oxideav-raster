@@ -261,10 +261,7 @@ impl SharedCache {
     }
 
     pub fn stats(&self) -> CacheStats {
-        self.inner
-            .lock()
-            .map(|g| g.stats())
-            .unwrap_or(CacheStats::default())
+        self.inner.lock().map(|g| g.stats()).unwrap_or_default()
     }
 
     pub fn reset_stats(&self) {
