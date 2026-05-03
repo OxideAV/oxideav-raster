@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `Node::SoftMask` render path — luminance + alpha mask kinds. The
+  `mask` subtree is rasterised to its own offscreen RGBA buffer and
+  reduced to a per-pixel coverage byte (BT.709 luminance for
+  `MaskKind::Luminance`, the mask's own alpha for `MaskKind::Alpha`);
+  the `content` subtree is then blitted onto the destination with
+  that coverage as a per-pixel alpha modulator. Covers SVG `<mask>`
+  and PDF `SMask` (subtype `Luminosity` vs. `Alpha`). Requires the
+  `Node::SoftMask` variant + `MaskKind` enum landed alongside in
+  `oxideav-core`.
 - Off-centre focal radial gradients (SVG 1.1 §13.2.4 / PDF Type 3
   axial radial). `eval_radial_gradient` now solves the standard
   quadratic in `t` for the unique circle (centre on the focal→centre

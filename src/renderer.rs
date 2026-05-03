@@ -4,8 +4,8 @@
 //! See the crate-level docs for the overall pipeline.
 
 use oxideav_core::{
-    FillRule, Frame, Group, ImageRef, Node, Paint, Path, PathNode, Rect, Rgba, Stroke, Transform2D,
-    VectorFrame, VideoFrame, VideoPlane,
+    FillRule, Frame, Group, ImageRef, MaskKind, Node, Paint, Path, PathNode, Rect, Rgba, Stroke,
+    Transform2D, VectorFrame, VideoFrame, VideoPlane,
 };
 
 use crate::cache::{composite_key, CacheStats, RasterizedSubtree, SharedCache};
@@ -298,10 +298,74 @@ impl Renderer {
             Node::Image(img) => {
                 self.draw_image(img, transform, group_opacity, buf, stride, clip_mask)
             }
-            // `Node` is #[non_exhaustive]; future variants
-            // (text, masks, filters) silently no-op until handled.
+            Node::SoftMask {
+                mask,
+                mask_kind,
+                content,
+            } => {
+                self.draw_soft_mask(
+                    mask,
+                    *mask_kind,
+                    content,
+                    transform,
+                    group_opacity,
+                    buf,
+                    stride,
+                    clip_mask,
+                );
+            }
+            // `Node` is #[non_exhaustive]; future variants (text,
+            // filters) silently no-op until handled.
             _ => {}
         }
+    }
+
+    /// Render a soft-mask composite: rasterise `mask` and `content`
+    /// to separate offscreen RGBA buffers, convert the mask buffer to
+    /// a per-pixel coverage byte (luminance-weighted Y or alpha
+    /// channel, per `kind`), then blit the content buffer on top of
+    /// `buf` with that coverage as a per-pixel modulator (multiplied
+    /// in with `group_opacity` and the inherited `clip_mask`).
+    fn draw_soft_mask(
+        &self,
+        mask: &Node,
+        kind: MaskKind,
+        content: &Node,
+        transform: Transform2D,
+        group_opacity: f32,
+        buf: &mut [u8],
+        stride: usize,
+        clip_mask: Option<&AlphaMask>,
+    ) {
+        let off_stride = (self.width as usize) * 4;
+        let cap = off_stride * (self.height as usize);
+        // Rasterise the mask subtree.
+        let mut mask_buf = vec![0u8; cap];
+        self.draw_node(mask, transform, 1.0, &mut mask_buf, off_stride, None);
+        // Rasterise the content subtree.
+        let mut content_buf = vec![0u8; cap];
+        self.draw_node(content, transform, 1.0, &mut content_buf, off_stride, None);
+        // Build a coverage AlphaMask from the mask buffer.
+        let cov = mask_buffer_to_alpha(&mask_buf, self.width, self.height, off_stride, kind);
+        // Intersect with any inherited clip.
+        let cov = match clip_mask {
+            Some(c) => intersect_masks(c, &cov),
+            None => cov,
+        };
+        // Blit content_buf onto buf, modulated by cov (soft-mask
+        // coverage, treated as a per-pixel alpha multiplier exactly
+        // like a clip mask) + group_opacity.
+        blit_rgba_over(
+            buf,
+            stride,
+            self.width,
+            self.height,
+            &content_buf,
+            self.width,
+            self.height,
+            Some(&cov),
+            group_opacity,
+        );
     }
 
     fn draw_path(
@@ -566,6 +630,45 @@ fn blit_rgba_over(
             dst[pidx + 3] = oa.min(255) as u8;
         }
     }
+}
+
+/// Convert a packed RGBA offscreen buffer (the rasterised mask
+/// subtree) into a single-channel coverage [`AlphaMask`].
+///
+/// * [`MaskKind::Luminance`]: Y = 0.2126·R + 0.7152·G + 0.0722·B
+///   (BT.709), then multiplied by the pixel's own alpha so a
+///   transparent mask pixel always contributes zero coverage. Matches
+///   SVG `<mask mask-type="luminance">` (default) and PDF `SMask`
+///   `/Luminosity` semantics.
+/// * [`MaskKind::Alpha`]: the pixel's own alpha channel verbatim.
+///   Matches SVG `<mask mask-type="alpha">` and PDF `SMask` `/Alpha`.
+fn mask_buffer_to_alpha(
+    buf: &[u8],
+    width: u32,
+    height: u32,
+    stride: usize,
+    kind: MaskKind,
+) -> AlphaMask {
+    let mut out = AlphaMask::new(width, height);
+    for y in 0..height {
+        let row = (y as usize) * stride;
+        for x in 0..width {
+            let i = row + (x as usize) * 4;
+            let cov = match kind {
+                MaskKind::Alpha => buf[i + 3],
+                MaskKind::Luminance => {
+                    let r = buf[i] as f32;
+                    let g = buf[i + 1] as f32;
+                    let b = buf[i + 2] as f32;
+                    let a = buf[i + 3] as f32 / 255.0;
+                    let y_val = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+                    (y_val * a).round().clamp(0.0, 255.0) as u8
+                }
+            };
+            out.data[(y * width + x) as usize] = cov;
+        }
+    }
+    out
 }
 
 /// Intersect two alpha masks (per-pixel min). Both must have the same
