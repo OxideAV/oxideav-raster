@@ -1,0 +1,17 @@
+[package]
+name = "oxideav-raster"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+authors = ["Mark Karpeles"]
+description = "Pure-Rust vector→raster rendering kernel for the oxideav framework — path flattening, scanline AA fill, stroke geometry, gradients, clip, group opacity, premultiplied composite"
+repository = "https://github.com/OxideAV/oxideav-raster"
+homepage = "https://github.com/OxideAV/oxideav-raster"
+readme = "README.md"
+keywords = ["graphics", "vector", "rasterizer", "svg", "pure-rust"]
+categories = ["graphics", "rendering", "multimedia::images"]
+
+[dependencies]
+oxideav-core = "0.1"
+oxideav-pixfmt = "0.1"
