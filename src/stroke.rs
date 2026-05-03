@@ -15,13 +15,13 @@
 //! 1. Apply the dash pattern (if any), turning the contour into a list
 //!    of "on" sub-polylines.
 //! 2. For each sub-polyline:
-//!    a. Walk forward, offsetting each segment by `+w/2` perpendicular
-//!   to its direction (right-hand normal). Insert a join at every
-//!   interior vertex.
-//!    b. Place an end cap.
-//!    c. Walk backward, offsetting by `+w/2` (which on the reversed
-//!   walk lands on the *other* side of the original line).
-//!    d. Place a start cap, close.
+//!    - Walk forward, offsetting each segment by `+w/2` perpendicular
+//!      to its direction (right-hand normal). Insert a join at every
+//!      interior vertex.
+//!    - Place an end cap.
+//!    - Walk backward, offsetting by `+w/2` (which on the reversed
+//!      walk lands on the *other* side of the original line).
+//!    - Place a start cap, close.
 //!
 //! For each closed contour:
 //!
