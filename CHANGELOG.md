@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Off-centre focal radial gradients (SVG 1.1 §13.2.4 / PDF Type 3
+  axial radial). `eval_radial_gradient` now solves the standard
+  quadratic in `t` for the unique circle (centre on the focal→centre
+  line, parameterised by `t`) that contains the sample point;
+  degenerates correctly to the centred-radial formula when
+  `focal == center`. SVG-mandated focal-clamp-inside-boundary is
+  applied so the equation always has a real positive root.
 - Bilinear image resampling for `Node::Image`. Selectable via
   `Renderer::image_filter: ImageFilter`; defaults to
   `ImageFilter::Bilinear` (matching CSS `image-rendering: auto` and the

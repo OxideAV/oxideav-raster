@@ -10,7 +10,7 @@
 //! caller is using for raster output (the Renderer applies the active
 //! transform to the gradient endpoints before passing them in).
 
-use oxideav_core::{LinearGradient, RadialGradient, Rgba, SpreadMethod};
+use oxideav_core::{LinearGradient, Point, RadialGradient, Rgba, SpreadMethod};
 
 /// Sample a linear gradient at pixel `(px, py)`.
 pub fn eval_linear_gradient(g: &LinearGradient, px: f32, py: f32) -> Rgba {
@@ -32,12 +32,26 @@ pub fn eval_linear_gradient(g: &LinearGradient, px: f32, py: f32) -> Rgba {
 
 /// Sample a radial gradient at pixel `(px, py)`.
 ///
-/// Implements the SVG 1.1 §13.2.3 algorithm for the *focal point at
-/// the centre* case (`focal == None || focal == center`); the general
-/// off-centre focal case is approximated as the centred-radial
-/// formula when the focal differs from the centre by less than one
-/// radius. Real off-focal SVG (which is rare in practice) is a
-/// round-2 item.
+/// Implements the SVG 1.1 §13.2.4 ("Radial gradients") general
+/// formula: the gradient is parameterised by `t`, where `t = 0` is
+/// the focal point and `t = 1` traces the bounding circle (centre =
+/// `g.center`, radius = `g.radius`). For each pixel we solve the
+/// quadratic in `t`:
+///
+/// ```text
+/// A * t^2 - 2 * (c·d) * t + (d·d) = 0
+///   where  c = center - focal,  d = pixel - focal,
+///          A = c·c - r^2.
+/// ```
+///
+/// and pick the meaningful root (`t = ((c·d) - sqrt(Δ)) / A`). The
+/// formula degenerates correctly when `focal == center` (gives the
+/// classical `|P - centre| / r`).
+///
+/// SVG says the focal must lie *inside* the bounding circle. If the
+/// caller supplies a focal on or outside the boundary we clamp it
+/// onto the circle (just inside, by a tiny epsilon), matching the
+/// browser-side normalisation step.
 pub fn eval_radial_gradient(g: &RadialGradient, px: f32, py: f32) -> Rgba {
     if g.stops.is_empty() {
         return Rgba::new(0, 0, 0, 0);
@@ -45,11 +59,58 @@ pub fn eval_radial_gradient(g: &RadialGradient, px: f32, py: f32) -> Rgba {
     if g.stops.len() == 1 || g.radius <= 1e-12 {
         return g.stops[0].color;
     }
-    let dx = px - g.center.x;
-    let dy = py - g.center.y;
-    let dist = (dx * dx + dy * dy).sqrt();
-    let t = dist / g.radius;
+    let r = g.radius;
+    let (fx, fy) = clamp_focal_inside_circle(g.focal.unwrap_or(g.center), g.center, r);
+    let cdx = g.center.x - fx;
+    let cdy = g.center.y - fy;
+    let dx = px - fx;
+    let dy = py - fy;
+    // c·d, d·d, c·c.
+    let cd = cdx * dx + cdy * dy;
+    let dd = dx * dx + dy * dy;
+    let cc = cdx * cdx + cdy * cdy;
+    let aa = cc - r * r; // <= 0 when focal is inside the circle
+    let t = if aa.abs() < 1e-12 {
+        // Focal on the boundary — quadratic collapses to linear:
+        //   -2(c·d)*t + d·d = 0  =>  t = d·d / (2 c·d).
+        if cd.abs() < 1e-12 {
+            // c·d == 0: pixel sits on the line through focal
+            // perpendicular to F→C, with no axis component → use
+            // distance/radius as the centred fallback.
+            (dd.sqrt()) / r
+        } else {
+            dd / (2.0 * cd)
+        }
+    } else {
+        let disc = cd * cd - aa * dd;
+        if disc < 0.0 {
+            // Numerical underflow, possible only off the disc; clamp
+            // to the centred fallback so the spread method still
+            // runs against a meaningful t.
+            dd.sqrt() / r
+        } else {
+            (cd - disc.sqrt()) / aa
+        }
+    };
     sample_stops(&g.stops, apply_spread(t, g.spread))
+}
+
+/// Pull `focal` strictly inside the bounding circle when it lies on
+/// or outside the boundary. SVG normalises this so the gradient
+/// equation always has a real positive root for points inside the
+/// circle.
+fn clamp_focal_inside_circle(focal: Point, center: Point, r: f32) -> (f32, f32) {
+    let dx = focal.x - center.x;
+    let dy = focal.y - center.y;
+    let dist_sq = dx * dx + dy * dy;
+    let r_minus_eps = (r - 1e-4).max(0.0);
+    if dist_sq <= r_minus_eps * r_minus_eps {
+        (focal.x, focal.y)
+    } else {
+        let dist = dist_sq.sqrt().max(1e-12);
+        let scale = r_minus_eps / dist;
+        (center.x + dx * scale, center.y + dy * scale)
+    }
 }
 
 /// Map a parametric coordinate `t` through the spread method, producing
