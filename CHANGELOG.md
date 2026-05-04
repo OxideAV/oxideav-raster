@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1](https://github.com/OxideAV/oxideav-raster/compare/v0.1.0...v0.1.1) - 2026-05-04
+
+### Fixed
+
+- *(clippy)* inline Group opacity into struct literal
+- *(clippy)* rewrite stroke algorithm doc as nested bullets
+- *(clippy)* clear the 1.95 lint sweep (cast/checked/match/dead/doc)
+
+### Other
+
+- Lanczos2 (4×4 windowed sinc) image resampling
+- store touched-pixel bbox crop instead of full canvas
+- enlarge unit-circle arc test radius so polyline assertion holds
+- re-land Node::SoftMask render path
+- Revert "renderer: implement Node::SoftMask render path"
+- implement Node::SoftMask render path
+- off-centre focal radial gradients
+- bilinear image resampling for Node::Image
+- bitmap cache for Group::cache_key subtrees
+
 ### Added
 
 - `Node::SoftMask` render path — luminance + alpha mask kinds. The
