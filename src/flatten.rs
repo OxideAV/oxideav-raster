@@ -512,21 +512,32 @@ mod tests {
 
     #[test]
     fn arc_in_path_flattens_to_polyline() {
+        // Use a radius large enough that the chord-length subdivision
+        // tolerance (FLATTEN_TOLERANCE_PX = 0.5 px) actually splits the
+        // 90° cubic into many polyline segments. A 1-px-radius arc has
+        // a ~1.4 px chord and produces only the single-cubic endpoints
+        // (~3-5 points), which is geometrically correct but too few to
+        // observe as a "polyline". Use radius 50 instead — a 90°
+        // quarter-arc on r=50 is ~78 px long and subdivides plenty.
         let mut p = Path::new();
-        p.move_to(Point::new(1.0, 0.0));
+        p.move_to(Point::new(50.0, 0.0));
         p.commands.push(PathCommand::ArcTo {
-            rx: 1.0,
-            ry: 1.0,
+            rx: 50.0,
+            ry: 50.0,
             x_axis_rot: 0.0,
             large_arc: false,
             sweep: true,
-            end: Point::new(0.0, 1.0),
+            end: Point::new(0.0, 50.0),
         });
         let cs = flatten_path(&p.commands, &Transform2D::identity());
         assert_eq!(cs.len(), 1);
-        assert!(cs[0].points.len() > 5);
+        assert!(
+            cs[0].points.len() > 5,
+            "expected the 90°-r=50 arc to subdivide to many points, got {}",
+            cs[0].points.len()
+        );
         let last = cs[0].points.last().copied().unwrap();
-        assert!(close_to(last.0, 0.0, 1e-3));
-        assert!(close_to(last.1, 1.0, 1e-3));
+        assert!(close_to(last.0, 0.0, 1e-2));
+        assert!(close_to(last.1, 50.0, 1e-2));
     }
 }
