@@ -34,21 +34,29 @@ use std::sync::{Arc, Mutex};
 
 use oxideav_core::Transform2D;
 
-/// One cached rasterised subtree. Captures the full output of
-/// rendering a group's children at a specific `transform_at_cache_time`
-/// so a future hit can blit the same pixels straight into the
-/// destination buffer.
+/// One cached rasterised subtree. Captures the rasterised output of a
+/// group's children at a specific `transform_at_cache_time` so a future
+/// hit can blit the same pixels straight into the destination buffer.
 ///
-/// `width × height` are the bitmap's dimensions in pixels (always equal
-/// to the renderer's canvas size in this round — the cached buffer is
-/// the entire canvas so the blit needs no further offset arithmetic).
-/// `rgba` is `width * height * 4` bytes of packed straight-alpha RGBA.
+/// Round 3 stores only the *touched-pixel bounding box* of the subtree,
+/// not the full canvas — a 16 px glyph in a 4096 px canvas now consumes
+/// ~1 KB instead of 64 MB. `(offset_x, offset_y)` is the destination
+/// position of the bitmap's top-left corner; `width × height` are the
+/// crop's dimensions in pixels. `rgba` is `width * height * 4` bytes of
+/// packed straight-alpha RGBA.
+///
+/// A subtree that paints nothing is stored with `width = height = 0`;
+/// blits of empty subtrees are no-ops.
 #[derive(Debug, Clone)]
 pub struct RasterizedSubtree {
-    /// Bitmap width in pixels.
+    /// Bitmap width in pixels (post-crop).
     pub width: u32,
-    /// Bitmap height in pixels.
+    /// Bitmap height in pixels (post-crop).
     pub height: u32,
+    /// X offset of the bitmap's top-left corner in destination pixels.
+    pub offset_x: u32,
+    /// Y offset of the bitmap's top-left corner in destination pixels.
+    pub offset_y: u32,
     /// Packed straight-alpha RGBA, `width * height * 4` bytes.
     pub rgba: Vec<u8>,
     /// Effective transform at the moment the bitmap was rasterised —
@@ -323,6 +331,8 @@ mod tests {
         RasterizedSubtree {
             width,
             height,
+            offset_x: 0,
+            offset_y: 0,
             rgba: vec![0; (width as usize) * (height as usize) * 4],
             transform_at_cache_time: Transform2D::identity(),
         }

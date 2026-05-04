@@ -208,6 +208,8 @@ impl Renderer {
                 &bitmap.rgba,
                 bitmap.width,
                 bitmap.height,
+                bitmap.offset_x,
+                bitmap.offset_y,
                 clip_mask,
                 parent_opacity,
             );
@@ -241,8 +243,11 @@ impl Renderer {
     /// Render `g`'s children onto a fresh canvas-sized RGBA buffer at
     /// `local` transform, with `g.opacity` as the modulator and the
     /// group's own clip path (but no inherited clip — that's applied
-    /// at blit time). Stores the result in the bitmap cache and
-    /// returns a clone for immediate reuse.
+    /// at blit time). Then scans the offscreen buffer for the
+    /// touched-pixel bounding box, allocates a tight crop, and stores
+    /// only that crop in the bitmap cache (saves significant memory for
+    /// tiny glyphs in large canvases — a 16 px glyph on a 4096 px canvas
+    /// drops from 64 MB to ~1 KB per cache entry).
     fn render_group_offscreen(
         &self,
         g: &Group,
@@ -267,12 +272,7 @@ impl Renderer {
         for child in &g.children {
             self.draw_node(child, local, g.opacity, &mut off, stride, effective_clip);
         }
-        let subtree = RasterizedSubtree {
-            width: self.width,
-            height: self.height,
-            rgba: off,
-            transform_at_cache_time: local,
-        };
+        let subtree = crop_to_bbox(&off, stride, self.width, self.height, local);
         self.cache.put(composite, subtree.clone());
         subtree
     }
@@ -359,6 +359,8 @@ impl Renderer {
             &content_buf,
             self.width,
             self.height,
+            0,
+            0,
             Some(&cov),
             group_opacity,
         );
@@ -540,12 +542,14 @@ fn build_stroke_geometry(
 /// Blit a packed straight-alpha RGBA source buffer over an RGBA
 /// destination using premultiplied source-over.
 ///
-/// `clip_mask` (when `Some`) further multiplies the source alpha
-/// per-pixel; `extra_alpha` (in `0.0..=1.0`) modulates the source
-/// alpha globally (used for parent group opacity). The source and
-/// destination share the same canvas size and stride; the blit
-/// touches only pixels where the source alpha (after clip + extra)
-/// is non-zero.
+/// `(offset_x, offset_y)` places the source bitmap's top-left at that
+/// destination pixel. `clip_mask` (when `Some`) further multiplies the
+/// source alpha per-pixel and is sampled in **destination** coordinates
+/// (so a cached-and-cropped subtree blitted at an offset reads its clip
+/// at the matching destination pixel). `extra_alpha` (in `0.0..=1.0`)
+/// modulates the source alpha globally (used for parent group opacity).
+/// The blit touches only pixels where the source alpha (after clip +
+/// extra) is non-zero.
 fn blit_rgba_over(
     dst: &mut [u8],
     dst_stride: usize,
@@ -554,10 +558,15 @@ fn blit_rgba_over(
     src: &[u8],
     src_width: u32,
     src_height: u32,
+    offset_x: u32,
+    offset_y: u32,
     clip_mask: Option<&AlphaMask>,
     extra_alpha: f32,
 ) {
     if src_width == 0 || src_height == 0 {
+        return;
+    }
+    if offset_x >= dst_width || offset_y >= dst_height {
         return;
     }
     let extra = extra_alpha.clamp(0.0, 1.0);
@@ -565,11 +574,11 @@ fn blit_rgba_over(
     if extra_q == 0 {
         return;
     }
-    let w = src_width.min(dst_width) as usize;
-    let h = src_height.min(dst_height) as usize;
+    let w = src_width.min(dst_width - offset_x) as usize;
+    let h = src_height.min(dst_height - offset_y) as usize;
     let src_stride = (src_width as usize) * 4;
     for y in 0..h {
-        let dst_row = y * dst_stride;
+        let dst_row = (offset_y as usize + y) * dst_stride;
         let src_row = y * src_stride;
         for x in 0..w {
             let si = src_row + x * 4;
@@ -577,8 +586,10 @@ fn blit_rgba_over(
             if sa_raw == 0 {
                 continue;
             }
+            let dx = offset_x + x as u32;
+            let dy = offset_y + y as u32;
             let cov = match clip_mask {
-                Some(c) => c.get(x as u32, y as u32) as u32,
+                Some(c) => c.get(dx, dy) as u32,
                 None => 255,
             };
             if cov == 0 {
@@ -597,7 +608,7 @@ fn blit_rgba_over(
             let sg = (src[si + 1] as u32 * sa + 127) / 255;
             let sb = (src[si + 2] as u32 * sa + 127) / 255;
 
-            let pidx = dst_row + x * 4;
+            let pidx = dst_row + (offset_x as usize + x) * 4;
             let dr0 = dst[pidx] as u32;
             let dg0 = dst[pidx + 1] as u32;
             let db0 = dst[pidx + 2] as u32;
@@ -625,6 +636,84 @@ fn blit_rgba_over(
             dst[pidx + 2] = ob_s as u8;
             dst[pidx + 3] = oa.min(255) as u8;
         }
+    }
+}
+
+/// Scan a canvas-sized RGBA buffer for the touched-pixel bounding box
+/// (any pixel with non-zero alpha), allocate a tight crop, and return
+/// it as a [`RasterizedSubtree`].
+///
+/// Empty subtrees (no touched pixels) return `width = height = 0` with
+/// an empty `rgba` vec — the blitter treats that as a no-op.
+fn crop_to_bbox(
+    src: &[u8],
+    src_stride: usize,
+    src_width: u32,
+    src_height: u32,
+    transform_at_cache_time: Transform2D,
+) -> RasterizedSubtree {
+    if src_width == 0 || src_height == 0 {
+        return RasterizedSubtree {
+            width: 0,
+            height: 0,
+            offset_x: 0,
+            offset_y: 0,
+            rgba: Vec::new(),
+            transform_at_cache_time,
+        };
+    }
+    let mut min_x = src_width;
+    let mut max_x = 0u32; // inclusive max
+    let mut min_y = src_height;
+    let mut max_y = 0u32;
+    let mut any = false;
+    for y in 0..src_height {
+        let row = (y as usize) * src_stride;
+        for x in 0..src_width {
+            let i = row + (x as usize) * 4;
+            if src[i + 3] != 0 {
+                any = true;
+                if x < min_x {
+                    min_x = x;
+                }
+                if x > max_x {
+                    max_x = x;
+                }
+                if y < min_y {
+                    min_y = y;
+                }
+                if y > max_y {
+                    max_y = y;
+                }
+            }
+        }
+    }
+    if !any {
+        return RasterizedSubtree {
+            width: 0,
+            height: 0,
+            offset_x: 0,
+            offset_y: 0,
+            rgba: Vec::new(),
+            transform_at_cache_time,
+        };
+    }
+    let w = max_x - min_x + 1;
+    let h = max_y - min_y + 1;
+    let dst_stride = (w as usize) * 4;
+    let mut rgba = vec![0u8; dst_stride * (h as usize)];
+    for y in 0..h {
+        let src_row = ((min_y + y) as usize) * src_stride + (min_x as usize) * 4;
+        let dst_row = (y as usize) * dst_stride;
+        rgba[dst_row..dst_row + dst_stride].copy_from_slice(&src[src_row..src_row + dst_stride]);
+    }
+    RasterizedSubtree {
+        width: w,
+        height: h,
+        offset_x: min_x,
+        offset_y: min_y,
+        rgba,
+        transform_at_cache_time,
     }
 }
 
@@ -964,5 +1053,93 @@ mod tests {
         let q = inv.apply(t.apply(p));
         assert!((q.x - p.x).abs() < 1e-4);
         assert!((q.y - p.y).abs() < 1e-4);
+    }
+
+    #[test]
+    fn crop_to_bbox_extracts_painted_pixels_only() {
+        // 8×8 buffer with a single non-zero pixel at (3, 5).
+        let w = 8u32;
+        let h = 8u32;
+        let stride = (w as usize) * 4;
+        let mut buf = vec![0u8; stride * (h as usize)];
+        let i = 5 * stride + 3 * 4;
+        buf[i] = 11;
+        buf[i + 1] = 22;
+        buf[i + 2] = 33;
+        buf[i + 3] = 44;
+        let s = crop_to_bbox(&buf, stride, w, h, Transform2D::identity());
+        assert_eq!(s.width, 1);
+        assert_eq!(s.height, 1);
+        assert_eq!(s.offset_x, 3);
+        assert_eq!(s.offset_y, 5);
+        assert_eq!(&s.rgba, &[11, 22, 33, 44]);
+    }
+
+    #[test]
+    fn crop_to_bbox_empty_buffer_yields_empty_subtree() {
+        let w = 4u32;
+        let h = 4u32;
+        let stride = (w as usize) * 4;
+        let buf = vec![0u8; stride * (h as usize)];
+        let s = crop_to_bbox(&buf, stride, w, h, Transform2D::identity());
+        assert_eq!(s.width, 0);
+        assert_eq!(s.height, 0);
+        assert!(s.rgba.is_empty());
+    }
+
+    #[test]
+    fn crop_to_bbox_inclusive_bounds_around_two_pixels() {
+        // Two non-zero pixels at (1, 2) and (4, 6) → bbox is 4×5.
+        let w = 8u32;
+        let h = 8u32;
+        let stride = (w as usize) * 4;
+        let mut buf = vec![0u8; stride * (h as usize)];
+        for &(x, y, a) in &[(1u32, 2u32, 100u8), (4u32, 6u32, 200u8)] {
+            let i = (y as usize) * stride + (x as usize) * 4;
+            buf[i + 3] = a;
+        }
+        let s = crop_to_bbox(&buf, stride, w, h, Transform2D::identity());
+        assert_eq!(s.offset_x, 1);
+        assert_eq!(s.offset_y, 2);
+        assert_eq!(s.width, 4);
+        assert_eq!(s.height, 5);
+        assert_eq!(s.rgba.len(), (4 * 5 * 4) as usize);
+    }
+
+    #[test]
+    fn blit_with_offset_paints_at_destination_position() {
+        // 8×8 destination, 2×2 source of opaque red, blit at (3, 4).
+        let mut dst = vec![0u8; 8 * 8 * 4];
+        let src: Vec<u8> = (0..2 * 2).flat_map(|_| [255, 0, 0, 255]).collect();
+        blit_rgba_over(&mut dst, 32, 8, 8, &src, 2, 2, 3, 4, None, 1.0);
+        // Pixel (3, 4) should be red.
+        let i = 4 * 32 + 3 * 4;
+        assert_eq!(&dst[i..i + 4], &[255, 0, 0, 255]);
+        // Pixel (4, 5) should be red.
+        let i = 5 * 32 + 4 * 4;
+        assert_eq!(&dst[i..i + 4], &[255, 0, 0, 255]);
+        // Pixel (0, 0) untouched.
+        assert_eq!(&dst[0..4], &[0, 0, 0, 0]);
+        // Pixel (5, 4) just past the 2×2 src — untouched.
+        let i = 4 * 32 + 5 * 4;
+        assert_eq!(&dst[i..i + 4], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn blit_with_offset_clips_oversized_source() {
+        // 4×4 destination, 4×4 source, blit at (2, 2) → only the
+        // top-left 2×2 of the source should land on dst.
+        let mut dst = vec![0u8; 4 * 4 * 4];
+        let src: Vec<u8> = (0..4 * 4).flat_map(|_| [10, 20, 30, 255]).collect();
+        blit_rgba_over(&mut dst, 16, 4, 4, &src, 4, 4, 2, 2, None, 1.0);
+        // Pixel (2, 2): painted.
+        let i = 2 * 16 + 2 * 4;
+        assert_eq!(&dst[i..i + 4], &[10, 20, 30, 255]);
+        // Pixel (3, 3): painted.
+        let i = 3 * 16 + 3 * 4;
+        assert_eq!(&dst[i..i + 4], &[10, 20, 30, 255]);
+        // Pixel (1, 1): untouched.
+        let i = 16 + 4;
+        assert_eq!(&dst[i..i + 4], &[0, 0, 0, 0]);
     }
 }
