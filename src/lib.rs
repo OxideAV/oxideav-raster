@@ -41,8 +41,9 @@
 //!   spread, off-centre focal),
 //! * single-path clip,
 //! * group opacity,
-//! * embedded raster images (`Node::Image`) — nearest-neighbour or
-//!   bilinear sampling, configurable via [`Renderer::image_filter`],
+//! * embedded raster images (`Node::Image`) — nearest-neighbour,
+//!   bilinear, or Lanczos2 (4×4 windowed sinc) sampling, configurable
+//!   via [`Renderer::image_filter`],
 //! * bitmap cache for memoised group subtrees (consumes
 //!   [`oxideav_core::Group::cache_key`]) — round 3 stores only the
 //!   touched-pixel bbox crop per entry, not the full canvas,
@@ -54,7 +55,6 @@
 //! * `<pattern>` paints,
 //! * full color-managed pipeline (ICC, gamma 2.2 / linear blending —
 //!   the rasterizer mixes in non-linear sRGB space today),
-//! * Lanczos2 / bicubic image resampling,
 //! * patterned dashes interacting with miter / round joins beyond
 //!   single-segment dashes.
 

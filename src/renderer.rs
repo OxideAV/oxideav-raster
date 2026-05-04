@@ -65,6 +65,13 @@ pub enum ImageFilter {
     /// matching CSS `image-rendering: auto` and the SVG spec.
     #[default]
     Bilinear,
+    /// Lanczos2 (windowed sinc, a = 2). 4×4 separable kernel
+    /// `lanczos2(x) = sinc(x) * sinc(x/2)` for `|x| < 2`. Sharper than
+    /// bilinear with the windowed-sinc impulse response — matches the
+    /// CSS `image-rendering: high-quality` hint. Slightly slower (16
+    /// taps vs 4) and may overshoot, so the per-pixel result is
+    /// clamped back into `[0, 255]` per channel.
+    Lanczos2,
 }
 
 /// Default cache capacity (entries) when none is specified.
@@ -508,6 +515,7 @@ impl Renderer {
                 match filter {
                     ImageFilter::Nearest => sample_image_nearest(&frame, &bounds, user.x, user.y),
                     ImageFilter::Bilinear => sample_image_bilinear(&frame, &bounds, user.x, user.y),
+                    ImageFilter::Lanczos2 => sample_image_lanczos2(&frame, &bounds, user.x, user.y),
                 }
             },
         );
@@ -872,6 +880,102 @@ fn sample_image_bilinear(frame: &VideoFrame, bounds: &Rect, ux: f32, uy: f32) ->
     )
 }
 
+/// Lanczos2 (windowed sinc, `a = 2`) sample of an `Rgba` `VideoFrame`.
+///
+/// `lanczos2(x) = sinc(π·x) * sinc(π·x/2)` for `|x| < 2`, zero
+/// elsewhere. The 2-D filter is the separable product
+/// `lanczos2(x) * lanczos2(y)` evaluated over a 4×4 footprint centred
+/// at the sample point. Samples are taken in **premultiplied-alpha**
+/// space so that alpha-zero source pixels don't bleed colour into the
+/// blend; the un-premultiply at the end mirrors
+/// [`sample_image_bilinear`]. The filter can ring (negative side-lobes
+/// pull the channel outside `[0, 255]`); the result is clamped per
+/// channel before un-premultiplication.
+///
+/// Uses *clamp-to-edge* for samples whose footprint extends past the
+/// texture boundary. Out-of-bounds (the user point is outside `bounds`)
+/// returns transparent — same as the other samplers.
+fn sample_image_lanczos2(frame: &VideoFrame, bounds: &Rect, ux: f32, uy: f32) -> Rgba {
+    let info = match prepare_image_sample(frame, bounds, ux, uy) {
+        Some(i) => i,
+        None => return Rgba::new(0, 0, 0, 0),
+    };
+    let tx = info.u * info.width as f32 - 0.5;
+    let ty = info.v * info.height as f32 - 0.5;
+    let xc = tx.floor() as i64;
+    let yc = ty.floor() as i64;
+    // 4×4 taps at offsets (-1, 0, +1, +2) from the floored centre.
+    let mut wxs = [0.0f32; 4];
+    let mut wys = [0.0f32; 4];
+    let mut sumwx = 0.0f32;
+    let mut sumwy = 0.0f32;
+    for (k, (wx, wy)) in wxs.iter_mut().zip(wys.iter_mut()).enumerate() {
+        let off = (k as i64) - 1;
+        *wx = lanczos2(tx - (xc + off) as f32);
+        *wy = lanczos2(ty - (yc + off) as f32);
+        sumwx += *wx;
+        sumwy += *wy;
+    }
+    // Re-normalise the per-axis weight sums so the kernel is a
+    // partition of unity (compensates for the truncated tail of the
+    // sinc — without this, edge samples shift slightly in luminance).
+    if sumwx.abs() > 1e-6 {
+        for w in wxs.iter_mut() {
+            *w /= sumwx;
+        }
+    }
+    if sumwy.abs() > 1e-6 {
+        for w in wys.iter_mut() {
+            *w /= sumwy;
+        }
+    }
+    let mut acc = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+    for (j, &wy) in wys.iter().enumerate() {
+        let py = (yc + j as i64 - 1).clamp(0, info.height as i64 - 1) as usize;
+        for (i, &wx) in wxs.iter().enumerate() {
+            let px = (xc + i as i64 - 1).clamp(0, info.width as i64 - 1) as usize;
+            let w = wx * wy;
+            let (r, g, b, a) = fetch_premul(info.data, info.stride, px, py);
+            acc.0 += r * w;
+            acc.1 += g * w;
+            acc.2 += b * w;
+            acc.3 += a * w;
+        }
+    }
+    let pa = acc.3.clamp(0.0, 255.0);
+    if pa <= 0.5 {
+        return Rgba::new(0, 0, 0, 0);
+    }
+    let inv = 255.0 / pa;
+    Rgba::new(
+        (acc.0 * inv).round().clamp(0.0, 255.0) as u8,
+        (acc.1 * inv).round().clamp(0.0, 255.0) as u8,
+        (acc.2 * inv).round().clamp(0.0, 255.0) as u8,
+        pa.round().clamp(0.0, 255.0) as u8,
+    )
+}
+
+/// Lanczos kernel for `a = 2`. `lanczos2(0) = 1`; vanishes at integer
+/// non-zero `x`; zero outside `|x| < 2`. The naive `sin(πx) / (πx)`
+/// form is fine for our 4-tap evaluation — the divide is cheap and
+/// the special case at `x = 0` is the only branch.
+#[inline]
+fn lanczos2(x: f32) -> f32 {
+    let ax = x.abs();
+    if ax >= 2.0 {
+        return 0.0;
+    }
+    if ax < 1e-7 {
+        return 1.0;
+    }
+    let pi = std::f32::consts::PI;
+    let pix = pi * x;
+    let pix2 = pix * 0.5;
+    let s = pix.sin() / pix;
+    let s2 = pix2.sin() / pix2;
+    s * s2
+}
+
 /// Fetch a single texel and convert to premultiplied-alpha floats.
 #[inline]
 fn fetch_premul(data: &[u8], stride: usize, x: usize, y: usize) -> (f32, f32, f32, f32) {
@@ -1141,5 +1245,22 @@ mod tests {
         // Pixel (1, 1): untouched.
         let i = 16 + 4;
         assert_eq!(&dst[i..i + 4], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn lanczos2_kernel_unit_at_zero_and_zero_at_integers() {
+        assert!((lanczos2(0.0) - 1.0).abs() < 1e-6);
+        assert!(lanczos2(1.0).abs() < 1e-3);
+        assert!(lanczos2(-1.0).abs() < 1e-3);
+        assert_eq!(lanczos2(2.0), 0.0);
+        assert_eq!(lanczos2(-2.0), 0.0);
+        assert_eq!(lanczos2(2.5), 0.0);
+    }
+
+    #[test]
+    fn lanczos2_kernel_is_even_symmetric() {
+        for x in [0.25f32, 0.5, 0.75, 1.25, 1.5, 1.75] {
+            assert!((lanczos2(x) - lanczos2(-x)).abs() < 1e-6);
+        }
     }
 }
