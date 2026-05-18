@@ -7,7 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.1.1](https://github.com/OxideAV/oxideav-raster/compare/v0.1.0...v0.1.1) - 2026-05-04
+### Added
+
+- Mitchell–Netravali bicubic image resampling (`ImageFilter::Mitchell`).
+  Standard `B = 1/3, C = 1/3` parameter pair from Mitchell & Netravali's
+  1988 reconstruction-filter paper; 4×4 separable kernel sampled in
+  premultiplied-alpha space. Smoother than Lanczos2 (no visible halo
+  banding on hard step edges) and sharper than bilinear; useful as the
+  default for downscaling photographic content. Joins the existing
+  Nearest / Bilinear / Lanczos2 entries on `Renderer::image_filter`.
+- `Renderer::color_interpolation` selects between SVG 2 §13.9
+  `color-interpolation: sRGB` (the default, matches the historic SVG 1.1
+  default) and `color-interpolation: linearRGB`. Linear-RGB
+  interpolation converts each gradient stop through the IEC 61966-2-1
+  sRGB transfer function (`(C + 0.055) / 1.055)^2.4` above 0.04045 /
+  linear `÷ 12.92` below), interpolates in the light-energy-linear
+  domain, and encodes back to sRGB for the output frame. Eliminates the
+  "ugly grey midpoint" artefact where complementary primaries (e.g.
+  black↔white, red↔green) appear too dark in the middle of a naive
+  sRGB-space gradient. Wired through `sample_paint_in` →
+  `eval_{linear,radial}_gradient_in` so consumers can also evaluate
+  paints standalone.
+
+
 
 ### Fixed
 

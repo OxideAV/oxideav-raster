@@ -7,26 +7,32 @@ resolution-independent [`VectorFrame`](https://docs.rs/oxideav-core/latest/oxide
 groups with opacity / clip / transform, embedded raster images) and
 produces a packed `Rgba` `VideoFrame`.
 
-## Round 1
+## Status
 
-| Capability                          | Status     |
-| ----------------------------------- | ---------- |
-| Path flattening (line/quad/cubic)   | done       |
-| SVG elliptic-arc → cubic Bezier     | done       |
-| Scanline AA fill (even-odd / NZ)    | done       |
-| Configurable supersampling 1/2/4/8× | done       |
-| Stroke geometry (caps + joins)      | done       |
-| Dash patterns                       | done       |
-| Linear + radial gradients           | done       |
-| Pad / Reflect / Repeat spread       | done       |
-| Single-path clip                    | done       |
-| Group opacity                       | done       |
-| Embedded raster image (nearest)     | done       |
-| Filters (blur, drop-shadow, …)      | round 2    |
-| `<pattern>` paint                   | round 2    |
-| Soft masks (luminance / alpha)      | round 2    |
-| Color-managed pipeline (linear sRGB)| round 2    |
-| Bilinear image resampling           | round 2    |
+| Capability                                | Status               |
+| ----------------------------------------- | -------------------- |
+| Path flattening (line/quad/cubic)         | done                 |
+| SVG elliptic-arc → cubic Bezier           | done                 |
+| Scanline AA fill (even-odd / NZ)          | done                 |
+| Configurable supersampling 1/2/4/8×       | done                 |
+| Stroke geometry (caps + joins)            | done                 |
+| Dash patterns                             | done                 |
+| Linear + radial gradients                 | done                 |
+| Off-centre focal radial                   | done                 |
+| Pad / Reflect / Repeat spread             | done                 |
+| `color-interpolation: sRGB` (default)     | done                 |
+| `color-interpolation: linearRGB`          | done (round 4)       |
+| Single-path clip                          | done                 |
+| Group opacity                             | done                 |
+| Soft masks (luminance / alpha)            | done (round 2)       |
+| Bitmap cache (`Group::cache_key`)         | done (round 3, bbox) |
+| Image resample: nearest                   | done                 |
+| Image resample: bilinear                  | done (round 2)       |
+| Image resample: Lanczos2 (4×4 sinc)       | done (round 3)       |
+| Image resample: Mitchell–Netravali bicubic| done (round 4)       |
+| Filters (blur, drop-shadow, …)            | pending              |
+| `<pattern>` paint                         | pending              |
+| Full ICC color-managed pipeline           | pending              |
 
 ## Usage
 

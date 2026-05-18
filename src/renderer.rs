@@ -12,7 +12,8 @@ use crate::cache::{composite_key, CacheStats, RasterizedSubtree, SharedCache};
 use crate::composite::composite_rgba_premultiplied;
 use crate::fill::{rasterize_fill, AlphaMask};
 use crate::flatten::{flatten_path, FlatContour};
-use crate::paint::sample_paint;
+use crate::gradient::InterpolationSpace;
+use crate::paint::sample_paint_in;
 use crate::stroke::stroke_to_fill_path;
 
 /// Top-level vector→raster renderer.
@@ -47,6 +48,13 @@ pub struct Renderer {
     /// [`ImageFilter::Bilinear`]; nearest-neighbour is available for
     /// callers that explicitly want pixel-perfect block-replication.
     pub image_filter: ImageFilter,
+    /// Color-interpolation space for gradient (and future per-pixel
+    /// paint) stops. Defaults to [`InterpolationSpace::Srgb`] (the
+    /// historical SVG 1.1 default — fast, matches naive renderers).
+    /// Set to [`InterpolationSpace::LinearRgb`] for SVG 2 §13.9
+    /// `color-interpolation: linearRGB` behaviour (avoids the dark
+    /// midpoint where complementary primaries cross).
+    pub color_interpolation: InterpolationSpace,
     /// Bitmap cache for memoised group subtrees. Shared via
     /// `Arc<Mutex<...>>` so the cache survives `Clone`, and so the
     /// cache lookup remains coherent across the scene walk's
@@ -72,6 +80,15 @@ pub enum ImageFilter {
     /// taps vs 4) and may overshoot, so the per-pixel result is
     /// clamped back into `[0, 255]` per channel.
     Lanczos2,
+    /// Mitchell–Netravali bicubic with the classic `B = 1/3, C = 1/3`
+    /// parameters (the "Mitchell" point in the Mitchell–Netravali
+    /// 1988 reconstruction-filter family — minimises a balanced sum of
+    /// blur + ringing). 4×4 separable kernel; smoother than Lanczos2
+    /// (less ringing, no negative side-lobes large enough to overshoot
+    /// in practice) and sharper than bilinear. Useful as the default
+    /// for *downscaling* photographic content where Lanczos2's
+    /// negative lobes can show as halo banding.
+    Mitchell,
 }
 
 /// Default cache capacity (entries) when none is specified.
@@ -90,6 +107,7 @@ impl Renderer {
             subpixel_positioning: false,
             background: Rgba::new(0, 0, 0, 0),
             image_filter: ImageFilter::default(),
+            color_interpolation: InterpolationSpace::default(),
             cache: SharedCache::with_capacity(DEFAULT_CACHE_CAPACITY),
         }
     }
@@ -449,6 +467,7 @@ impl Renderer {
             // call's lifetime.
             other => {
                 let other = other.clone();
+                let space = self.color_interpolation;
                 composite_rgba_premultiplied(
                     buf,
                     stride,
@@ -458,7 +477,7 @@ impl Renderer {
                     0,
                     0,
                     group_opacity,
-                    move |x, y| sample_paint(&other, x as f32 + 0.5, y as f32 + 0.5),
+                    move |x, y| sample_paint_in(&other, x as f32 + 0.5, y as f32 + 0.5, space),
                 );
             }
         }
@@ -516,6 +535,7 @@ impl Renderer {
                     ImageFilter::Nearest => sample_image_nearest(&frame, &bounds, user.x, user.y),
                     ImageFilter::Bilinear => sample_image_bilinear(&frame, &bounds, user.x, user.y),
                     ImageFilter::Lanczos2 => sample_image_lanczos2(&frame, &bounds, user.x, user.y),
+                    ImageFilter::Mitchell => sample_image_mitchell(&frame, &bounds, user.x, user.y),
                 }
             },
         );
@@ -955,6 +975,125 @@ fn sample_image_lanczos2(frame: &VideoFrame, bounds: &Rect, ux: f32, uy: f32) ->
     )
 }
 
+/// Mitchell–Netravali bicubic sample of an `Rgba` `VideoFrame`.
+///
+/// `B = 1/3, C = 1/3` (the "Mitchell" filter), the parameter pair
+/// recommended in *Mitchell & Netravali, "Reconstruction Filters in
+/// Computer Graphics" (1988)* as the best subjective trade-off between
+/// blur and ringing. The 4×4 separable kernel evaluates
+/// [`mitchell_netravali`] per axis, samples in **premultiplied-alpha**
+/// space, and clamps the result back to `[0, 255]` per channel. The
+/// out-of-bounds handling and edge-clamp behaviour mirrors the bilinear
+/// and Lanczos2 paths.
+fn sample_image_mitchell(frame: &VideoFrame, bounds: &Rect, ux: f32, uy: f32) -> Rgba {
+    let info = match prepare_image_sample(frame, bounds, ux, uy) {
+        Some(i) => i,
+        None => return Rgba::new(0, 0, 0, 0),
+    };
+    let tx = info.u * info.width as f32 - 0.5;
+    let ty = info.v * info.height as f32 - 0.5;
+    let xc = tx.floor() as i64;
+    let yc = ty.floor() as i64;
+    // 4×4 taps at offsets (-1, 0, +1, +2) from the floored centre.
+    let mut wxs = [0.0f32; 4];
+    let mut wys = [0.0f32; 4];
+    let mut sumwx = 0.0f32;
+    let mut sumwy = 0.0f32;
+    for (k, (wx, wy)) in wxs.iter_mut().zip(wys.iter_mut()).enumerate() {
+        let off = (k as i64) - 1;
+        *wx = mitchell_netravali(tx - (xc + off) as f32);
+        *wy = mitchell_netravali(ty - (yc + off) as f32);
+        sumwx += *wx;
+        sumwy += *wy;
+    }
+    // The Mitchell–Netravali kernel already sums to 1 across an
+    // integer-aligned 4-tap window, but at the clamped boundary the
+    // contributing taps shift and the partition-of-unity property is
+    // broken; re-normalise so edge samples don't shift in luminance.
+    if sumwx.abs() > 1e-6 {
+        for w in wxs.iter_mut() {
+            *w /= sumwx;
+        }
+    }
+    if sumwy.abs() > 1e-6 {
+        for w in wys.iter_mut() {
+            *w /= sumwy;
+        }
+    }
+    let mut acc = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+    for (j, &wy) in wys.iter().enumerate() {
+        let py = (yc + j as i64 - 1).clamp(0, info.height as i64 - 1) as usize;
+        for (i, &wx) in wxs.iter().enumerate() {
+            let px = (xc + i as i64 - 1).clamp(0, info.width as i64 - 1) as usize;
+            let w = wx * wy;
+            let (r, g, b, a) = fetch_premul(info.data, info.stride, px, py);
+            acc.0 += r * w;
+            acc.1 += g * w;
+            acc.2 += b * w;
+            acc.3 += a * w;
+        }
+    }
+    let pa = acc.3.clamp(0.0, 255.0);
+    if pa <= 0.5 {
+        return Rgba::new(0, 0, 0, 0);
+    }
+    let inv = 255.0 / pa;
+    Rgba::new(
+        (acc.0 * inv).round().clamp(0.0, 255.0) as u8,
+        (acc.1 * inv).round().clamp(0.0, 255.0) as u8,
+        (acc.2 * inv).round().clamp(0.0, 255.0) as u8,
+        pa.round().clamp(0.0, 255.0) as u8,
+    )
+}
+
+/// Mitchell–Netravali cubic reconstruction kernel with `B = 1/3, C = 1/3`
+/// (the "Mitchell" point of the BC family). The kernel piecewise
+/// polynomial is:
+///
+/// ```text
+///                    1
+/// k(x) =  ──────── × {
+///                    6
+///   (12 − 9B − 6C)·|x|³ + (−18 + 12B + 6C)·|x|²            + (6 − 2B)            if |x| < 1
+///   (−B − 6C)·|x|³ + (6B + 30C)·|x|² + (−12B − 48C)·|x| + (8B + 24C)             if 1 ≤ |x| < 2
+///   0                                                                            otherwise
+/// }
+/// ```
+///
+/// With `B = 1/3, C = 1/3` (substituting and dividing through by 6):
+///
+/// ```text
+///   |x| < 1   → (7·|x|³ − 12·|x|² + 16/3) / 6
+///   1 ≤ |x| < 2 → (−7/3·|x|³ + 12·|x|² − 20·|x| + 32/3) / 6
+///   else        → 0
+/// ```
+///
+/// The naive un-factored form below is the one we actually evaluate —
+/// it keeps the source close to the textbook formula and is fast enough
+/// for a 4-tap-per-axis hot loop.
+#[inline]
+fn mitchell_netravali(x: f32) -> f32 {
+    const B: f32 = 1.0 / 3.0;
+    const C: f32 = 1.0 / 3.0;
+    let ax = x.abs();
+    if ax < 1.0 {
+        let x2 = ax * ax;
+        let x3 = x2 * ax;
+        ((12.0 - 9.0 * B - 6.0 * C) * x3 + (-18.0 + 12.0 * B + 6.0 * C) * x2 + (6.0 - 2.0 * B))
+            / 6.0
+    } else if ax < 2.0 {
+        let x2 = ax * ax;
+        let x3 = x2 * ax;
+        ((-B - 6.0 * C) * x3
+            + (6.0 * B + 30.0 * C) * x2
+            + (-12.0 * B - 48.0 * C) * ax
+            + (8.0 * B + 24.0 * C))
+            / 6.0
+    } else {
+        0.0
+    }
+}
+
 /// Lanczos kernel for `a = 2`. `lanczos2(0) = 1`; vanishes at integer
 /// non-zero `x`; zero outside `|x| < 2`. The naive `sin(πx) / (πx)`
 /// form is fine for our 4-tap evaluation — the divide is cheap and
@@ -1261,6 +1400,67 @@ mod tests {
     fn lanczos2_kernel_is_even_symmetric() {
         for x in [0.25f32, 0.5, 0.75, 1.25, 1.5, 1.75] {
             assert!((lanczos2(x) - lanczos2(-x)).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn mitchell_kernel_unit_at_zero_and_zero_outside_support() {
+        // k(0) = (6 - 2B) / 6 = (6 - 2/3) / 6 = 16/18 = 8/9 for the
+        // Mitchell choice (B = 1/3) — the kernel is *not* a partition of
+        // unity in isolation; only the sum across the 4-tap window is.
+        let v0 = mitchell_netravali(0.0);
+        assert!(
+            (v0 - 8.0 / 9.0).abs() < 1e-5,
+            "k(0)={}, want 8/9 ≈ 0.8889",
+            v0
+        );
+        // Vanishes outside the support.
+        assert_eq!(mitchell_netravali(2.0), 0.0);
+        assert_eq!(mitchell_netravali(-2.0), 0.0);
+        assert_eq!(mitchell_netravali(2.5), 0.0);
+        // At the piecewise boundary x = 1 the two branches meet at zero
+        // for Mitchell (B = C = 1/3): substituting into the |x| < 1
+        // branch gives (7 − 12 + 16/3) / 6 = (−5 + 16/3) / 6 = (1/3) / 6
+        // = 1/18; the |x| ≥ 1 branch also evaluates to 1/18 at x = 1.
+        // Confirm both pieces agree at the boundary.
+        let left = mitchell_netravali(1.0 - 1e-5);
+        let right = mitchell_netravali(1.0 + 1e-5);
+        assert!(
+            (left - right).abs() < 1e-3,
+            "branch mismatch at x=1: left={}, right={}",
+            left,
+            right
+        );
+    }
+
+    #[test]
+    fn mitchell_kernel_is_even_symmetric() {
+        for x in [0.25f32, 0.5, 0.75, 1.25, 1.5, 1.75] {
+            assert!(
+                (mitchell_netravali(x) - mitchell_netravali(-x)).abs() < 1e-6,
+                "asymmetry at |x|={}",
+                x
+            );
+        }
+    }
+
+    #[test]
+    fn mitchell_kernel_partition_of_unity_on_offset_grid() {
+        // Across a 4-tap window with the sample landing at any
+        // fractional offset, the four kernel weights must sum to 1
+        // (within float tolerance). This is the property that makes
+        // re-normalisation a no-op for interior samples.
+        for frac in [0.0f32, 0.1, 0.25, 0.5, 0.75, 0.9] {
+            let sum = mitchell_netravali(-1.0 - frac)
+                + mitchell_netravali(-frac)
+                + mitchell_netravali(1.0 - frac)
+                + mitchell_netravali(2.0 - frac);
+            assert!(
+                (sum - 1.0).abs() < 1e-5,
+                "partition broken at frac={}, sum={}",
+                frac,
+                sum
+            );
         }
     }
 }

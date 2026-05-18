@@ -37,13 +37,16 @@
 //! * fill (even-odd + non-zero) with configurable supersampling,
 //! * stroke geometry (Butt/Round/Square caps, Miter/Round/Bevel joins,
 //!   dash patterns, miter limit),
-//! * linear + radial gradients (sRGB interpolation, Pad/Reflect/Repeat
-//!   spread, off-centre focal),
+//! * linear + radial gradients (Pad/Reflect/Repeat spread, off-centre
+//!   focal, selectable sRGB or linear-light `color-interpolation`
+//!   space — see [`InterpolationSpace`] and
+//!   [`Renderer::color_interpolation`]),
 //! * single-path clip,
 //! * group opacity,
 //! * embedded raster images (`Node::Image`) — nearest-neighbour,
-//!   bilinear, or Lanczos2 (4×4 windowed sinc) sampling, configurable
-//!   via [`Renderer::image_filter`],
+//!   bilinear, Lanczos2 (4×4 windowed sinc), or Mitchell–Netravali
+//!   bicubic (`B = C = 1/3`) sampling, configurable via
+//!   [`Renderer::image_filter`],
 //! * bitmap cache for memoised group subtrees (consumes
 //!   [`oxideav_core::Group::cache_key`]) — round 3 stores only the
 //!   touched-pixel bbox crop per entry, not the full canvas,
@@ -53,8 +56,9 @@
 //!
 //! * filters (Gaussian blur, drop shadow, feColorMatrix, etc.),
 //! * `<pattern>` paints,
-//! * full color-managed pipeline (ICC, gamma 2.2 / linear blending —
-//!   the rasterizer mixes in non-linear sRGB space today),
+//! * full ICC-tagged color-managed pipeline (the `linearRGB`
+//!   interpolation space is implemented; per-channel ICC profile
+//!   transforms are still TODO),
 //! * patterned dashes interacting with miter / round joins beyond
 //!   single-segment dashes.
 
@@ -75,8 +79,11 @@ pub use cache::{CacheStats, RasterizedSubtree};
 pub use composite::composite_rgba_premultiplied;
 pub use fill::{rasterize_fill, AlphaMask};
 pub use flatten::{flatten_arc_to_cubics, flatten_path, FlatContour};
-pub use gradient::{eval_linear_gradient, eval_radial_gradient};
-pub use paint::sample_paint;
+pub use gradient::{
+    eval_linear_gradient, eval_linear_gradient_in, eval_radial_gradient, eval_radial_gradient_in,
+    InterpolationSpace,
+};
+pub use paint::{sample_paint, sample_paint_in};
 pub use renderer::{rasterize, ImageFilter, Renderer, DEFAULT_CACHE_CAPACITY};
 pub use stroke::stroke_to_fill_path;
 

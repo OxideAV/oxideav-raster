@@ -2,9 +2,20 @@
 //! [`RadialGradient`] at a point in pixel space and return the resulting
 //! straight-alpha sRGB color.
 //!
-//! Supports SVG/PDF Pad / Reflect / Repeat spread methods. Stops are
-//! interpolated linearly in non-linear sRGB space (a future round-2
-//! item: linear-light blending for color-managed pipelines).
+//! Supports SVG/PDF Pad / Reflect / Repeat spread methods.
+//!
+//! Two interpolation spaces are supported:
+//!
+//! * [`InterpolationSpace::Srgb`] — the default. Stops are interpolated
+//!   linearly in non-linear sRGB space. Matches every SVG 1.1 / PDF
+//!   renderer that doesn't explicitly opt into a color-managed pipeline.
+//! * [`InterpolationSpace::LinearRgb`] — stops are converted to
+//!   light-energy-linear sRGB tristimulus before interpolation, then
+//!   back to non-linear sRGB for return. Implements SVG 2 §13.9
+//!   `color-interpolation: linearRGB` (with the IEC 61966-2-1 transfer
+//!   function — `(C + 0.055) / 1.055)^2.4` above 0.04045 / `0.0031308`,
+//!   linear scale `× 12.92` / `÷ 12.92` below). Alpha is *not*
+//!   gamma-encoded — it carries linear coverage and is interpolated as-is.
 //!
 //! Gradient coordinates are taken to be in the same pixel space the
 //! caller is using for raster output (the Renderer applies the active
@@ -12,8 +23,41 @@
 
 use oxideav_core::{LinearGradient, Point, RadialGradient, Rgba, SpreadMethod};
 
-/// Sample a linear gradient at pixel `(px, py)`.
+/// Color-space hint for gradient (and future per-pixel) interpolation.
+///
+/// Selects between SVG `color-interpolation: sRGB` (default — fast,
+/// matches naive renderers) and `color-interpolation: linearRGB` —
+/// physically-correct light blending that avoids the dark-band artefact
+/// where complementary primaries cross.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum InterpolationSpace {
+    /// Interpolate in non-linear sRGB. The historical SVG 1.1 default
+    /// (`color-interpolation: sRGB`); matches almost every SVG renderer
+    /// shipped before 2010.
+    #[default]
+    Srgb,
+    /// Interpolate in light-energy-linear sRGB (sRGB tristimulus values
+    /// without the gamma transfer curve). The SVG 2 §13.9 / Filter
+    /// Effects 1 §6.1 `color-interpolation: linearRGB` model. Eliminates
+    /// the dark band that appears when complementary primaries (e.g.
+    /// red↔green) interpolate as a midpoint in sRGB space.
+    LinearRgb,
+}
+
+/// Sample a linear gradient at pixel `(px, py)` in the sRGB interpolation
+/// space (back-compat alias for [`eval_linear_gradient_in`]).
 pub fn eval_linear_gradient(g: &LinearGradient, px: f32, py: f32) -> Rgba {
+    eval_linear_gradient_in(g, px, py, InterpolationSpace::Srgb)
+}
+
+/// Sample a linear gradient at pixel `(px, py)` in the requested
+/// interpolation space.
+pub fn eval_linear_gradient_in(
+    g: &LinearGradient,
+    px: f32,
+    py: f32,
+    space: InterpolationSpace,
+) -> Rgba {
     if g.stops.is_empty() {
         return Rgba::new(0, 0, 0, 0);
     }
@@ -27,10 +71,11 @@ pub fn eval_linear_gradient(g: &LinearGradient, px: f32, py: f32) -> Rgba {
         return g.stops.last().copied().unwrap().color;
     }
     let t = ((px - g.start.x) * dx + (py - g.start.y) * dy) / denom;
-    sample_stops(&g.stops, apply_spread(t, g.spread))
+    sample_stops_in(&g.stops, apply_spread(t, g.spread), space)
 }
 
-/// Sample a radial gradient at pixel `(px, py)`.
+/// Sample a radial gradient at pixel `(px, py)` in the sRGB
+/// interpolation space (back-compat alias for [`eval_radial_gradient_in`]).
 ///
 /// Implements the SVG 1.1 §13.2.4 ("Radial gradients") general
 /// formula: the gradient is parameterised by `t`, where `t = 0` is
@@ -53,6 +98,19 @@ pub fn eval_linear_gradient(g: &LinearGradient, px: f32, py: f32) -> Rgba {
 /// onto the circle (just inside, by a tiny epsilon), matching the
 /// browser-side normalisation step.
 pub fn eval_radial_gradient(g: &RadialGradient, px: f32, py: f32) -> Rgba {
+    eval_radial_gradient_in(g, px, py, InterpolationSpace::Srgb)
+}
+
+/// Sample a radial gradient at pixel `(px, py)` in the requested
+/// interpolation space. See [`eval_radial_gradient`] for the geometric
+/// derivation; the `space` argument only affects the per-stop
+/// interpolation (geometric `t` is identical in both spaces).
+pub fn eval_radial_gradient_in(
+    g: &RadialGradient,
+    px: f32,
+    py: f32,
+    space: InterpolationSpace,
+) -> Rgba {
     if g.stops.is_empty() {
         return Rgba::new(0, 0, 0, 0);
     }
@@ -92,7 +150,7 @@ pub fn eval_radial_gradient(g: &RadialGradient, px: f32, py: f32) -> Rgba {
             (cd - disc.sqrt()) / aa
         }
     };
-    sample_stops(&g.stops, apply_spread(t, g.spread))
+    sample_stops_in(&g.stops, apply_spread(t, g.spread), space)
 }
 
 /// Pull `focal` strictly inside the bounding circle when it lies on
@@ -142,8 +200,20 @@ fn apply_spread(t: f32, spread: SpreadMethod) -> f32 {
     }
 }
 
-/// Linear interpolation across the `stops` array. `t` is in `[0, 1]`.
+/// Back-compat wrapper for the older `sample_stops` signature: always
+/// interpolates in sRGB.
+#[cfg(test)]
 fn sample_stops(stops: &[oxideav_core::GradientStop], t: f32) -> Rgba {
+    sample_stops_in(stops, t, InterpolationSpace::Srgb)
+}
+
+/// Linear interpolation across the `stops` array in the requested
+/// interpolation space. `t` is in `[0, 1]`.
+fn sample_stops_in(
+    stops: &[oxideav_core::GradientStop],
+    t: f32,
+    space: InterpolationSpace,
+) -> Rgba {
     if stops.is_empty() {
         return Rgba::new(0, 0, 0, 0);
     }
@@ -159,19 +229,76 @@ fn sample_stops(stops: &[oxideav_core::GradientStop], t: f32) -> Rgba {
         if t >= a.offset && t <= b.offset {
             let span = (b.offset - a.offset).max(1e-9);
             let local = (t - a.offset) / span;
-            return lerp_rgba(a.color, b.color, local);
+            return lerp_rgba(a.color, b.color, local, space);
         }
     }
     last.color
 }
 
-/// Linear interpolation between two straight-alpha sRGB colors.
-fn lerp_rgba(a: Rgba, b: Rgba, t: f32) -> Rgba {
-    let l = |x: u8, y: u8| -> u8 {
-        let lv = x as f32 + (y as f32 - x as f32) * t;
-        lv.round().clamp(0.0, 255.0) as u8
+/// Linear interpolation between two straight-alpha sRGB colors in the
+/// requested interpolation space.
+fn lerp_rgba(a: Rgba, b: Rgba, t: f32, space: InterpolationSpace) -> Rgba {
+    match space {
+        InterpolationSpace::Srgb => {
+            let l = |x: u8, y: u8| -> u8 {
+                let lv = x as f32 + (y as f32 - x as f32) * t;
+                lv.round().clamp(0.0, 255.0) as u8
+            };
+            Rgba::new(l(a.r, b.r), l(a.g, b.g), l(a.b, b.b), l(a.a, b.a))
+        }
+        InterpolationSpace::LinearRgb => {
+            // SVG 2 §13.9 / IEC 61966-2-1: convert each RGB channel
+            // through the gamma transfer function, lerp in the linear
+            // domain, then transfer back.  Alpha is treated as light
+            // coverage and stays linear throughout (matches CSS Filter
+            // Effects 1 §6.1's note on `color-interpolation-filters`).
+            let ar = srgb_to_linear(a.r);
+            let ag = srgb_to_linear(a.g);
+            let ab = srgb_to_linear(a.b);
+            let br = srgb_to_linear(b.r);
+            let bg = srgb_to_linear(b.g);
+            let bb = srgb_to_linear(b.b);
+            let lr = ar + (br - ar) * t;
+            let lg = ag + (bg - ag) * t;
+            let lb = ab + (bb - ab) * t;
+            let aa = a.a as f32 + (b.a as f32 - a.a as f32) * t;
+            Rgba::new(
+                linear_to_srgb(lr),
+                linear_to_srgb(lg),
+                linear_to_srgb(lb),
+                aa.round().clamp(0.0, 255.0) as u8,
+            )
+        }
+    }
+}
+
+/// IEC 61966-2-1 sRGB → linear-light transfer function. Input is a
+/// straight-alpha sRGB byte; output is the corresponding light-energy
+/// value in `[0.0, 1.0]`. Matches the formula in SVG 2 §13.9
+/// (`color-interpolation` linearRGB conversion).
+#[inline]
+fn srgb_to_linear(c: u8) -> f32 {
+    let cs = c as f32 / 255.0;
+    if cs <= 0.040_45 {
+        cs / 12.92
+    } else {
+        ((cs + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+/// IEC 61966-2-1 linear-light → sRGB transfer function. Input is in
+/// `[0.0, 1.0]` (clamped); output is the corresponding sRGB byte. The
+/// inverse of [`srgb_to_linear`] and the formula required by SVG 2
+/// §13.9 / IEC 61966-2-1 for the reverse transform.
+#[inline]
+fn linear_to_srgb(c: f32) -> u8 {
+    let c = c.clamp(0.0, 1.0);
+    let cs = if c <= 0.003_130_8 {
+        c * 12.92
+    } else {
+        1.055 * c.powf(1.0 / 2.4) - 0.055
     };
-    Rgba::new(l(a.r, b.r), l(a.g, b.g), l(a.b, b.b), l(a.a, b.a))
+    (cs * 255.0).round().clamp(0.0, 255.0) as u8
 }
 
 #[cfg(test)]
@@ -247,6 +374,117 @@ mod tests {
         let c = eval_radial_gradient(&g, 5.0, 5.0);
         assert_eq!(c.r, 255);
         assert_eq!(c.b, 0);
+    }
+
+    #[test]
+    fn srgb_to_linear_round_trip_within_byte_quantisation() {
+        // Each sRGB byte → linear → sRGB byte should land back on the
+        // original (within ±1 from float rounding).
+        for c in 0u8..=255 {
+            let l = srgb_to_linear(c);
+            let back = linear_to_srgb(l);
+            assert!(
+                (c as i32 - back as i32).abs() <= 1,
+                "round-trip mismatch at c={}: linear={} back={}",
+                c,
+                l,
+                back
+            );
+        }
+    }
+
+    #[test]
+    fn srgb_to_linear_endpoints_are_exact() {
+        assert!(srgb_to_linear(0).abs() < 1e-7);
+        // 255 → exactly 1.0 in light energy (within float epsilon).
+        assert!((srgb_to_linear(255) - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn linear_interpolation_midpoint_is_brighter_than_srgb() {
+        // Black → white at t = 0.5:
+        //   sRGB lerp   = 128 (midpoint between 0 and 255 in sRGB space)
+        //   linear lerp = encode_srgb(0.5) ≈ 188
+        // The linear-space midpoint is *brighter*; this is the canonical
+        // demo of why linearRGB gradients look "right" — sRGB midpoints
+        // are perceptually too dark because the encoded grey 128 is only
+        // 22% reflectance.
+        let g = LinearGradient {
+            start: Point::new(0.0, 0.0),
+            end: Point::new(10.0, 0.0),
+            stops: vec![
+                GradientStop::new(0.0, Rgba::opaque(0, 0, 0)),
+                GradientStop::new(1.0, Rgba::opaque(255, 255, 255)),
+            ],
+            spread: SpreadMethod::Pad,
+        };
+        let srgb_mid = eval_linear_gradient_in(&g, 5.0, 0.0, InterpolationSpace::Srgb);
+        let lin_mid = eval_linear_gradient_in(&g, 5.0, 0.0, InterpolationSpace::LinearRgb);
+        assert!(
+            (srgb_mid.r as i32 - 128).abs() <= 2,
+            "sRGB midpoint should be ~128, got {}",
+            srgb_mid.r
+        );
+        assert!(
+            lin_mid.r >= 185 && lin_mid.r <= 192,
+            "linearRGB midpoint should be ~188, got {}",
+            lin_mid.r
+        );
+    }
+
+    #[test]
+    fn linear_interpolation_red_to_green_avoids_dark_midpoint() {
+        // The classic "ugly grey midpoint" sRGB artefact: red → green
+        // through (188, 188, 0) in sRGB but through (~188, ~188, 0)
+        // *brighter* in linearRGB. The point: both channels should be
+        // at the linear midpoint of fully-on, not the sRGB midpoint of
+        // fully-on (= 128 each).
+        let g = LinearGradient {
+            start: Point::new(0.0, 0.0),
+            end: Point::new(10.0, 0.0),
+            stops: vec![
+                GradientStop::new(0.0, Rgba::opaque(255, 0, 0)),
+                GradientStop::new(1.0, Rgba::opaque(0, 255, 0)),
+            ],
+            spread: SpreadMethod::Pad,
+        };
+        let srgb_mid = eval_linear_gradient_in(&g, 5.0, 0.0, InterpolationSpace::Srgb);
+        let lin_mid = eval_linear_gradient_in(&g, 5.0, 0.0, InterpolationSpace::LinearRgb);
+        // sRGB midpoint: each channel at ~128.
+        assert!(
+            (srgb_mid.r as i32 - 128).abs() <= 2,
+            "sRGB red channel at midpoint should be ~128, got {}",
+            srgb_mid.r
+        );
+        // linearRGB midpoint: each channel at ~188 (encoded from 0.5
+        // light energy).
+        assert!(
+            lin_mid.r >= 185 && lin_mid.r <= 192,
+            "linearRGB red channel at midpoint should be ~188, got {}",
+            lin_mid.r
+        );
+        assert!(
+            lin_mid.g >= 185 && lin_mid.g <= 192,
+            "linearRGB green channel at midpoint should be ~188, got {}",
+            lin_mid.g
+        );
+        assert_eq!(lin_mid.b, 0, "blue should stay 0 throughout");
+    }
+
+    #[test]
+    fn legacy_sample_stops_alias_matches_srgb_path() {
+        // The deprecated `sample_stops` helper must still produce the
+        // same output as the new explicit-sRGB form (so existing tests
+        // keep their semantics).
+        let stops = vec![
+            GradientStop::new(0.0, Rgba::opaque(0, 0, 0)),
+            GradientStop::new(1.0, Rgba::opaque(255, 255, 255)),
+        ];
+        for t in [0.0f32, 0.25, 0.5, 0.75, 1.0] {
+            let legacy = sample_stops(&stops, t);
+            let explicit = sample_stops_in(&stops, t, InterpolationSpace::Srgb);
+            assert_eq!(legacy, explicit, "mismatch at t={}", t);
+        }
     }
 
     #[test]
