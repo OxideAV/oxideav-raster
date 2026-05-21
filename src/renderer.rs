@@ -8,8 +8,9 @@ use oxideav_core::{
     Transform2D, VectorFrame, VideoFrame, VideoPlane,
 };
 
+use crate::blend::BlendMode;
 use crate::cache::{composite_key, CacheStats, RasterizedSubtree, SharedCache};
-use crate::composite::composite_rgba_premultiplied;
+use crate::composite::composite_rgba_premultiplied_blend;
 use crate::fill::{rasterize_fill, AlphaMask};
 use crate::flatten::{flatten_path, FlatContour};
 use crate::gradient::InterpolationSpace;
@@ -55,6 +56,15 @@ pub struct Renderer {
     /// `color-interpolation: linearRGB` behaviour (avoids the dark
     /// midpoint where complementary primaries cross).
     pub color_interpolation: InterpolationSpace,
+    /// Per-paint compositing blend mode (PDF 32000-1:2008 §11.3.5 /
+    /// W3C Compositing-1 §10 standard separable modes). Defaults to
+    /// [`BlendMode::Normal`] — the historical source-over operator
+    /// matching SVG 1.1 and the CSS `mix-blend-mode: normal` default;
+    /// any other value routes the composite through the per-pixel
+    /// [`blend_over`](crate::blend_over) evaluation. Applied uniformly
+    /// to fill, stroke, and image paints in the current renderer; SVG 2
+    /// `mix-blend-mode` per-element override is a future extension.
+    pub blend_mode: BlendMode,
     /// Bitmap cache for memoised group subtrees. Shared via
     /// `Arc<Mutex<...>>` so the cache survives `Clone`, and so the
     /// cache lookup remains coherent across the scene walk's
@@ -108,6 +118,7 @@ impl Renderer {
             background: Rgba::new(0, 0, 0, 0),
             image_filter: ImageFilter::default(),
             color_interpolation: InterpolationSpace::default(),
+            blend_mode: BlendMode::default(),
             cache: SharedCache::with_capacity(DEFAULT_CACHE_CAPACITY),
         }
     }
@@ -447,10 +458,11 @@ impl Renderer {
         }
         // Clone gradient-bearing paints so the per-pixel sampler
         // doesn't have to re-resolve at each call.
+        let blend = self.blend_mode;
         match paint {
             Paint::Solid(c) => {
                 let c = *c;
-                composite_rgba_premultiplied(
+                composite_rgba_premultiplied_blend(
                     buf,
                     stride,
                     self.width,
@@ -459,6 +471,7 @@ impl Renderer {
                     0,
                     0,
                     group_opacity,
+                    blend,
                     move |_x, _y| c,
                 );
             }
@@ -468,7 +481,7 @@ impl Renderer {
             other => {
                 let other = other.clone();
                 let space = self.color_interpolation;
-                composite_rgba_premultiplied(
+                composite_rgba_premultiplied_blend(
                     buf,
                     stride,
                     self.width,
@@ -477,6 +490,7 @@ impl Renderer {
                     0,
                     0,
                     group_opacity,
+                    blend,
                     move |x, y| sample_paint_in(&other, x as f32 + 0.5, y as f32 + 0.5, space),
                 );
             }
@@ -520,7 +534,8 @@ impl Renderer {
         let bounds = img.bounds;
         let frame = img.frame.clone();
         let filter = self.image_filter;
-        composite_rgba_premultiplied(
+        let blend = self.blend_mode;
+        composite_rgba_premultiplied_blend(
             buf,
             stride,
             self.width,
@@ -529,6 +544,7 @@ impl Renderer {
             0,
             0,
             group_opacity,
+            blend,
             move |x, y| {
                 let user = inv.apply(oxideav_core::Point::new(x as f32 + 0.5, y as f32 + 0.5));
                 match filter {

@@ -50,7 +50,14 @@
 //! * bitmap cache for memoised group subtrees (consumes
 //!   [`oxideav_core::Group::cache_key`]) — round 3 stores only the
 //!   touched-pixel bbox crop per entry, not the full canvas,
-//! * soft masks (luminance + alpha) on `Node::SoftMask`.
+//! * soft masks (luminance + alpha) on `Node::SoftMask`,
+//! * 11 standard separable blend modes from PDF 32000-1:2008 §11.3.5
+//!   / W3C Compositing-1 §10 (Normal / Multiply / Screen / Overlay /
+//!   Darken / Lighten / ColorDodge / ColorBurn / HardLight / SoftLight /
+//!   Difference / Exclusion) — selectable via [`Renderer::blend_mode`]
+//!   or the standalone [`blend_over`] helper. Normal stays on the fast
+//!   premultiplied source-over path; non-normal modes evaluate the
+//!   spec's basic-compositing formula per-pixel.
 //!
 //! Deferred to a later round:
 //!
@@ -66,6 +73,7 @@
 #![warn(missing_docs)]
 #![allow(clippy::too_many_arguments)]
 
+mod blend;
 mod cache;
 mod composite;
 mod fill;
@@ -75,8 +83,9 @@ mod paint;
 mod renderer;
 mod stroke;
 
+pub use blend::{blend_channel, blend_over, BlendMode};
 pub use cache::{CacheStats, RasterizedSubtree};
-pub use composite::composite_rgba_premultiplied;
+pub use composite::{composite_rgba_premultiplied, composite_rgba_premultiplied_blend};
 pub use fill::{rasterize_fill, AlphaMask};
 pub use flatten::{flatten_arc_to_cubics, flatten_path, FlatContour};
 pub use gradient::{

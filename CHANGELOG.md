@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- 11 standard separable blend modes from PDF 32000-1:2008 §11.3.5 /
+  W3C Compositing-1 §10: Normal (default, fast source-over path
+  unchanged), Multiply, Screen, Overlay, Darken, Lighten, ColorDodge,
+  ColorBurn, HardLight, SoftLight, Difference, Exclusion. Selected via
+  the new `Renderer::blend_mode` field (defaults to `BlendMode::Normal`,
+  so existing renders are bit-identical); applied uniformly to fill,
+  stroke, and image paints. Per-pixel `B(Cb, Cs)` evaluated in
+  normalised f32 then folded into the spec's basic compositing formula
+  `Cr = (1 − αs/αr)·Cb + (αs/αr)·[(1 − αb)·Cs + αb·B(Cb, Cs)]`. The
+  Normal path retains the existing premultiplied-integer fast path so
+  the dispatch cost is one branch per pixel for legacy callers. A
+  free-standing `blend_over(cb, cs, mode)` helper and the lower-level
+  `blend_channel` / `composite_rgba_premultiplied_blend` entry points
+  are also re-exported. Per-element SVG-2 `mix-blend-mode` override on
+  individual nodes deferred to a future round (would need a
+  `Node::BlendMode` enum on `oxideav-core`).
 - Mitchell–Netravali bicubic image resampling (`ImageFilter::Mitchell`).
   Standard `B = 1/3, C = 1/3` parameter pair from Mitchell & Netravali's
   1988 reconstruction-filter paper; 4×4 separable kernel sampled in

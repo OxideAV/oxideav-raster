@@ -16,6 +16,7 @@
 //! source alpha by an extra group-opacity factor without rebuilding
 //! the mask.
 
+use crate::blend::{blend_over, BlendMode};
 use crate::fill::AlphaMask;
 use oxideav_core::Rgba;
 
@@ -44,6 +45,40 @@ pub fn composite_rgba_premultiplied(
     offset_x: i32,
     offset_y: i32,
     extra_alpha: f32,
+    paint_at: impl FnMut(u32, u32) -> Rgba,
+) {
+    composite_rgba_premultiplied_blend(
+        dst,
+        dst_stride,
+        dst_width,
+        dst_height,
+        mask,
+        offset_x,
+        offset_y,
+        extra_alpha,
+        BlendMode::Normal,
+        paint_at,
+    )
+}
+
+/// Composite a source mask + paint onto an `Rgba` byte buffer using
+/// the given [`BlendMode`] in the spec-defined PDF §11.3.3 / W3C
+/// Compositing-1 §10 basic-compositing formula.
+///
+/// For [`BlendMode::Normal`] this is the same fast source-over path as
+/// [`composite_rgba_premultiplied`]; non-normal modes route through the
+/// per-pixel `blend_over` evaluation in [`crate::blend`]. Otherwise the
+/// arguments match [`composite_rgba_premultiplied`].
+pub fn composite_rgba_premultiplied_blend(
+    dst: &mut [u8],
+    dst_stride: usize,
+    dst_width: u32,
+    dst_height: u32,
+    mask: &AlphaMask,
+    offset_x: i32,
+    offset_y: i32,
+    extra_alpha: f32,
+    blend: BlendMode,
     mut paint_at: impl FnMut(u32, u32) -> Rgba,
 ) {
     if mask.is_empty() {
@@ -80,40 +115,51 @@ pub fn composite_rgba_premultiplied(
             if combined == 0 {
                 continue;
             }
-            // Pre-multiply source.
-            let sa = combined;
-            let sr = ((src.r as u32) * sa + 127) / 255;
-            let sg = ((src.g as u32) * sa + 127) / 255;
-            let sb = ((src.b as u32) * sa + 127) / 255;
-            // Read destination as premultiplied (we store dst in
-            // straight-alpha so promote first).
-            let dr0 = dst[pidx] as u32;
-            let dg0 = dst[pidx + 1] as u32;
-            let db0 = dst[pidx + 2] as u32;
-            let da0 = dst[pidx + 3] as u32;
-            let dr = (dr0 * da0 + 127) / 255;
-            let dg = (dg0 * da0 + 127) / 255;
-            let db = (db0 * da0 + 127) / 255;
-            // Source-over in premultiplied space.
-            let inv = 255 - sa;
-            let or = sr + (dr * inv + 127) / 255;
-            let og = sg + (dg * inv + 127) / 255;
-            let ob = sb + (db * inv + 127) / 255;
-            let oa = sa + (da0 * inv + 127) / 255;
-            // Un-premultiply for the straight-alpha destination.
-            let or_s = (or * 255 + oa / 2)
-                .checked_div(oa)
-                .map_or(0, |v| v.min(255));
-            let og_s = (og * 255 + oa / 2)
-                .checked_div(oa)
-                .map_or(0, |v| v.min(255));
-            let ob_s = (ob * 255 + oa / 2)
-                .checked_div(oa)
-                .map_or(0, |v| v.min(255));
-            dst[pidx] = or_s as u8;
-            dst[pidx + 1] = og_s as u8;
-            dst[pidx + 2] = ob_s as u8;
-            dst[pidx + 3] = oa.min(255) as u8;
+            if blend.is_normal() {
+                // Fast path: standard premultiplied source-over.
+                let sa = combined;
+                let sr = ((src.r as u32) * sa + 127) / 255;
+                let sg = ((src.g as u32) * sa + 127) / 255;
+                let sb = ((src.b as u32) * sa + 127) / 255;
+                let dr0 = dst[pidx] as u32;
+                let dg0 = dst[pidx + 1] as u32;
+                let db0 = dst[pidx + 2] as u32;
+                let da0 = dst[pidx + 3] as u32;
+                let dr = (dr0 * da0 + 127) / 255;
+                let dg = (dg0 * da0 + 127) / 255;
+                let db = (db0 * da0 + 127) / 255;
+                let inv = 255 - sa;
+                let or = sr + (dr * inv + 127) / 255;
+                let og = sg + (dg * inv + 127) / 255;
+                let ob = sb + (db * inv + 127) / 255;
+                let oa = sa + (da0 * inv + 127) / 255;
+                let or_s = (or * 255 + oa / 2)
+                    .checked_div(oa)
+                    .map_or(0, |v| v.min(255));
+                let og_s = (og * 255 + oa / 2)
+                    .checked_div(oa)
+                    .map_or(0, |v| v.min(255));
+                let ob_s = (ob * 255 + oa / 2)
+                    .checked_div(oa)
+                    .map_or(0, |v| v.min(255));
+                dst[pidx] = or_s as u8;
+                dst[pidx + 1] = og_s as u8;
+                dst[pidx + 2] = ob_s as u8;
+                dst[pidx + 3] = oa.min(255) as u8;
+            } else {
+                // Slow path: full per-pixel separable blend. The
+                // backdrop is read straight-alpha; the source colour's
+                // alpha is replaced with the coverage-folded `combined`
+                // value so the spec's compositing formula sees the
+                // already-modulated source.
+                let cb = Rgba::new(dst[pidx], dst[pidx + 1], dst[pidx + 2], dst[pidx + 3]);
+                let cs = Rgba::new(src.r, src.g, src.b, combined.min(255) as u8);
+                let cr = blend_over(cb, cs, blend);
+                dst[pidx] = cr.r;
+                dst[pidx + 1] = cr.g;
+                dst[pidx + 2] = cr.b;
+                dst[pidx + 3] = cr.a;
+            }
         }
     }
 }
