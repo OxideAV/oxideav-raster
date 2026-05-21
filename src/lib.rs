@@ -51,13 +51,17 @@
 //!   [`oxideav_core::Group::cache_key`]) — round 3 stores only the
 //!   touched-pixel bbox crop per entry, not the full canvas,
 //! * soft masks (luminance + alpha) on `Node::SoftMask`,
-//! * 11 standard separable blend modes from PDF 32000-1:2008 §11.3.5
+//! * 12 standard separable blend modes from PDF 32000-1:2008 §11.3.5.2
 //!   / W3C Compositing-1 §10 (Normal / Multiply / Screen / Overlay /
 //!   Darken / Lighten / ColorDodge / ColorBurn / HardLight / SoftLight /
-//!   Difference / Exclusion) — selectable via [`Renderer::blend_mode`]
-//!   or the standalone [`blend_over`] helper. Normal stays on the fast
-//!   premultiplied source-over path; non-normal modes evaluate the
-//!   spec's basic-compositing formula per-pixel.
+//!   Difference / Exclusion) + 4 non-separable HSL modes from PDF
+//!   §11.3.5.3 / W3C Compositing-1 §11 (Hue / Saturation / Color /
+//!   Luminosity, using the spec's PDF-coefficient `Lum` /
+//!   `SetLum` / `ClipColor` / `Sat` / `SetSat` helpers) — selectable
+//!   via [`Renderer::blend_mode`] or the standalone [`blend_over`]
+//!   helper. Normal stays on the fast premultiplied source-over path;
+//!   non-normal modes evaluate the spec's basic-compositing formula
+//!   per-pixel.
 //!
 //! Deferred to a later round:
 //!

@@ -30,7 +30,8 @@ produces a packed `Rgba` `VideoFrame`.
 | Image resample: bilinear                  | done (round 2)       |
 | Image resample: Lanczos2 (4×4 sinc)       | done (round 3)       |
 | Image resample: Mitchell–Netravali bicubic| done (round 4)       |
-| 11 separable blend modes (PDF §11.3.5)    | done (round 5)       |
+| 12 separable blend modes (PDF §11.3.5.2)  | done (round 5)       |
+| 4 non-separable HSL modes (PDF §11.3.5.3) | done (round 6)       |
 | Filters (blur, drop-shadow, …)            | pending              |
 | `<pattern>` paint                         | pending              |
 | Full ICC color-managed pipeline           | pending              |

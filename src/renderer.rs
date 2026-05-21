@@ -57,10 +57,11 @@ pub struct Renderer {
     /// midpoint where complementary primaries cross).
     pub color_interpolation: InterpolationSpace,
     /// Per-paint compositing blend mode (PDF 32000-1:2008 §11.3.5 /
-    /// W3C Compositing-1 §10 standard separable modes). Defaults to
-    /// [`BlendMode::Normal`] — the historical source-over operator
-    /// matching SVG 1.1 and the CSS `mix-blend-mode: normal` default;
-    /// any other value routes the composite through the per-pixel
+    /// W3C Compositing-1 §10–§11 standard modes — 12 separable plus
+    /// 4 non-separable HSL modes). Defaults to [`BlendMode::Normal`]
+    /// — the historical source-over operator matching SVG 1.1 and the
+    /// CSS `mix-blend-mode: normal` default; any other value routes
+    /// the composite through the per-pixel
     /// [`blend_over`](crate::blend_over) evaluation. Applied uniformly
     /// to fill, stroke, and image paints in the current renderer; SVG 2
     /// `mix-blend-mode` per-element override is a future extension.

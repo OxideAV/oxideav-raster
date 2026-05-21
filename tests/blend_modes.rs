@@ -332,3 +332,137 @@ fn blend_mode_field_clones_through_renderer() {
     let r2 = r.clone();
     assert_eq!(r2.blend_mode, BlendMode::SoftLight);
 }
+
+// --- Non-separable HSL modes (PDF 32000-1:2008 §11.3.5.3 Table 137).
+
+#[test]
+fn color_mode_preserves_backdrop_luminance() {
+    // PDF §11.3.5.3 Color: B(Cb, Cs) = SetLum(Cs, Lum(Cb)). For an
+    // opaque pair the result's PDF-Lum (0.30·R + 0.59·G + 0.11·B)
+    // must match the backdrop's PDF-Lum.
+    let mut r = Renderer::new(16, 16);
+    r.blend_mode = BlendMode::Color;
+    let cb = Rgba::opaque(80, 180, 60);
+    let cs = Rgba::opaque(220, 100, 40);
+    let got = centre_pixel(&r, &stacked_scene(cb, cs));
+    assert_eq!(got.a, 255);
+    let want_l = 0.30 * cb.r as f32 + 0.59 * cb.g as f32 + 0.11 * cb.b as f32;
+    let got_l = 0.30 * got.r as f32 + 0.59 * got.g as f32 + 0.11 * got.b as f32;
+    assert!(
+        (got_l - want_l).abs() <= 1.5,
+        "Color mode broke luminance: got_l={got_l} want_l={want_l} (got pixel {got:?})"
+    );
+}
+
+#[test]
+fn luminosity_mode_takes_source_luminance() {
+    // PDF §11.3.5.3 Luminosity: B(Cb, Cs) = SetLum(Cb, Lum(Cs)).
+    let mut r = Renderer::new(16, 16);
+    r.blend_mode = BlendMode::Luminosity;
+    let cb = Rgba::opaque(80, 180, 60);
+    let cs = Rgba::opaque(220, 100, 40);
+    let got = centre_pixel(&r, &stacked_scene(cb, cs));
+    assert_eq!(got.a, 255);
+    let want_l = 0.30 * cs.r as f32 + 0.59 * cs.g as f32 + 0.11 * cs.b as f32;
+    let got_l = 0.30 * got.r as f32 + 0.59 * got.g as f32 + 0.11 * got.b as f32;
+    assert!(
+        (got_l - want_l).abs() <= 1.5,
+        "Luminosity mode broke luminance: got_l={got_l} want_l={want_l}"
+    );
+}
+
+#[test]
+fn saturation_mode_over_grey_backdrop_is_identity() {
+    // PDF §11.3.5.3 Saturation NOTE 2: "Painting with this mode in an
+    // area of the backdrop that is a pure gray (no saturation)
+    // produces no change."
+    let mut r = Renderer::new(16, 16);
+    r.blend_mode = BlendMode::Saturation;
+    let cb = Rgba::opaque(120, 120, 120);
+    let cs = Rgba::opaque(220, 100, 40);
+    let got = centre_pixel(&r, &stacked_scene(cb, cs));
+    // ±1 per channel for byte-rounding through the f32 path.
+    assert!((got.r as i32 - cb.r as i32).abs() <= 1);
+    assert!((got.g as i32 - cb.g as i32).abs() <= 1);
+    assert!((got.b as i32 - cb.b as i32).abs() <= 1);
+    assert_eq!(got.a, 255);
+}
+
+#[test]
+fn hue_mode_keeps_backdrop_luminance_and_caps_saturation() {
+    // PDF §11.3.5.3 Hue: B = SetLum(SetSat(Cs, Sat(Cb)), Lum(Cb)). The
+    // result must preserve Lum(Cb); its saturation cannot exceed
+    // Sat(Cb) (ClipColor may reduce it during gamut mapping but never
+    // increases it).
+    let mut r = Renderer::new(16, 16);
+    r.blend_mode = BlendMode::Hue;
+    let cb = Rgba::opaque(80, 160, 120);
+    let cs = Rgba::opaque(220, 30, 90);
+    let got = centre_pixel(&r, &stacked_scene(cb, cs));
+    assert_eq!(got.a, 255);
+    let want_l = 0.30 * cb.r as f32 + 0.59 * cb.g as f32 + 0.11 * cb.b as f32;
+    let got_l = 0.30 * got.r as f32 + 0.59 * got.g as f32 + 0.11 * got.b as f32;
+    assert!(
+        (got_l - want_l).abs() <= 1.5,
+        "Hue mode broke luminance: got_l={got_l} want_l={want_l}"
+    );
+    let sat_cb = cb.r.max(cb.g).max(cb.b) as i32 - cb.r.min(cb.g).min(cb.b) as i32;
+    let sat_got = got.r.max(got.g).max(got.b) as i32 - got.r.min(got.g).min(got.b) as i32;
+    assert!(
+        sat_got <= sat_cb + 2,
+        "Sat(Hue(Cb,Cs))={sat_got} > Sat(Cb)={sat_cb}"
+    );
+}
+
+#[test]
+fn color_mode_over_grey_source_is_grey() {
+    // Color with a grey source: SetLum(grey, Lum(Cb)) is just a grey
+    // whose value equals Lum(Cb). The result must be achromatic.
+    let mut r = Renderer::new(16, 16);
+    r.blend_mode = BlendMode::Color;
+    let cb = Rgba::opaque(80, 180, 60);
+    let cs = Rgba::opaque(128, 128, 128); // any grey
+    let got = centre_pixel(&r, &stacked_scene(cb, cs));
+    assert_eq!(got.a, 255);
+    // R, G, B should all be equal (allowing ±1 for byte-rounding).
+    assert!((got.r as i32 - got.g as i32).abs() <= 1);
+    assert!((got.g as i32 - got.b as i32).abs() <= 1);
+}
+
+#[test]
+fn luminosity_with_same_luma_source_is_backdrop() {
+    // If Lum(Cs) == Lum(Cb), Luminosity should leave the backdrop
+    // basically unchanged (the SetLum step is a no-op modulo
+    // ClipColor). Construct Cs to have the same PDF Lum as Cb.
+    let mut r = Renderer::new(16, 16);
+    r.blend_mode = BlendMode::Luminosity;
+    let cb = Rgba::opaque(100, 150, 50);
+    let target_l = 0.30 * cb.r as f32 + 0.59 * cb.g as f32 + 0.11 * cb.b as f32;
+    // Pure-grey source at this luminance.
+    let cs = Rgba::opaque(
+        target_l.round() as u8,
+        target_l.round() as u8,
+        target_l.round() as u8,
+    );
+    let got = centre_pixel(&r, &stacked_scene(cb, cs));
+    // ±2 per channel for cumulative rounding (3-channel Lum
+    // round-trip through bytes).
+    assert!(
+        (got.r as i32 - cb.r as i32).abs() <= 2,
+        "got.r={} cb.r={}",
+        got.r,
+        cb.r
+    );
+    assert!(
+        (got.g as i32 - cb.g as i32).abs() <= 2,
+        "got.g={} cb.g={}",
+        got.g,
+        cb.g
+    );
+    assert!(
+        (got.b as i32 - cb.b as i32).abs() <= 2,
+        "got.b={} cb.b={}",
+        got.b,
+        cb.b
+    );
+}

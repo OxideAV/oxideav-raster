@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- 4 non-separable HSL blend modes from PDF 32000-1:2008 §11.3.5.3 /
+  W3C Compositing-1 §11: Hue, Saturation, Color, Luminosity. Composed
+  from the spec's auxiliary helpers `Lum(C) = 0.30·R + 0.59·G + 0.11·B`
+  (PDF coefficients — *not* Rec. 709), `SetLum`, `ClipColor`,
+  `Sat = max(R,G,B) − min(R,G,B)`, and `SetSat`. The four formulas
+  from Table 137 are wired into [`BlendMode::blend_rgb`] which now
+  dispatches non-separable modes per-RGB-triple and falls through to
+  the existing per-channel `blend_channel` path for the 12 separable
+  modes. `BlendMode::is_separable()` is added for introspection;
+  `blend_channel` panics with a clear message if called with a
+  non-separable mode (those require the full triple). Composite path
+  is unchanged: any non-`Normal` mode routes through `blend_over`,
+  which now correctly evaluates the HSL modes. Brings the
+  `Renderer::blend_mode` enum to the full 16-mode PDF / W3C surface.
 - 11 standard separable blend modes from PDF 32000-1:2008 §11.3.5 /
   W3C Compositing-1 §10: Normal (default, fast source-over path
   unchanged), Multiply, Screen, Overlay, Darken, Lighten, ColorDodge,
