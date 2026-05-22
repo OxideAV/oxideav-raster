@@ -100,6 +100,16 @@ pub enum ImageFilter {
     /// for *downscaling* photographic content where Lanczos2's
     /// negative lobes can show as halo banding.
     Mitchell,
+    /// Catmull–Rom bicubic — the `B = 0, C = 1/2` interpolating member
+    /// of the same Mitchell–Netravali (1988) BC family. Unlike Mitchell
+    /// it passes exactly through the source samples (`k(0) = 1`,
+    /// `k(±1) = k(±2) = 0`), so it preserves crisp edges without the
+    /// blur Mitchell's `B = 1/3` term introduces. The price is a
+    /// stronger negative side-lobe (more ringing potential than
+    /// Mitchell), absorbed by the sampler's per-channel `[0, 255]`
+    /// clamp. A good default for *upscaling* line art / UI where edge
+    /// sharpness matters more than maximal smoothness.
+    CatmullRom,
 }
 
 /// Default cache capacity (entries) when none is specified.
@@ -579,6 +589,9 @@ impl Renderer {
                     ImageFilter::Bilinear => sample_image_bilinear(&frame, &bounds, user.x, user.y),
                     ImageFilter::Lanczos2 => sample_image_lanczos2(&frame, &bounds, user.x, user.y),
                     ImageFilter::Mitchell => sample_image_mitchell(&frame, &bounds, user.x, user.y),
+                    ImageFilter::CatmullRom => {
+                        sample_image_catmull_rom(&frame, &bounds, user.x, user.y)
+                    }
                 }
             },
         );
@@ -1029,6 +1042,30 @@ fn sample_image_lanczos2(frame: &VideoFrame, bounds: &Rect, ux: f32, uy: f32) ->
 /// out-of-bounds handling and edge-clamp behaviour mirrors the bilinear
 /// and Lanczos2 paths.
 fn sample_image_mitchell(frame: &VideoFrame, bounds: &Rect, ux: f32, uy: f32) -> Rgba {
+    sample_image_bc_cubic(frame, bounds, ux, uy, mitchell_netravali)
+}
+
+/// Catmull–Rom bicubic sample of an `Rgba` `VideoFrame` — the `B = 0,
+/// C = 1/2` interpolating member of the BC family (sharper than
+/// Mitchell, passes through source samples). Shares the 4×4 separable
+/// premultiplied-alpha machinery via [`sample_image_bc_cubic`]; the only
+/// difference from the Mitchell path is the per-axis kernel.
+fn sample_image_catmull_rom(frame: &VideoFrame, bounds: &Rect, ux: f32, uy: f32) -> Rgba {
+    sample_image_bc_cubic(frame, bounds, ux, uy, catmull_rom)
+}
+
+/// Shared 4×4 separable BC-family-cubic sampler. `kernel` is one of the
+/// Mitchell–Netravali BC kernels ([`mitchell_netravali`] /
+/// [`catmull_rom`]); the geometry, premultiplied-alpha accumulation,
+/// boundary clamp + per-axis weight re-normalisation, and final
+/// un-premultiply are identical across the family.
+fn sample_image_bc_cubic(
+    frame: &VideoFrame,
+    bounds: &Rect,
+    ux: f32,
+    uy: f32,
+    kernel: fn(f32) -> f32,
+) -> Rgba {
     let info = match prepare_image_sample(frame, bounds, ux, uy) {
         Some(i) => i,
         None => return Rgba::new(0, 0, 0, 0),
@@ -1044,15 +1081,15 @@ fn sample_image_mitchell(frame: &VideoFrame, bounds: &Rect, ux: f32, uy: f32) ->
     let mut sumwy = 0.0f32;
     for (k, (wx, wy)) in wxs.iter_mut().zip(wys.iter_mut()).enumerate() {
         let off = (k as i64) - 1;
-        *wx = mitchell_netravali(tx - (xc + off) as f32);
-        *wy = mitchell_netravali(ty - (yc + off) as f32);
+        *wx = kernel(tx - (xc + off) as f32);
+        *wy = kernel(ty - (yc + off) as f32);
         sumwx += *wx;
         sumwy += *wy;
     }
-    // The Mitchell–Netravali kernel already sums to 1 across an
-    // integer-aligned 4-tap window, but at the clamped boundary the
-    // contributing taps shift and the partition-of-unity property is
-    // broken; re-normalise so edge samples don't shift in luminance.
+    // Every BC-family cubic sums to 1 across an integer-aligned 4-tap
+    // window, but at the clamped boundary the contributing taps shift
+    // and the partition-of-unity property is broken; re-normalise so
+    // edge samples don't shift in luminance.
     if sumwx.abs() > 1e-6 {
         for w in wxs.iter_mut() {
             *w /= sumwx;
@@ -1089,9 +1126,9 @@ fn sample_image_mitchell(frame: &VideoFrame, bounds: &Rect, ux: f32, uy: f32) ->
     )
 }
 
-/// Mitchell–Netravali cubic reconstruction kernel with `B = 1/3, C = 1/3`
-/// (the "Mitchell" point of the BC family). The kernel piecewise
-/// polynomial is:
+/// Generic Mitchell–Netravali BC-family cubic reconstruction kernel.
+/// The piecewise polynomial (from *Mitchell & Netravali, "Reconstruction
+/// Filters in Computer Graphics" (1988)*) is:
 ///
 /// ```text
 ///                    1
@@ -1103,38 +1140,67 @@ fn sample_image_mitchell(frame: &VideoFrame, bounds: &Rect, ux: f32, uy: f32) ->
 /// }
 /// ```
 ///
-/// With `B = 1/3, C = 1/3` (substituting and dividing through by 6):
+/// `(B, C)` selects the member of the family:
+///
+/// * `(1/3, 1/3)` — the "Mitchell" point (balanced blur + ringing); see
+///   [`mitchell_netravali`].
+/// * `(0, 1/2)` — Catmull–Rom: the interpolating cubic spline
+///   (`k(0) = 1`, `k(n) = 0` for non-zero integer `n`), so it passes
+///   exactly through the source samples and is noticeably sharper than
+///   Mitchell at the cost of a slightly stronger negative side-lobe; see
+///   [`catmull_rom`].
+///
+/// The naive un-factored form below is the one we actually evaluate —
+/// it keeps the source close to the textbook formula and is fast enough
+/// for a 4-tap-per-axis hot loop.
+#[inline]
+fn bc_cubic(x: f32, b: f32, c: f32) -> f32 {
+    let ax = x.abs();
+    if ax < 1.0 {
+        let x2 = ax * ax;
+        let x3 = x2 * ax;
+        ((12.0 - 9.0 * b - 6.0 * c) * x3 + (-18.0 + 12.0 * b + 6.0 * c) * x2 + (6.0 - 2.0 * b))
+            / 6.0
+    } else if ax < 2.0 {
+        let x2 = ax * ax;
+        let x3 = x2 * ax;
+        ((-b - 6.0 * c) * x3
+            + (6.0 * b + 30.0 * c) * x2
+            + (-12.0 * b - 48.0 * c) * ax
+            + (8.0 * b + 24.0 * c))
+            / 6.0
+    } else {
+        0.0
+    }
+}
+
+/// Mitchell–Netravali cubic reconstruction kernel with `B = 1/3, C = 1/3`
+/// — the "Mitchell" point of the BC family, the subjective best blur +
+/// ringing trade-off per the 1988 paper.
+///
+/// With `B = 1/3, C = 1/3` the [`bc_cubic`] polynomial reduces to:
 ///
 /// ```text
 ///   |x| < 1   → (7·|x|³ − 12·|x|² + 16/3) / 6
 ///   1 ≤ |x| < 2 → (−7/3·|x|³ + 12·|x|² − 20·|x| + 32/3) / 6
 ///   else        → 0
 /// ```
-///
-/// The naive un-factored form below is the one we actually evaluate —
-/// it keeps the source close to the textbook formula and is fast enough
-/// for a 4-tap-per-axis hot loop.
 #[inline]
 fn mitchell_netravali(x: f32) -> f32 {
-    const B: f32 = 1.0 / 3.0;
-    const C: f32 = 1.0 / 3.0;
-    let ax = x.abs();
-    if ax < 1.0 {
-        let x2 = ax * ax;
-        let x3 = x2 * ax;
-        ((12.0 - 9.0 * B - 6.0 * C) * x3 + (-18.0 + 12.0 * B + 6.0 * C) * x2 + (6.0 - 2.0 * B))
-            / 6.0
-    } else if ax < 2.0 {
-        let x2 = ax * ax;
-        let x3 = x2 * ax;
-        ((-B - 6.0 * C) * x3
-            + (6.0 * B + 30.0 * C) * x2
-            + (-12.0 * B - 48.0 * C) * ax
-            + (8.0 * B + 24.0 * C))
-            / 6.0
-    } else {
-        0.0
-    }
+    bc_cubic(x, 1.0 / 3.0, 1.0 / 3.0)
+}
+
+/// Catmull–Rom cubic reconstruction kernel — the `B = 0, C = 1/2` member
+/// of the Mitchell–Netravali BC family. It is the unique cubic in the
+/// family that *interpolates* the source samples (`k(0) = 1`, and
+/// `k(±1) = k(±2) = 0`), so a sample landing exactly on a source-pixel
+/// centre reproduces that pixel unchanged. Sharper than Mitchell (no
+/// blur term, `B = 0`); the price is a stronger negative side-lobe in
+/// `1 ≤ |x| < 2`, which the sampler's per-channel `[0, 255]` clamp
+/// absorbs. A good choice for *upscaling* where edge crispness matters.
+#[inline]
+fn catmull_rom(x: f32) -> f32 {
+    bc_cubic(x, 0.0, 0.5)
 }
 
 /// Lanczos kernel for `a = 2`. `lanczos2(0) = 1`; vanishes at integer
@@ -1504,6 +1570,72 @@ mod tests {
                 frac,
                 sum
             );
+        }
+    }
+
+    #[test]
+    fn catmull_rom_interpolates_source_samples() {
+        // The defining property of Catmull–Rom (the interpolating member
+        // of the BC family): k(0) = 1 and k vanishes at every non-zero
+        // integer offset, so a sample on a pixel centre reproduces it.
+        assert!((catmull_rom(0.0) - 1.0).abs() < 1e-6, "k(0) must be 1");
+        assert!(catmull_rom(1.0).abs() < 1e-6, "k(1) must be 0");
+        assert!(catmull_rom(-1.0).abs() < 1e-6, "k(-1) must be 0");
+        assert_eq!(catmull_rom(2.0), 0.0);
+        assert_eq!(catmull_rom(-2.0), 0.0);
+        assert_eq!(catmull_rom(2.5), 0.0);
+    }
+
+    #[test]
+    fn catmull_rom_kernel_is_even_symmetric() {
+        for x in [0.25f32, 0.5, 0.75, 1.25, 1.5, 1.75] {
+            assert!(
+                (catmull_rom(x) - catmull_rom(-x)).abs() < 1e-6,
+                "asymmetry at |x|={}",
+                x
+            );
+        }
+    }
+
+    #[test]
+    fn catmull_rom_kernel_partition_of_unity_on_offset_grid() {
+        // Like every BC-family cubic, the four weights across a 4-tap
+        // window sum to 1 at any fractional offset.
+        for frac in [0.0f32, 0.1, 0.25, 0.5, 0.75, 0.9] {
+            let sum = catmull_rom(-1.0 - frac)
+                + catmull_rom(-frac)
+                + catmull_rom(1.0 - frac)
+                + catmull_rom(2.0 - frac);
+            assert!(
+                (sum - 1.0).abs() < 1e-5,
+                "partition broken at frac={}, sum={}",
+                frac,
+                sum
+            );
+        }
+    }
+
+    #[test]
+    fn catmull_rom_has_negative_side_lobe() {
+        // The B = 0 family member rings: there is a region in
+        // 1 < |x| < 2 where the kernel goes negative. (Mitchell's
+        // B = 1/3 mostly suppresses this.) Confirm at the side-lobe
+        // extreme x = 1.5.
+        assert!(
+            catmull_rom(1.5) < 0.0,
+            "Catmull–Rom should have a negative side-lobe at x=1.5, got {}",
+            catmull_rom(1.5)
+        );
+    }
+
+    #[test]
+    fn bc_cubic_matches_named_specialisations() {
+        // The named wrappers must equal the generic kernel at their
+        // respective (B, C) points across the whole support.
+        for i in -25..=25 {
+            let x = i as f32 / 10.0;
+            assert!((bc_cubic(x, 1.0 / 3.0, 1.0 / 3.0) - mitchell_netravali(x)).abs() < 1e-7);
+            assert!((bc_cubic(x, 0.0, 0.5) - catmull_rom(x)).abs() < 1e-7);
         }
     }
 }

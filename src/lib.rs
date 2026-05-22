@@ -44,8 +44,9 @@
 //! * single-path clip,
 //! * group opacity,
 //! * embedded raster images (`Node::Image`) — nearest-neighbour,
-//!   bilinear, Lanczos2 (4×4 windowed sinc), or Mitchell–Netravali
-//!   bicubic (`B = C = 1/3`) sampling, configurable via
+//!   bilinear, Lanczos2 (4×4 windowed sinc), Mitchell–Netravali bicubic
+//!   (`B = C = 1/3`), or Catmull–Rom bicubic (`B = 0, C = 1/2`, the
+//!   interpolating BC-family member) sampling, configurable via
 //!   [`Renderer::image_filter`],
 //! * bitmap cache for memoised group subtrees (consumes
 //!   [`oxideav_core::Group::cache_key`]) — round 3 stores only the

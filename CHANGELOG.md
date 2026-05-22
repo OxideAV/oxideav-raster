@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `ImageFilter::CatmullRom` — Catmull–Rom bicubic image resampling, the
+  `B = 0, C = 1/2` interpolating member of the Mitchell–Netravali (1988)
+  BC reconstruction-filter family. Unlike Mitchell (`B = C = 1/3`),
+  Catmull–Rom passes exactly through the source samples (`k(0) = 1`,
+  `k(±1) = k(±2) = 0`), so it preserves crisp edges with no blur term —
+  a better default for *upscaling* line art / UI than Mitchell, which
+  trades sharpness for reduced ringing. The 4×4 separable Mitchell
+  sampler was refactored into a shared `sample_image_bc_cubic` taking a
+  per-axis kernel function and a generic `bc_cubic(x, B, C)` evaluator;
+  `mitchell_netravali` and the new `catmull_rom` are thin wrappers, so
+  the premultiplied-alpha accumulation, boundary clamp, weight
+  re-normalisation, and un-premultiply are byte-identical across the
+  family. Selectable via `Renderer::image_filter`; the renderer default
+  stays `Bilinear`. 10 new tests (5 kernel unit tests in `renderer.rs`
+  covering interpolation property / even symmetry / partition-of-unity /
+  negative side-lobe / generic-vs-named agreement, plus 5 integration
+  tests in `tests/image_catmull_rom.rs` covering solid-colour
+  preservation, seam blending, pixel-aligned exact reproduction,
+  in-gamut step edges, and the unchanged default).
 - Pre-baked stops look-up table for gradient paints. `StopsLut::build`
   pre-computes a 256-entry `Rgba` table once per fill in the active
   `InterpolationSpace`; per-pixel evaluation reduces to a clamped index
