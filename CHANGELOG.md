@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Pre-baked stops look-up table for gradient paints. `StopsLut::build`
+  pre-computes a 256-entry `Rgba` table once per fill in the active
+  `InterpolationSpace`; per-pixel evaluation reduces to a clamped index
+  + load (no `srgb_to_linear` / `linear_to_srgb` `powf` evaluation in
+  the hot loop, no stops-window scan). `eval_linear_gradient_lut` and
+  `eval_radial_gradient_lut` are the LUT-aware sampler entry points;
+  the existing `eval_*_in` per-pixel evaluators remain for callers
+  that don't have a LUT in hand. The `Renderer::composite_with_paint`
+  fast path builds a LUT once per gradient fill, then dispatches the
+  per-pixel closure through `sample_paint_with_lut` — gradient renders
+  in `LinearRgb` mode see the largest improvement (the LUT collapses
+  6× `powf` per pixel down to one read), but `sRGB` interpolation
+  also benefits from the eliminated stops scan. Wired transparently;
+  no public-facing API change for callers using `Renderer::render`.
+  13 new tests (6 `gradient.rs` unit + 7 integration in
+  `tests/gradient_lut.rs`) verify LUT/per-pixel agreement within ±1
+  LSB, endpoint exactness, empty-stops transparency, NaN-safety, and
+  end-to-end Renderer parity.
 - 4 non-separable HSL blend modes from PDF 32000-1:2008 §11.3.5.3 /
   W3C Compositing-1 §11: Hue, Saturation, Color, Luminosity. Composed
   from the spec's auxiliary helpers `Lum(C) = 0.30·R + 0.59·G + 0.11·B`

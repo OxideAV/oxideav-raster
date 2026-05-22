@@ -14,7 +14,7 @@ use crate::composite::composite_rgba_premultiplied_blend;
 use crate::fill::{rasterize_fill, AlphaMask};
 use crate::flatten::{flatten_path, FlatContour};
 use crate::gradient::InterpolationSpace;
-use crate::paint::sample_paint_in;
+use crate::paint::{build_paint_lut, sample_paint_in, sample_paint_with_lut};
 use crate::stroke::stroke_to_fill_path;
 
 /// Top-level vector→raster renderer.
@@ -478,22 +478,48 @@ impl Renderer {
             }
             // Gradient + future non-Solid variants. Cloned upfront so
             // the closure owns its data and survives the composite
-            // call's lifetime.
+            // call's lifetime. Gradients additionally pre-bake a
+            // 256-entry stops LUT once per fill — this collapses the
+            // per-pixel stops-window scan + (for `LinearRgb`) the
+            // `srgb_to_linear` / `linear_to_srgb` `powf` evaluation
+            // down to a single clamped table lookup. The build cost
+            // is `O(stops × 256)` (256× per-stop arithmetic);
+            // amortised against `O(canvas-area)` per-pixel calls this
+            // pays for itself any time the gradient covers more than
+            // ~10 destination pixels, which is essentially always in
+            // practice.
             other => {
-                let other = other.clone();
                 let space = self.color_interpolation;
-                composite_rgba_premultiplied_blend(
-                    buf,
-                    stride,
-                    self.width,
-                    self.height,
-                    mask,
-                    0,
-                    0,
-                    group_opacity,
-                    blend,
-                    move |x, y| sample_paint_in(&other, x as f32 + 0.5, y as f32 + 0.5, space),
-                );
+                let lut = build_paint_lut(other, space);
+                let other = other.clone();
+                match lut {
+                    Some(lut) => composite_rgba_premultiplied_blend(
+                        buf,
+                        stride,
+                        self.width,
+                        self.height,
+                        mask,
+                        0,
+                        0,
+                        group_opacity,
+                        blend,
+                        move |x, y| {
+                            sample_paint_with_lut(&other, x as f32 + 0.5, y as f32 + 0.5, &lut)
+                        },
+                    ),
+                    None => composite_rgba_premultiplied_blend(
+                        buf,
+                        stride,
+                        self.width,
+                        self.height,
+                        mask,
+                        0,
+                        0,
+                        group_opacity,
+                        blend,
+                        move |x, y| sample_paint_in(&other, x as f32 + 0.5, y as f32 + 0.5, space),
+                    ),
+                }
             }
         }
     }

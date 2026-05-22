@@ -22,6 +22,7 @@ produces a packed `Rgba` `VideoFrame`.
 | Pad / Reflect / Repeat spread             | done                 |
 | `color-interpolation: sRGB` (default)     | done                 |
 | `color-interpolation: linearRGB`          | done (round 4)       |
+| Gradient stops LUT (256-entry pre-bake)   | done (round 7)       |
 | Single-path clip                          | done                 |
 | Group opacity                             | done                 |
 | Soft masks (luminance / alpha)            | done (round 2)       |

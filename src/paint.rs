@@ -12,7 +12,36 @@
 
 use oxideav_core::{Paint, Rgba};
 
-use crate::gradient::{eval_linear_gradient_in, eval_radial_gradient_in, InterpolationSpace};
+use crate::gradient::{
+    eval_linear_gradient_in, eval_linear_gradient_lut, eval_radial_gradient_in,
+    eval_radial_gradient_lut, InterpolationSpace, StopsLut,
+};
+
+/// Build a stops LUT for `paint` in `space` if `paint` is a gradient
+/// type that benefits from one. Returns `None` for solid paints and
+/// any non-gradient variant (which the per-pixel path will route
+/// through the slow `sample_paint_in` fallback anyway).
+pub(crate) fn build_paint_lut(paint: &Paint, space: InterpolationSpace) -> Option<StopsLut> {
+    match paint {
+        Paint::LinearGradient(g) => Some(StopsLut::build(&g.stops, space)),
+        Paint::RadialGradient(g) => Some(StopsLut::build(&g.stops, space)),
+        _ => None,
+    }
+}
+
+/// Sample `paint` at pixel `(x, y)` using a pre-built stops LUT for
+/// gradient paints. Solid paints return their color unchanged; non-
+/// gradient variants fall through to the transparent default
+/// (matching [`sample_paint_in`]).
+#[inline]
+pub(crate) fn sample_paint_with_lut(paint: &Paint, x: f32, y: f32, lut: &StopsLut) -> Rgba {
+    match paint {
+        Paint::Solid(c) => *c,
+        Paint::LinearGradient(g) => eval_linear_gradient_lut(g, x, y, lut),
+        Paint::RadialGradient(g) => eval_radial_gradient_lut(g, x, y, lut),
+        _ => Rgba::new(0, 0, 0, 0),
+    }
+}
 
 /// Sample `paint` at pixel `(x, y)` (in raster pixel coordinates),
 /// using the default sRGB interpolation space (back-compat alias).
@@ -66,6 +95,42 @@ mod tests {
         let s = sample_paint_in(&p, 5.0, 5.0, InterpolationSpace::Srgb);
         let l = sample_paint_in(&p, 5.0, 5.0, InterpolationSpace::LinearRgb);
         assert_eq!(s, l);
+    }
+
+    #[test]
+    fn build_paint_lut_only_for_gradients() {
+        let solid = Paint::Solid(Rgba::opaque(10, 20, 30));
+        assert!(build_paint_lut(&solid, InterpolationSpace::Srgb).is_none());
+
+        let lin = Paint::LinearGradient(LinearGradient {
+            start: Point::new(0.0, 0.0),
+            end: Point::new(10.0, 0.0),
+            stops: vec![
+                GradientStop::new(0.0, Rgba::opaque(0, 0, 0)),
+                GradientStop::new(1.0, Rgba::opaque(255, 255, 255)),
+            ],
+            spread: SpreadMethod::Pad,
+        });
+        assert!(build_paint_lut(&lin, InterpolationSpace::Srgb).is_some());
+    }
+
+    #[test]
+    fn sample_paint_with_lut_matches_per_pixel_within_one_lsb() {
+        let p = Paint::LinearGradient(LinearGradient {
+            start: Point::new(0.0, 0.0),
+            end: Point::new(255.0, 0.0),
+            stops: vec![
+                GradientStop::new(0.0, Rgba::opaque(0, 0, 0)),
+                GradientStop::new(1.0, Rgba::opaque(255, 255, 255)),
+            ],
+            spread: SpreadMethod::Pad,
+        });
+        let lut = build_paint_lut(&p, InterpolationSpace::Srgb).unwrap();
+        for x in 0..=255 {
+            let a = sample_paint_in(&p, x as f32, 0.0, InterpolationSpace::Srgb);
+            let b = sample_paint_with_lut(&p, x as f32, 0.0, &lut);
+            assert!((a.r as i32 - b.r as i32).abs() <= 1);
+        }
     }
 
     #[test]

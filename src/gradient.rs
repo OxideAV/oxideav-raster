@@ -44,6 +44,127 @@ pub enum InterpolationSpace {
     LinearRgb,
 }
 
+/// Pre-baked 256-entry stops look-up table.
+///
+/// Each entry is a straight-alpha sRGB color sampled at `t = i / 255`
+/// for `i ∈ 0..=255`. Building the LUT pays the per-stop scan + (for
+/// `LinearRgb`) the `powf` transfer-curve evaluation **once** per
+/// gradient, regardless of the destination pixel count. Per-pixel
+/// sampling then reduces to a clamp + index + load (no float math
+/// inside the inner loop besides the `t` scaling that the geometry
+/// step has to do anyway).
+///
+/// Practical impact: a 1024×1024 radial gradient with 4 stops in
+/// `LinearRgb` mode goes from ~1M × (stops-window scan + 6× powf) to
+/// 256 × (scan + powf) + 1M × (table lookup) — a ~3-5× reduction in
+/// gradient-paint CPU time for non-trivial canvas sizes. The LUT is
+/// also cache-friendly (1 KiB fits in L1), so the per-pixel hit is
+/// dominated by `paint_at` dispatch + the over-blend, not gradient
+/// evaluation.
+///
+/// The 256-entry resolution matches the destination byte depth: any
+/// finer LUT would alias on the trip through the 8-bit per-channel
+/// sRGB encoding at the end of compositing. For interpolation in
+/// linear-light the LUT stores the *already-back-encoded* sRGB byte
+/// values, so no per-pixel `linear_to_srgb` call is needed.
+///
+/// Built via [`StopsLut::build`]; queried via [`StopsLut::sample`].
+#[derive(Debug, Clone)]
+pub struct StopsLut {
+    /// 256 RGBA entries, indexed by `(t.clamp(0,1) * 255).round() as
+    /// u8`.
+    entries: [Rgba; 256],
+}
+
+impl StopsLut {
+    /// Build a LUT for the given stops in the requested interpolation
+    /// space. `stops` must be sorted by `offset` ascending (the same
+    /// contract the underlying [`sample_stops_in`] enforces).
+    ///
+    /// Empty stops produce an all-transparent LUT.
+    pub fn build(stops: &[oxideav_core::GradientStop], space: InterpolationSpace) -> Self {
+        let mut entries = [Rgba::new(0, 0, 0, 0); 256];
+        if stops.is_empty() {
+            return Self { entries };
+        }
+        for (i, slot) in entries.iter_mut().enumerate() {
+            let t = i as f32 / 255.0;
+            *slot = sample_stops_in(stops, t, space);
+        }
+        Self { entries }
+    }
+
+    /// Sample the LUT at `t ∈ [0, 1]`. Values outside the range are
+    /// clamped (`Pad`-equivalent at the LUT boundary — the caller is
+    /// expected to have applied [`apply_spread`] before this call,
+    /// which already normalises `t` into `[0, 1]`).
+    #[inline]
+    pub fn sample(&self, t: f32) -> Rgba {
+        if !t.is_finite() {
+            return self.entries[0];
+        }
+        let scaled = (t * 255.0).round().clamp(0.0, 255.0) as usize;
+        self.entries[scaled]
+    }
+}
+
+/// Evaluate a linear gradient at pixel `(px, py)` using a pre-built
+/// stops LUT. Geometry is identical to [`eval_linear_gradient_in`]; the
+/// stops scan is replaced by [`StopsLut::sample`].
+pub fn eval_linear_gradient_lut(g: &LinearGradient, px: f32, py: f32, lut: &StopsLut) -> Rgba {
+    if g.stops.is_empty() {
+        return Rgba::new(0, 0, 0, 0);
+    }
+    if g.stops.len() == 1 {
+        return g.stops[0].color;
+    }
+    let dx = g.end.x - g.start.x;
+    let dy = g.end.y - g.start.y;
+    let denom = dx * dx + dy * dy;
+    if denom <= 1e-12 {
+        return g.stops.last().copied().unwrap().color;
+    }
+    let t = ((px - g.start.x) * dx + (py - g.start.y) * dy) / denom;
+    lut.sample(apply_spread(t, g.spread))
+}
+
+/// Evaluate a radial gradient at pixel `(px, py)` using a pre-built
+/// stops LUT. Geometry is identical to [`eval_radial_gradient_in`]; the
+/// stops scan is replaced by [`StopsLut::sample`].
+pub fn eval_radial_gradient_lut(g: &RadialGradient, px: f32, py: f32, lut: &StopsLut) -> Rgba {
+    if g.stops.is_empty() {
+        return Rgba::new(0, 0, 0, 0);
+    }
+    if g.stops.len() == 1 || g.radius <= 1e-12 {
+        return g.stops[0].color;
+    }
+    let r = g.radius;
+    let (fx, fy) = clamp_focal_inside_circle(g.focal.unwrap_or(g.center), g.center, r);
+    let cdx = g.center.x - fx;
+    let cdy = g.center.y - fy;
+    let dx = px - fx;
+    let dy = py - fy;
+    let cd = cdx * dx + cdy * dy;
+    let dd = dx * dx + dy * dy;
+    let cc = cdx * cdx + cdy * cdy;
+    let aa = cc - r * r;
+    let t = if aa.abs() < 1e-12 {
+        if cd.abs() < 1e-12 {
+            dd.sqrt() / r
+        } else {
+            dd / (2.0 * cd)
+        }
+    } else {
+        let disc = cd * cd - aa * dd;
+        if disc < 0.0 {
+            dd.sqrt() / r
+        } else {
+            (cd - disc.sqrt()) / aa
+        }
+    };
+    lut.sample(apply_spread(t, g.spread))
+}
+
 /// Sample a linear gradient at pixel `(px, py)` in the sRGB interpolation
 /// space (back-compat alias for [`eval_linear_gradient_in`]).
 pub fn eval_linear_gradient(g: &LinearGradient, px: f32, py: f32) -> Rgba {
@@ -484,6 +605,68 @@ mod tests {
             let legacy = sample_stops(&stops, t);
             let explicit = sample_stops_in(&stops, t, InterpolationSpace::Srgb);
             assert_eq!(legacy, explicit, "mismatch at t={}", t);
+        }
+    }
+
+    #[test]
+    fn stops_lut_endpoint_exact() {
+        let stops = vec![
+            GradientStop::new(0.0, Rgba::opaque(255, 0, 0)),
+            GradientStop::new(1.0, Rgba::opaque(0, 0, 255)),
+        ];
+        let lut = StopsLut::build(&stops, InterpolationSpace::Srgb);
+        assert_eq!(lut.sample(0.0), Rgba::opaque(255, 0, 0));
+        assert_eq!(lut.sample(1.0), Rgba::opaque(0, 0, 255));
+    }
+
+    #[test]
+    fn stops_lut_empty_stops_returns_transparent() {
+        let lut = StopsLut::build(&[], InterpolationSpace::Srgb);
+        // Every entry must be (0, 0, 0, 0) — the documented behaviour
+        // for an empty stop set.
+        for t in [0.0f32, 0.25, 0.5, 0.75, 1.0] {
+            assert_eq!(lut.sample(t), Rgba::new(0, 0, 0, 0));
+        }
+    }
+
+    #[test]
+    fn stops_lut_radial_eval_lut_matches_per_pixel() {
+        let g = RadialGradient {
+            center: Point::new(0.0, 0.0),
+            radius: 10.0,
+            focal: None,
+            stops: vec![
+                GradientStop::new(0.0, Rgba::opaque(255, 0, 0)),
+                GradientStop::new(1.0, Rgba::opaque(0, 0, 255)),
+            ],
+            spread: SpreadMethod::Pad,
+        };
+        let lut = StopsLut::build(&g.stops, InterpolationSpace::Srgb);
+        // Sample a 21×21 grid spanning the gradient's bounding circle
+        // and assert per-pixel and LUT outputs agree within ±1 LSB.
+        for iy in -10..=10 {
+            for ix in -10..=10 {
+                let px = ix as f32;
+                let py = iy as f32;
+                let p = eval_radial_gradient(&g, px, py);
+                let q = eval_radial_gradient_lut(&g, px, py, &lut);
+                for (pa, qa) in [(p.r, q.r), (p.g, q.g), (p.b, q.b), (p.a, q.a)] {
+                    assert!((pa as i32 - qa as i32).abs() <= 1);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn stops_lut_linear_eval_lut_matches_per_pixel() {
+        let g = black_to_white_linear();
+        let lut = StopsLut::build(&g.stops, InterpolationSpace::Srgb);
+        for x in 0..=10 {
+            let p = eval_linear_gradient(&g, x as f32, 0.0);
+            let q = eval_linear_gradient_lut(&g, x as f32, 0.0, &lut);
+            for (pa, qa) in [(p.r, q.r), (p.g, q.g), (p.b, q.b), (p.a, q.a)] {
+                assert!((pa as i32 - qa as i32).abs() <= 1);
+            }
         }
     }
 

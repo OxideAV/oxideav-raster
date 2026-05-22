@@ -93,8 +93,8 @@ pub use composite::{composite_rgba_premultiplied, composite_rgba_premultiplied_b
 pub use fill::{rasterize_fill, AlphaMask};
 pub use flatten::{flatten_arc_to_cubics, flatten_path, FlatContour};
 pub use gradient::{
-    eval_linear_gradient, eval_linear_gradient_in, eval_radial_gradient, eval_radial_gradient_in,
-    InterpolationSpace,
+    eval_linear_gradient, eval_linear_gradient_in, eval_linear_gradient_lut, eval_radial_gradient,
+    eval_radial_gradient_in, eval_radial_gradient_lut, InterpolationSpace, StopsLut,
 };
 pub use paint::{sample_paint, sample_paint_in};
 pub use renderer::{rasterize, ImageFilter, Renderer, DEFAULT_CACHE_CAPACITY};
