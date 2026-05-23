@@ -110,6 +110,20 @@ pub enum ImageFilter {
     /// clamp. A good default for *upscaling* line art / UI where edge
     /// sharpness matters more than maximal smoothness.
     CatmullRom,
+    /// Cubic B-spline — the `B = 1, C = 0` *approximating* member of the
+    /// same Mitchell–Netravali (1988) BC family. It is the smoothest of
+    /// the three canonical points: the kernel is everywhere non-negative
+    /// (no ringing side-lobes, so no overshoot and nothing to clamp), at
+    /// the cost of the strongest blur. Unlike Catmull–Rom it does *not*
+    /// pass through the source samples (`k(0) = 4/6 ≈ 0.667`, not 1), so
+    /// it smooths rather than interpolates. The best choice for
+    /// noise-suppressing *downscaling* or anywhere a halo-free,
+    /// monotone-preserving reconstruction matters more than edge
+    /// sharpness (e.g. heavy minification of photographic content where
+    /// even Mitchell's small negative lobe would alias). 4×4 separable
+    /// kernel; same premultiplied-alpha machinery as Mitchell /
+    /// Catmull–Rom.
+    BSpline,
 }
 
 /// Default cache capacity (entries) when none is specified.
@@ -592,6 +606,7 @@ impl Renderer {
                     ImageFilter::CatmullRom => {
                         sample_image_catmull_rom(&frame, &bounds, user.x, user.y)
                     }
+                    ImageFilter::BSpline => sample_image_b_spline(&frame, &bounds, user.x, user.y),
                 }
             },
         );
@@ -1054,6 +1069,15 @@ fn sample_image_catmull_rom(frame: &VideoFrame, bounds: &Rect, ux: f32, uy: f32)
     sample_image_bc_cubic(frame, bounds, ux, uy, catmull_rom)
 }
 
+/// Cubic B-spline sample of an `Rgba` `VideoFrame` — the `B = 1, C = 0`
+/// approximating member of the BC family (smoothest, ring-free, blurs
+/// rather than interpolates). Shares the 4×4 separable premultiplied-
+/// alpha machinery via [`sample_image_bc_cubic`]; the only difference
+/// from the Mitchell / Catmull–Rom paths is the per-axis kernel.
+fn sample_image_b_spline(frame: &VideoFrame, bounds: &Rect, ux: f32, uy: f32) -> Rgba {
+    sample_image_bc_cubic(frame, bounds, ux, uy, b_spline)
+}
+
 /// Shared 4×4 separable BC-family-cubic sampler. `kernel` is one of the
 /// Mitchell–Netravali BC kernels ([`mitchell_netravali`] /
 /// [`catmull_rom`]); the geometry, premultiplied-alpha accumulation,
@@ -1149,6 +1173,10 @@ fn sample_image_bc_cubic(
 ///   exactly through the source samples and is noticeably sharper than
 ///   Mitchell at the cost of a slightly stronger negative side-lobe; see
 ///   [`catmull_rom`].
+/// * `(1, 0)` — the cubic B-spline: the maximally-smooth, everywhere
+///   non-negative approximating spline (no ringing, no overshoot,
+///   `k(0) = 4/6`), the blurriest of the three canonical points; see
+///   [`b_spline`].
 ///
 /// The naive un-factored form below is the one we actually evaluate —
 /// it keeps the source close to the textbook formula and is fast enough
@@ -1201,6 +1229,29 @@ fn mitchell_netravali(x: f32) -> f32 {
 #[inline]
 fn catmull_rom(x: f32) -> f32 {
     bc_cubic(x, 0.0, 0.5)
+}
+
+/// Cubic B-spline reconstruction kernel — the `B = 1, C = 0` member of
+/// the Mitchell–Netravali BC family. It is the unique *approximating*
+/// cubic in the family: everywhere non-negative (so it never rings or
+/// overshoots — no negative side-lobe to clamp), but it does not
+/// interpolate the source (`k(0) = 4/6 ≈ 0.667`, and the neighbours at
+/// `±1` carry the rest, `k(±1) = 1/6`). It is the smoothest and
+/// blurriest of the three canonical points, the best choice when
+/// halo-free, monotone-preserving minification matters more than edge
+/// sharpness.
+///
+/// With `B = 1, C = 0` the [`bc_cubic`] polynomial reduces to the
+/// classic uniform cubic B-spline basis:
+///
+/// ```text
+///   |x| < 1     → (3·|x|³ − 6·|x|² + 4) / 6
+///   1 ≤ |x| < 2 → (2 − |x|)³ / 6
+///   else        → 0
+/// ```
+#[inline]
+fn b_spline(x: f32) -> f32 {
+    bc_cubic(x, 1.0, 0.0)
 }
 
 /// Lanczos kernel for `a = 2`. `lanczos2(0) = 1`; vanishes at integer
@@ -1636,6 +1687,83 @@ mod tests {
             let x = i as f32 / 10.0;
             assert!((bc_cubic(x, 1.0 / 3.0, 1.0 / 3.0) - mitchell_netravali(x)).abs() < 1e-7);
             assert!((bc_cubic(x, 0.0, 0.5) - catmull_rom(x)).abs() < 1e-7);
+            assert!((bc_cubic(x, 1.0, 0.0) - b_spline(x)).abs() < 1e-7);
+        }
+    }
+
+    #[test]
+    fn b_spline_approximates_not_interpolates() {
+        // The defining property of the B-spline (the approximating member
+        // of the BC family): k(0) = 4/6, NOT 1 — so a sample landing on a
+        // pixel centre is still blended with its neighbours rather than
+        // reproduced. The ±1 neighbours carry 1/6 each.
+        assert!(
+            (b_spline(0.0) - 4.0 / 6.0).abs() < 1e-6,
+            "k(0) must be 4/6, got {}",
+            b_spline(0.0)
+        );
+        assert!(
+            (b_spline(1.0) - 1.0 / 6.0).abs() < 1e-6,
+            "k(1) must be 1/6, got {}",
+            b_spline(1.0)
+        );
+        assert!(
+            (b_spline(-1.0) - 1.0 / 6.0).abs() < 1e-6,
+            "k(-1) must be 1/6, got {}",
+            b_spline(-1.0)
+        );
+        // Vanishes at and beyond the support edge.
+        assert_eq!(b_spline(2.0), 0.0);
+        assert_eq!(b_spline(-2.0), 0.0);
+        assert_eq!(b_spline(2.5), 0.0);
+    }
+
+    #[test]
+    fn b_spline_kernel_is_even_symmetric() {
+        for x in [0.25f32, 0.5, 0.75, 1.25, 1.5, 1.75] {
+            assert!(
+                (b_spline(x) - b_spline(-x)).abs() < 1e-6,
+                "asymmetry at |x|={}",
+                x
+            );
+        }
+    }
+
+    #[test]
+    fn b_spline_kernel_is_everywhere_non_negative() {
+        // Unlike Mitchell (tiny negative tail) and Catmull–Rom (real
+        // side-lobe), the B = 1, C = 0 spline never goes negative — that
+        // is exactly why it cannot ring or overshoot. The mathematical
+        // value is non-negative on the whole support; the tolerance only
+        // absorbs f32 cancellation noise near |x| → 2, where the
+        // expanded-polynomial form recovers (2 − |x|)³ / 6 from
+        // near-cancelling cubic terms (~1.6e-7 of round-off).
+        for i in -200..=200 {
+            let x = i as f32 / 100.0;
+            assert!(
+                b_spline(x) >= -1e-6,
+                "B-spline must be non-negative everywhere, got k({})={}",
+                x,
+                b_spline(x)
+            );
+        }
+    }
+
+    #[test]
+    fn b_spline_kernel_partition_of_unity_on_offset_grid() {
+        // Like every BC-family cubic, the four weights across a 4-tap
+        // window sum to 1 at any fractional offset.
+        for frac in [0.0f32, 0.1, 0.25, 0.5, 0.75, 0.9] {
+            let sum = b_spline(-1.0 - frac)
+                + b_spline(-frac)
+                + b_spline(1.0 - frac)
+                + b_spline(2.0 - frac);
+            assert!(
+                (sum - 1.0).abs() < 1e-5,
+                "partition broken at frac={}, sum={}",
+                frac,
+                sum
+            );
         }
     }
 }

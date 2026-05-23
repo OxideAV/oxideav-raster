@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `ImageFilter::BSpline` — cubic B-spline image resampling, the `B = 1,
+  C = 0` *approximating* member of the Mitchell–Netravali (1988) BC
+  reconstruction-filter family and the third canonical point alongside
+  Mitchell (`B = C = 1/3`) and Catmull–Rom (`B = 0, C = 1/2`). It is the
+  smoothest of the three: the kernel is everywhere non-negative, so it
+  cannot ring or overshoot (nothing to clamp), at the cost of the
+  strongest blur. Unlike Catmull–Rom it does not pass through the source
+  samples (`k(0) = 4/6`, `k(±1) = 1/6`), so it smooths rather than
+  interpolates — the right choice for halo-free, monotone-preserving
+  *downscaling* / minification. Reuses the shared `sample_image_bc_cubic`
+  4×4 separable premultiplied-alpha sampler via a new `b_spline(x)`
+  kernel wrapper over the existing generic `bc_cubic(x, B, C)` evaluator,
+  so the boundary clamp, weight re-normalisation, and un-premultiply are
+  byte-identical across the family. Selectable via
+  `Renderer::image_filter`; the renderer default stays `Bilinear`. 10 new
+  tests (5 kernel unit tests in `renderer.rs` covering the approximating
+  property `k(0) = 4/6` / even symmetry / everywhere-non-negative (no
+  ringing) / partition-of-unity / generic-vs-named agreement, plus 5
+  integration tests in `tests/image_b_spline.rs` covering solid-colour
+  preservation, seam blending, pixel-aligned smoothing, in-gamut step
+  edges, and the unchanged default).
 - `ImageFilter::CatmullRom` — Catmull–Rom bicubic image resampling, the
   `B = 0, C = 1/2` interpolating member of the Mitchell–Netravali (1988)
   BC reconstruction-filter family. Unlike Mitchell (`B = C = 1/3`),
