@@ -30,6 +30,7 @@ produces a packed `Rgba` `VideoFrame`.
 | Image resample: nearest                   | done                 |
 | Image resample: bilinear                  | done (round 2)       |
 | Image resample: Lanczos2 (4×4 sinc)       | done (round 3)       |
+| Image resample: Lanczos3 (6×6 sinc)       | done (round 10)      |
 | Image resample: Mitchell–Netravali bicubic| done (round 4)       |
 | Image resample: Catmull–Rom bicubic       | done (round 8)       |
 | Image resample: cubic B-spline (B=1,C=0)   | done (round 9)       |

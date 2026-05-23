@@ -91,6 +91,21 @@ pub enum ImageFilter {
     /// taps vs 4) and may overshoot, so the per-pixel result is
     /// clamped back into `[0, 255]` per channel.
     Lanczos2,
+    /// Lanczos3 (windowed sinc, a = 3). 6×6 separable kernel
+    /// `lanczos3(x) = sinc(π·x) * sinc(π·x/3)` for `|x| < 3`. The wider
+    /// 6-tap window captures more of the sinc's main lobe (and a piece
+    /// of the first negative side-lobe), which gives noticeably sharper
+    /// reconstruction than Lanczos2 with a less abrupt impulse-response
+    /// truncation — the standard "high-quality" choice in image-
+    /// processing literature (e.g. Turkowski, "Filters for Common
+    /// Resampling Tasks", 1990; Duchon, "Lanczos filtering in one and
+    /// two dimensions", 1979). The price is 36 taps per output pixel
+    /// vs Lanczos2's 16, and a stronger second negative lobe that can
+    /// overshoot further — the per-pixel result is clamped back into
+    /// `[0, 255]` per channel, identical to the Lanczos2 path. Best for
+    /// high-quality downscaling of photographic content where Lanczos2
+    /// still alias-shows on fine repeating texture.
+    Lanczos3,
     /// Mitchell–Netravali bicubic with the classic `B = 1/3, C = 1/3`
     /// parameters (the "Mitchell" point in the Mitchell–Netravali
     /// 1988 reconstruction-filter family — minimises a balanced sum of
@@ -602,6 +617,7 @@ impl Renderer {
                     ImageFilter::Nearest => sample_image_nearest(&frame, &bounds, user.x, user.y),
                     ImageFilter::Bilinear => sample_image_bilinear(&frame, &bounds, user.x, user.y),
                     ImageFilter::Lanczos2 => sample_image_lanczos2(&frame, &bounds, user.x, user.y),
+                    ImageFilter::Lanczos3 => sample_image_lanczos3(&frame, &bounds, user.x, user.y),
                     ImageFilter::Mitchell => sample_image_mitchell(&frame, &bounds, user.x, user.y),
                     ImageFilter::CatmullRom => {
                         sample_image_catmull_rom(&frame, &bounds, user.x, user.y)
@@ -987,6 +1003,48 @@ fn sample_image_bilinear(frame: &VideoFrame, bounds: &Rect, ux: f32, uy: f32) ->
 /// texture boundary. Out-of-bounds (the user point is outside `bounds`)
 /// returns transparent — same as the other samplers.
 fn sample_image_lanczos2(frame: &VideoFrame, bounds: &Rect, ux: f32, uy: f32) -> Rgba {
+    sample_image_lanczos_a::<2, 4>(frame, bounds, ux, uy, lanczos2)
+}
+
+/// Lanczos3 (windowed sinc, `a = 3`) sample of an `Rgba` `VideoFrame`.
+///
+/// `lanczos3(x) = sinc(π·x) * sinc(π·x/3)` for `|x| < 3`, zero
+/// elsewhere. The 2-D filter is the separable product
+/// `lanczos3(x) * lanczos3(y)` evaluated over a 6×6 footprint centred
+/// at the sample point. Wider main-lobe than Lanczos2 → sharper
+/// reconstruction; the second negative side-lobe (around `x = 1.5..2.5`)
+/// can push the per-channel premultiplied accumulator outside
+/// `[0, 255]`, so the result is clamped per channel before
+/// un-premultiplication — identical bookkeeping to the Lanczos2 path.
+/// Reference: Duchon, "Lanczos filtering in one and two dimensions"
+/// (1979); Turkowski, "Filters for Common Resampling Tasks" (1990).
+///
+/// Uses *clamp-to-edge* for samples whose footprint extends past the
+/// texture boundary. Out-of-bounds (the user point is outside `bounds`)
+/// returns transparent — same as the other samplers.
+fn sample_image_lanczos3(frame: &VideoFrame, bounds: &Rect, ux: f32, uy: f32) -> Rgba {
+    sample_image_lanczos_a::<3, 6>(frame, bounds, ux, uy, lanczos3)
+}
+
+/// Shared 2N×2N separable Lanczos sampler (`N = a`). The fixed-size
+/// `[f32; W]` weight arrays (`W = 2 * N`) and the const-generic loop
+/// bound let the compiler unroll the per-axis weight build, while the
+/// shared boundary clamp + premultiplied-alpha accumulation + per-axis
+/// weight re-normalisation keeps the Lanczos2 and Lanczos3 paths
+/// byte-identical apart from `a` and the kernel function pointer.
+///
+/// `N` is the Lanczos half-window in source pixels and `W = 2 * N` the
+/// total tap count per axis; the trailing const generic is required
+/// because const arithmetic in array lengths isn't yet stable on
+/// `[f32; 2 * N]`.
+fn sample_image_lanczos_a<const N: i64, const W: usize>(
+    frame: &VideoFrame,
+    bounds: &Rect,
+    ux: f32,
+    uy: f32,
+    kernel: fn(f32) -> f32,
+) -> Rgba {
+    debug_assert_eq!(W, 2 * N as usize);
     let info = match prepare_image_sample(frame, bounds, ux, uy) {
         Some(i) => i,
         None => return Rgba::new(0, 0, 0, 0),
@@ -995,15 +1053,15 @@ fn sample_image_lanczos2(frame: &VideoFrame, bounds: &Rect, ux: f32, uy: f32) ->
     let ty = info.v * info.height as f32 - 0.5;
     let xc = tx.floor() as i64;
     let yc = ty.floor() as i64;
-    // 4×4 taps at offsets (-1, 0, +1, +2) from the floored centre.
-    let mut wxs = [0.0f32; 4];
-    let mut wys = [0.0f32; 4];
+    // W taps at offsets (-(N-1), .., 0, +1, .., +N) from the floored centre.
+    let mut wxs = [0.0f32; W];
+    let mut wys = [0.0f32; W];
     let mut sumwx = 0.0f32;
     let mut sumwy = 0.0f32;
     for (k, (wx, wy)) in wxs.iter_mut().zip(wys.iter_mut()).enumerate() {
-        let off = (k as i64) - 1;
-        *wx = lanczos2(tx - (xc + off) as f32);
-        *wy = lanczos2(ty - (yc + off) as f32);
+        let off = (k as i64) - (N - 1);
+        *wx = kernel(tx - (xc + off) as f32);
+        *wy = kernel(ty - (yc + off) as f32);
         sumwx += *wx;
         sumwy += *wy;
     }
@@ -1022,9 +1080,9 @@ fn sample_image_lanczos2(frame: &VideoFrame, bounds: &Rect, ux: f32, uy: f32) ->
     }
     let mut acc = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
     for (j, &wy) in wys.iter().enumerate() {
-        let py = (yc + j as i64 - 1).clamp(0, info.height as i64 - 1) as usize;
+        let py = (yc + j as i64 - (N - 1)).clamp(0, info.height as i64 - 1) as usize;
         for (i, &wx) in wxs.iter().enumerate() {
-            let px = (xc + i as i64 - 1).clamp(0, info.width as i64 - 1) as usize;
+            let px = (xc + i as i64 - (N - 1)).clamp(0, info.width as i64 - 1) as usize;
             let w = wx * wy;
             let (r, g, b, a) = fetch_premul(info.data, info.stride, px, py);
             acc.0 += r * w;
@@ -1273,6 +1331,29 @@ fn lanczos2(x: f32) -> f32 {
     let s = pix.sin() / pix;
     let s2 = pix2.sin() / pix2;
     s * s2
+}
+
+/// Lanczos kernel for `a = 3`. `lanczos3(0) = 1`; vanishes at integer
+/// non-zero `x` (the `sinc(πx)` factor); zero outside `|x| < 3`.
+/// Identical structure to [`lanczos2`] with the window stretched to
+/// `sinc(πx/3)` — adds two more taps per axis, picks up the first
+/// negative side-lobe of the source sinc, and gives a noticeably
+/// sharper reconstruction at the cost of one extra `sin` per tap.
+#[inline]
+fn lanczos3(x: f32) -> f32 {
+    let ax = x.abs();
+    if ax >= 3.0 {
+        return 0.0;
+    }
+    if ax < 1e-7 {
+        return 1.0;
+    }
+    let pi = std::f32::consts::PI;
+    let pix = pi * x;
+    let pix3 = pix / 3.0;
+    let s = pix.sin() / pix;
+    let s3 = pix3.sin() / pix3;
+    s * s3
 }
 
 /// Fetch a single texel and convert to premultiplied-alpha floats.
@@ -1561,6 +1642,65 @@ mod tests {
         for x in [0.25f32, 0.5, 0.75, 1.25, 1.5, 1.75] {
             assert!((lanczos2(x) - lanczos2(-x)).abs() < 1e-6);
         }
+    }
+
+    #[test]
+    fn lanczos3_kernel_unit_at_zero_and_zero_at_integers() {
+        assert!((lanczos3(0.0) - 1.0).abs() < 1e-6);
+        // sinc(π·k) is zero for non-zero integer k, so the kernel
+        // vanishes at every integer inside its support except 0.
+        for k in [1.0f32, 2.0, -1.0, -2.0] {
+            assert!(
+                lanczos3(k).abs() < 1e-3,
+                "lanczos3({k}) should vanish at integer non-zero x"
+            );
+        }
+        // Zero outside the 6-tap support.
+        assert_eq!(lanczos3(3.0), 0.0);
+        assert_eq!(lanczos3(-3.0), 0.0);
+        assert_eq!(lanczos3(4.0), 0.0);
+    }
+
+    #[test]
+    fn lanczos3_kernel_is_even_symmetric() {
+        for x in [0.25f32, 0.5, 0.75, 1.25, 1.5, 1.75, 2.25, 2.5, 2.75] {
+            assert!(
+                (lanczos3(x) - lanczos3(-x)).abs() < 1e-6,
+                "lanczos3 should be even-symmetric at x={x}"
+            );
+        }
+    }
+
+    #[test]
+    fn lanczos3_has_negative_side_lobes_unlike_b_spline() {
+        // The second cycle of sinc inside |x| < 3 gives a negative
+        // side-lobe; this is the textbook ringing signature of any
+        // truncated-sinc reconstruction and what distinguishes Lanczos
+        // from the everywhere-non-negative cubic B-spline.
+        let mut saw_negative = false;
+        let mut x = 1.05f32;
+        while x < 1.95 {
+            if lanczos3(x) < 0.0 {
+                saw_negative = true;
+                break;
+            }
+            x += 0.05;
+        }
+        assert!(
+            saw_negative,
+            "lanczos3 should dip below zero in |x| ∈ (1, 2)"
+        );
+    }
+
+    #[test]
+    fn lanczos3_kernel_window_is_wider_than_lanczos2() {
+        // The defining contrast vs Lanczos2: lanczos3 still has
+        // support past |x| = 2 (because sinc(πx/3) is non-zero there),
+        // while lanczos2 is zero by construction.
+        assert_eq!(lanczos2(2.0), 0.0);
+        assert_eq!(lanczos2(2.5), 0.0);
+        // Lanczos3 is non-zero (and indeed negative) in (2, 3).
+        assert!(lanczos3(2.5).abs() > 1e-3);
     }
 
     #[test]

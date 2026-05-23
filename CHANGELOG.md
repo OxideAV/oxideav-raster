@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `ImageFilter::Lanczos3` — windowed-sinc image resampling at `a = 3`,
+  the wider sibling of the existing `Lanczos2`. The kernel is
+  `lanczos3(x) = sinc(π·x) · sinc(π·x/3)` for `|x| < 3` (zero elsewhere)
+  — the standard high-quality reconstruction filter of the image-
+  processing literature (Duchon, "Lanczos filtering in one and two
+  dimensions", 1979; Turkowski, "Filters for Common Resampling Tasks",
+  1990). The 2-D filter is the separable product `lanczos3(x) * lanczos3(y)`
+  evaluated over a 6×6 footprint (36 taps vs Lanczos2's 16), so it
+  captures more of the underlying sinc main lobe and a piece of the
+  first negative side-lobe — sharper than Lanczos2 with a less abrupt
+  impulse-response truncation, at the cost of 2.25× the per-pixel
+  work and a stronger secondary side-lobe that can overshoot further.
+  Identical bookkeeping to the Lanczos2 path: premultiplied-alpha
+  accumulation, clamp-to-edge for footprints that extend past the
+  texture boundary, per-axis weight re-normalisation, and a final
+  per-channel `[0, 255]` clamp before the un-premultiply. The
+  refactor extracts a shared const-generic `sample_image_lanczos_a::<N, W>`
+  (`N` is the half-window in source pixels, `W = 2·N` the per-axis
+  tap count) so the Lanczos2 and Lanczos3 samplers are byte-identical
+  apart from `a` and the kernel pointer. Selectable via
+  `Renderer::image_filter`; the renderer default stays `Bilinear`. 10
+  new tests (4 kernel unit tests in `renderer.rs` covering unit-at-zero
+  / vanishing at non-zero integers / even symmetry / negative side-lobe
+  presence vs the cubic B-spline / wider window than Lanczos2, plus 6
+  integration tests in `tests/image_lanczos3.rs` covering solid-colour
+  centre + clamped-corner preservation, seam blending, in-gamut clamp,
+  sharper-than-Lanczos2 step edge, and the unchanged renderer default).
 - `ImageFilter::BSpline` — cubic B-spline image resampling, the `B = 1,
   C = 0` *approximating* member of the Mitchell–Netravali (1988) BC
   reconstruction-filter family and the third canonical point alongside
