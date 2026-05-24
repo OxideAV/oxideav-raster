@@ -65,9 +65,19 @@
 //!   non-normal modes evaluate the spec's basic-compositing formula
 //!   per-pixel.
 //!
+//! * `<feMorphology>` (SVG 1.1 §15.20) erosion + dilation by an
+//!   axis-aligned rectangular structuring element of half-extents
+//!   `(rx, ry)`, exposed as the standalone [`morphology`] /
+//!   [`morphology_pixels`] functions selectable via [`MorphologyOp`].
+//!   Implemented via the separable-rectangle decomposition
+//!   `f ⊖ B = (f ⊖ Bx) ⊖ By`, `f ⊕ B = (f ⊕ Bx) ⊕ By` (Serra 1982
+//!   §I.4 Theorem 4.1 / Gonzalez & Woods 2008 §9.4.1) so the
+//!   per-pixel work scales as `O(rx + ry)` instead of `O(rx · ry)`.
+//!
 //! Deferred to a later round:
 //!
-//! * filters (Gaussian blur, drop shadow, feColorMatrix, etc.),
+//! * remaining filters (Gaussian blur, drop shadow, feColorMatrix,
+//!   feTurbulence, feConvolveMatrix, feDisplacementMap, lighting),
 //! * `<pattern>` paints,
 //! * full ICC-tagged color-managed pipeline (the `linearRGB`
 //!   interpolation space is implemented; per-channel ICC profile
@@ -83,6 +93,7 @@ mod blend;
 mod cache;
 mod composite;
 mod fill;
+mod filter;
 mod flatten;
 mod gradient;
 mod paint;
@@ -93,6 +104,7 @@ pub use blend::{blend_channel, blend_over, BlendMode};
 pub use cache::{CacheStats, RasterizedSubtree};
 pub use composite::{composite_rgba_premultiplied, composite_rgba_premultiplied_blend};
 pub use fill::{rasterize_fill, AlphaMask};
+pub use filter::{morphology, morphology_pixels, MorphologyOp};
 pub use flatten::{flatten_arc_to_cubics, flatten_path, FlatContour};
 pub use gradient::{
     eval_linear_gradient, eval_linear_gradient_in, eval_linear_gradient_lut, eval_radial_gradient,

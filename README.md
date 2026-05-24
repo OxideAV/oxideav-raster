@@ -36,7 +36,8 @@ produces a packed `Rgba` `VideoFrame`.
 | Image resample: cubic B-spline (B=1,C=0)   | done (round 9)       |
 | 12 separable blend modes (PDF §11.3.5.2)  | done (round 5)       |
 | 4 non-separable HSL modes (PDF §11.3.5.3) | done (round 6)       |
-| Filters (blur, drop-shadow, …)            | pending              |
+| `feMorphology` erode / dilate (SVG §15.20)| done (round 11)      |
+| Filters (blur, drop-shadow, …)            | partial (morphology) |
 | `<pattern>` paint                         | pending              |
 | Full ICC color-managed pipeline           | pending              |
 

@@ -9,6 +9,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `feMorphology` filter primitive (SVG 1.1 §15.20) — erosion and
+  dilation of a packed-RGBA buffer by an axis-aligned rectangular
+  structuring element of half-extents `(rx, ry)`, exposed as
+  `pub fn morphology(src, w, h, rx, ry, op) -> Vec<u8>` plus the
+  typed-pixel convenience wrapper `morphology_pixels(&[Rgba], ...)`
+  and the `MorphologyOp { Erode, Dilate }` enum. Per the spec the
+  output is the component-wise min (erode) or max (dilate) of the
+  RGBA values inside the kernel rectangle, with the discrete kernel
+  realised as a `(2·rx + 1) × (2·ry + 1)` window inclusive of the
+  centre (the standard "ball of radius r" in discrete morphology).
+  Boundary handling is clamp-to-edge. The implementation exploits the
+  classical separability of flat rectangular structuring elements
+  (`f ⊖ B = (f ⊖ Bx) ⊖ By`, `f ⊕ B = (f ⊕ Bx) ⊕ By` — Serra,
+  *Image Analysis and Mathematical Morphology*, 1982 §I.4 Theorem 4.1
+  / Gonzalez & Woods, *Digital Image Processing*, 3rd ed. 2008 §9.4.1)
+  to run one horizontal 1-D sliding-window pass followed by one
+  vertical 1-D pass, dropping per-pixel work from `O(rx · ry)` to
+  `O(rx + ry)`. 16 new tests: 9 in the `src/filter.rs` unit suite
+  (zero-radius identity, solid-image invariance under both operators
+  across 6 radii, dilation footprint of an isolated bright pixel
+  matches the 25-pixel 5×5 kernel exactly, erosion shaves a 7×7
+  block down to 5×5 at `rx = ry = 1`, the duality
+  `erode(f) = ¬dilate(¬f)` byte-exact across 5 radii on a noisy
+  pattern, the separable H-then-V pipeline matches the naive 2-D
+  reference across 5 radii × 2 operators on a 11×9 pseudo-random
+  field, per-pixel extensivity
+  `erode(f) ≤ f ≤ dilate(f)` across 5 radii, the typed-pixel wrapper
+  round-trips through the byte API, and a `#[should_panic]` guard
+  for wrong-length input) plus 7 integration tests in
+  `tests/filter_morphology.rs` (public-API zero-radius identity,
+  isolated-pixel dilation paints exactly 7×3 = 21 bright pixels for
+  `rx = 3, ry = 1`, a 1-pixel-wide line is fully erased by
+  `rx = 1, ry = 0` erosion, closing is idempotent on the interior of
+  a 9×9 block, opening with a 3×3 SE removes a detached noise pixel
+  while preserving a 5×5 block, axis-decoupled `ry = 0` dilation
+  does not smear vertically, and the typed-pixel wrapper matches the
+  byte API across 4 radii × 2 operators). Math cited to
+  `docs/image/svg/svg11-second-edition.pdf` §15.20 + Serra (1982) +
+  Gonzalez & Woods (2008); no `image` / `imageproc` / `opencv` /
+  `cairo` / `skia` source consulted.
 - Catmull–Rom round-trip regression tests in `tests/image_catmull_rom.rs`:
   a 1:1-scale identity check on a smooth synthetic plate (asserts
   PSNR ≈ ∞ — the interpolation property `k(0)=1, k(±n)=0` implies
