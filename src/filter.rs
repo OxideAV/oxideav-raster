@@ -19,12 +19,23 @@
 //!   §9.4.1) — so the per-pixel work scales linearly with the radius
 //!   instead of quadratically.
 //!
+//! * **Colour-matrix transform** — `feColorMatrix` from SVG 1.1
+//!   §15.10. A 4×5 matrix `M` is applied to the un-premultiplied
+//!   colour-tuple `(R, G, B, A, 1)ᵀ` per pixel to produce the new
+//!   `(R', G', B', A')ᵀ`. The spec defines four sub-operations
+//!   ([`ColorMatrixOp`]): a general user matrix, a one-parameter
+//!   saturation matrix, a one-parameter hue rotation, and a fixed
+//!   "luminance to alpha" matrix. The latter three are pre-computed
+//!   matrices given verbatim by §15.10; we expose them through
+//!   [`ColorMatrix::saturate`], [`ColorMatrix::hue_rotate`] and
+//!   [`ColorMatrix::luminance_to_alpha`] so callers do not have to
+//!   re-derive them.
+//!
 //! # Deferred
 //!
 //! Gaussian blur (`feGaussianBlur`), drop shadow (`feDropShadow`),
-//! `feColorMatrix`, `feComponentTransfer`, `feConvolveMatrix`,
-//! `feTurbulence` (Perlin), `feDisplacementMap`, `feSpecularLighting`,
-//! `feDiffuseLighting`.
+//! `feComponentTransfer`, `feConvolveMatrix`, `feTurbulence` (Perlin),
+//! `feDisplacementMap`, `feSpecularLighting`, `feDiffuseLighting`.
 //!
 //! # Wall provenance
 //!
@@ -34,8 +45,11 @@
 //! component-wise maximum of the corresponding R,G,B,A values in the
 //! input image's kernel rectangle. In erosion, the output pixel is the
 //! individual component-wise minimum…") and Serra (1982) §I.4 + Gonzalez
-//! & Woods (2008) §9.4.1 for the separability decomposition. No
-//! `image` / `imageproc` / `opencv` / `cairo` / `skia` source consulted.
+//! & Woods (2008) §9.4.1 for the separability decomposition; §15.10
+//! for the `feColorMatrix` matrix forms (general 4×5 matrix; the
+//! saturate / hueRotate / luminanceToAlpha pre-built matrices are
+//! reproduced verbatim from the spec table). No `image` / `imageproc`
+//! / `opencv` / `cairo` / `skia` source consulted.
 
 use oxideav_core::Rgba;
 
@@ -556,5 +570,638 @@ mod tests {
     fn morphology_panics_on_wrong_length() {
         let bad = vec![0u8; 7]; // not w·h·4 for w=2, h=2
         let _ = morphology(&bad, 2, 2, 1, 1, MorphologyOp::Erode);
+    }
+}
+
+// ---------------------------------------------------------------------------
+//  feColorMatrix (SVG 1.1 §15.10)
+// ---------------------------------------------------------------------------
+
+/// Selector mirroring the `type` attribute of SVG 1.1 §15.10
+/// `<feColorMatrix>` (`"matrix"` | `"saturate"` | `"hueRotate"` |
+/// `"luminanceToAlpha"`).
+///
+/// The variants carry the spec's user-supplied parameter (none for
+/// `Matrix` — the matrix itself is supplied as a [`ColorMatrix`]; a
+/// single scalar for `Saturate` and `HueRotate`). The fully-fixed
+/// `LuminanceToAlpha` operator takes no parameter.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ColorMatrixOp {
+    /// User-supplied 4×5 matrix applied verbatim. The matrix itself
+    /// lives in the [`ColorMatrix`] passed to [`color_matrix`].
+    Matrix,
+    /// SVG `type="saturate"`: pre-built saturation matrix
+    /// parameterised by `s ∈ [0, ∞)`. `s = 1` is identity, `s = 0`
+    /// collapses RGB to the BT.709 luminance scalar, `s > 1` boosts
+    /// saturation past the original.
+    Saturate(f32),
+    /// SVG `type="hueRotate"`: rotate the colour vector around the
+    /// achromatic axis by `degrees` degrees (positive = R→G→B in the
+    /// spec's convention). Constructed from the spec's static
+    /// constant / cos-term / sin-term matrix triple.
+    HueRotate(f32),
+    /// SVG `type="luminanceToAlpha"`: fixed matrix that produces a
+    /// transparent black image whose alpha is the BT.709 luminance of
+    /// the input. Used as the back-end for SVG `mask`'s
+    /// `mask-type="luminance"` and for chained PDF `SMask`
+    /// `Luminosity` subtypes.
+    LuminanceToAlpha,
+}
+
+/// A 4×5 colour-transform matrix in row-major layout (the same layout
+/// SVG 1.1 §15.10 uses for the `values` attribute).
+///
+/// The four rows produce the new R, G, B, A in turn; the five columns
+/// are the coefficients of `(R, G, B, A, 1)` — the trailing `1` is the
+/// homogeneous bias term that lets the matrix add a constant offset to
+/// each output channel.
+///
+/// ```text
+/// | R' |   | m00 m01 m02 m03 m04 |   | R |
+/// | G' |   | m10 m11 m12 m13 m14 |   | G |
+/// | B' | = | m20 m21 m22 m23 m24 | × | B |
+/// | A' |   | m30 m31 m32 m33 m34 |   | A |
+///                                    | 1 |
+/// ```
+///
+/// All values are floats in the same `[0, 1]` normalised scale the
+/// spec uses internally (the byte-API entry point [`color_matrix`]
+/// promotes/demotes around the matrix multiply).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ColorMatrix(pub [[f32; 5]; 4]);
+
+impl ColorMatrix {
+    /// 4×5 identity matrix: `(R', G', B', A') = (R, G, B, A)`. Useful
+    /// as a base for callers that want to perturb a small number of
+    /// entries.
+    pub const fn identity() -> Self {
+        Self([
+            [1.0, 0.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0, 0.0],
+        ])
+    }
+
+    /// SVG 1.1 §15.10 `type="saturate"` matrix for saturation factor
+    /// `s` (clamped to `[0, ∞)` — the spec leaves the upper bound
+    /// open; `s = 0` is the explicit "fully desaturated" point).
+    ///
+    /// The matrix is reproduced verbatim from §15.10:
+    ///
+    /// ```text
+    /// | 0.213 + 0.787·s   0.715 − 0.715·s   0.072 − 0.072·s   0   0 |
+    /// | 0.213 − 0.213·s   0.715 + 0.285·s   0.072 − 0.072·s   0   0 |
+    /// | 0.213 − 0.213·s   0.715 − 0.715·s   0.072 + 0.928·s   0   0 |
+    /// |        0                  0                  0        1   0 |
+    /// ```
+    ///
+    /// The `(0.213, 0.715, 0.072)` row is the spec-mandated BT.709
+    /// luminance triple (§15.10 — slightly different from the PDF
+    /// blend-mode `Lum` coefficients used elsewhere in this crate,
+    /// which come from PDF 32000-1:2008 §11.3.5.3).
+    pub fn saturate(s: f32) -> Self {
+        let s = if s.is_nan() { 1.0 } else { s.max(0.0) };
+        Self([
+            [
+                0.213 + 0.787 * s,
+                0.715 - 0.715 * s,
+                0.072 - 0.072 * s,
+                0.0,
+                0.0,
+            ],
+            [
+                0.213 - 0.213 * s,
+                0.715 + 0.285 * s,
+                0.072 - 0.072 * s,
+                0.0,
+                0.0,
+            ],
+            [
+                0.213 - 0.213 * s,
+                0.715 - 0.715 * s,
+                0.072 + 0.928 * s,
+                0.0,
+                0.0,
+            ],
+            [0.0, 0.0, 0.0, 1.0, 0.0],
+        ])
+    }
+
+    /// SVG 1.1 §15.10 `type="hueRotate"` matrix for rotation angle
+    /// `degrees` (positive direction is the spec's R → G → B
+    /// convention).
+    ///
+    /// The spec gives the result as the sum of three constant 3×3
+    /// matrices weighted by `1`, `cos(θ)` and `sin(θ)` respectively;
+    /// the alpha row is identity. Coefficients are verbatim from
+    /// §15.10:
+    ///
+    /// ```text
+    /// const   = |  0.213  0.715  0.072 |
+    ///           |  0.213  0.715  0.072 |
+    ///           |  0.213  0.715  0.072 |
+    ///
+    /// cos·    = |  0.787 −0.715 −0.072 |
+    ///           | −0.213  0.285 −0.072 |
+    ///           | −0.213 −0.715  0.928 |
+    ///
+    /// sin·    = | −0.213 −0.715  0.928 |
+    ///           |  0.143  0.140 −0.283 |
+    ///           | −0.787  0.715  0.072 |
+    /// ```
+    ///
+    /// `degrees.is_nan()` is treated as zero rotation (identity row);
+    /// the rotation is otherwise unbounded — the trig functions are
+    /// inherently periodic.
+    pub fn hue_rotate(degrees: f32) -> Self {
+        let theta = if degrees.is_nan() {
+            0.0
+        } else {
+            degrees.to_radians()
+        };
+        let c = theta.cos();
+        let s = theta.sin();
+
+        // Spec-verbatim 3×3 contributions.
+        let const_m = [
+            [0.213, 0.715, 0.072],
+            [0.213, 0.715, 0.072],
+            [0.213, 0.715, 0.072],
+        ];
+        let cos_m = [
+            [0.787, -0.715, -0.072],
+            [-0.213, 0.285, -0.072],
+            [-0.213, -0.715, 0.928],
+        ];
+        let sin_m = [
+            [-0.213, -0.715, 0.928],
+            [0.143, 0.140, -0.283],
+            [-0.787, 0.715, 0.072],
+        ];
+
+        let mut rows = [[0.0f32; 5]; 4];
+        for i in 0..3 {
+            for j in 0..3 {
+                rows[i][j] = const_m[i][j] + c * cos_m[i][j] + s * sin_m[i][j];
+            }
+        }
+        rows[3][3] = 1.0; // alpha untouched
+        Self(rows)
+    }
+
+    /// SVG 1.1 §15.10 `type="luminanceToAlpha"` matrix.
+    ///
+    /// ```text
+    /// |   0      0      0     0  0 |
+    /// |   0      0      0     0  0 |
+    /// |   0      0      0     0  0 |
+    /// | 0.2125 0.7154 0.0721 0  0 |
+    /// ```
+    ///
+    /// Note the §15.10 luminance row uses the slightly different
+    /// `(0.2125, 0.7154, 0.0721)` triple — this is the BT.709 set of
+    /// coefficients SVG 1.1 cites for "luminance to alpha"
+    /// specifically. (The saturation / hueRotate matrices above use
+    /// the rounded `(0.213, 0.715, 0.072)` set the same section
+    /// hands out for those operators; we follow the spec literally
+    /// for each.)
+    pub const fn luminance_to_alpha() -> Self {
+        Self([
+            [0.0, 0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0, 0.0],
+            [0.2125, 0.7154, 0.0721, 0.0, 0.0],
+        ])
+    }
+
+    /// Resolve a [`ColorMatrixOp`] to the concrete `ColorMatrix` it
+    /// names. Used internally by [`color_matrix`] / [`color_matrix_op`]
+    /// and re-exported for callers that want to inspect / cache /
+    /// compose the matrix before applying it.
+    pub fn from_op(op: ColorMatrixOp, user: &ColorMatrix) -> ColorMatrix {
+        match op {
+            ColorMatrixOp::Matrix => *user,
+            ColorMatrixOp::Saturate(s) => ColorMatrix::saturate(s),
+            ColorMatrixOp::HueRotate(d) => ColorMatrix::hue_rotate(d),
+            ColorMatrixOp::LuminanceToAlpha => ColorMatrix::luminance_to_alpha(),
+        }
+    }
+}
+
+/// SVG 1.1 §15.10 `<feColorMatrix>` with an explicit user-supplied
+/// matrix — apply `m` per pixel and clamp the result to `[0, 255]`.
+///
+/// `width × height` is the input/output image extent in pixels. `src`
+/// is a packed-RGBA byte buffer of exactly `width * height * 4` bytes
+/// in row-major order.
+///
+/// **Pixel space.** The §15.10 multiply is defined on *un-premultiplied*
+/// channel values normalised to `[0, 1]`. This entry point therefore
+/// treats the input bytes as straight-alpha sRGB samples (no
+/// linearisation — §15.10 is in the device gamut, like the rest of the
+/// SVG colour-matrix algebra). The output bytes are also straight
+/// alpha; the caller is responsible for any subsequent premultiplication
+/// before compositing.
+///
+/// # Algorithm
+///
+/// 1. For each pixel: normalise `(R, G, B, A) → (r, g, b, a) ∈ [0, 1]⁴`.
+/// 2. Compute `(r', g', b', a') = M · (r, g, b, a, 1)ᵀ` per the §15.10
+///    matrix form.
+/// 3. Clamp each output channel to `[0, 1]` and quantise back to
+///    `round(x · 255)`.
+///
+/// Complexity is `O(W · H)` with a constant 20-term inner product per
+/// channel — independent of any radius or kernel size.
+///
+/// # Panics
+///
+/// Panics if `src.len() != width as usize * height as usize * 4`.
+pub fn color_matrix(src: &[u8], width: u32, height: u32, m: &ColorMatrix) -> Vec<u8> {
+    let w = width as usize;
+    let h = height as usize;
+    let expected = w
+        .checked_mul(h)
+        .and_then(|n| n.checked_mul(4))
+        .expect("color_matrix: width * height * 4 overflowed usize");
+    assert_eq!(
+        src.len(),
+        expected,
+        "color_matrix: src.len() == {} but width*height*4 == {expected}",
+        src.len()
+    );
+
+    if width == 0 || height == 0 {
+        return Vec::new();
+    }
+
+    let rows = &m.0;
+    let mut out = Vec::with_capacity(src.len());
+    for chunk in src.chunks_exact(4) {
+        let r = chunk[0] as f32 / 255.0;
+        let g = chunk[1] as f32 / 255.0;
+        let b = chunk[2] as f32 / 255.0;
+        let a = chunk[3] as f32 / 255.0;
+        for row in rows {
+            let v = row[0] * r + row[1] * g + row[2] * b + row[3] * a + row[4];
+            out.push(quantise_unit(v));
+        }
+    }
+    out
+}
+
+/// SVG 1.1 §15.10 `<feColorMatrix>` with the `type=` attribute
+/// expanded into a [`ColorMatrixOp`]. `user_matrix` is consulted only
+/// when `op == ColorMatrixOp::Matrix` — the other three operators
+/// build their matrix from the operator parameters and the spec's
+/// hard-coded coefficient tables.
+///
+/// Equivalent to:
+///
+/// ```text
+/// let m = ColorMatrix::from_op(op, user_matrix);
+/// color_matrix(src, w, h, &m)
+/// ```
+///
+/// — exposed as a separate entry point so callers that hold a parsed
+/// SVG `feColorMatrix` element can dispatch in one line.
+///
+/// # Panics
+///
+/// Same as [`color_matrix`].
+pub fn color_matrix_op(
+    src: &[u8],
+    width: u32,
+    height: u32,
+    op: ColorMatrixOp,
+    user_matrix: &ColorMatrix,
+) -> Vec<u8> {
+    let m = ColorMatrix::from_op(op, user_matrix);
+    color_matrix(src, width, height, &m)
+}
+
+/// Convenience wrapper that runs [`color_matrix`] on a slice of [`Rgba`]
+/// pixels and returns a `Vec<Rgba>` of the same length. Identical
+/// semantics — provided for callers that already have a typed pixel
+/// buffer.
+pub fn color_matrix_pixels(src: &[Rgba], width: u32, height: u32, m: &ColorMatrix) -> Vec<Rgba> {
+    assert_eq!(
+        src.len(),
+        width as usize * height as usize,
+        "color_matrix_pixels: src.len() == {} but width*height == {}",
+        src.len(),
+        width as usize * height as usize
+    );
+    let mut bytes = Vec::with_capacity(src.len() * 4);
+    for p in src {
+        bytes.push(p.r);
+        bytes.push(p.g);
+        bytes.push(p.b);
+        bytes.push(p.a);
+    }
+    let out = color_matrix(&bytes, width, height, m);
+    out.chunks_exact(4)
+        .map(|c| Rgba::new(c[0], c[1], c[2], c[3]))
+        .collect()
+}
+
+/// Clamp a normalised-`[0, 1]` colour-channel value to that range and
+/// quantise it back to a `u8` via the standard `round(x · 255)`
+/// rule. NaNs map to zero (a defensive choice — the §15.10 multiply is
+/// a finite linear combination of finite inputs, so a NaN would have
+/// to come from a NaN entry in the user matrix).
+#[inline]
+fn quantise_unit(v: f32) -> u8 {
+    if v.is_nan() {
+        return 0;
+    }
+    let clamped = v.clamp(0.0, 1.0);
+    (clamped * 255.0 + 0.5) as u8
+}
+
+#[cfg(test)]
+mod color_matrix_tests {
+    use super::*;
+
+    fn build<F: FnMut(u32, u32) -> Rgba>(w: u32, h: u32, mut f: F) -> Vec<u8> {
+        let mut v = Vec::with_capacity((w * h * 4) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                let c = f(x, y);
+                v.extend_from_slice(&[c.r, c.g, c.b, c.a]);
+            }
+        }
+        v
+    }
+
+    #[test]
+    fn identity_matrix_is_bytewise_identity() {
+        // The 4×5 identity must round-trip every (R, G, B, A) tuple
+        // bit-exactly — the only loss in the pipeline is the f32
+        // round-trip, and `v / 255 * 255` followed by the standard
+        // half-up rounding is provably idempotent for `v ∈ [0, 255]`.
+        let img = build(7, 5, |x, y| {
+            Rgba::new(
+                (x.wrapping_mul(37) ^ y.wrapping_mul(13)) as u8,
+                (x.wrapping_mul(7).wrapping_add(y)) as u8,
+                (x.wrapping_add(y.wrapping_mul(53))) as u8,
+                (x.wrapping_mul(y).wrapping_add(31)) as u8,
+            )
+        });
+        let out = color_matrix(&img, 7, 5, &ColorMatrix::identity());
+        assert_eq!(out, img);
+    }
+
+    #[test]
+    fn saturate_one_is_identity_on_arbitrary_colours() {
+        // s = 1 ⇒ the spec saturate matrix collapses to the 4×4
+        // identity (every off-diagonal RGB term cancels: 0.213·1 −
+        // 0.213·1 = 0, etc.). Therefore saturate(1) applied to any
+        // colour must reproduce it within the 1-LSB rounding window
+        // (one round-trip through normalise→multiply→quantise).
+        let img = build(4, 4, |x, y| {
+            Rgba::new((x * 60) as u8, (y * 80) as u8, 17, 200)
+        });
+        let m = ColorMatrix::saturate(1.0);
+        let out = color_matrix(&img, 4, 4, &m);
+        for i in 0..img.len() {
+            let d = (out[i] as i32 - img[i] as i32).abs();
+            assert!(d <= 1, "saturate(1) differs by {d} at byte {i}");
+        }
+    }
+
+    #[test]
+    fn saturate_zero_collapses_rgb_to_luminance() {
+        // s = 0 ⇒ every RGB output row is the same luminance combination
+        // (0.213·R + 0.715·G + 0.072·B). Apply to a fixed (200, 100, 50)
+        // pixel and check the three colour channels emerge equal.
+        let img = build(1, 1, |_, _| Rgba::new(200, 100, 50, 255));
+        let m = ColorMatrix::saturate(0.0);
+        let out = color_matrix(&img, 1, 1, &m);
+        assert_eq!(out[0], out[1], "R != G after full desaturation");
+        assert_eq!(out[1], out[2], "G != B after full desaturation");
+        assert_eq!(out[3], 255, "alpha must pass through");
+        // Spot-check the analytic value: 0.213·200 + 0.715·100 + 0.072·50
+        // = 42.6 + 71.5 + 3.6 = 117.7 / 255 ⇒ quantises to 118.
+        let expected = ((0.213_f32 * 200.0 + 0.715 * 100.0 + 0.072 * 50.0)
+            .clamp(0.0, 255.0)
+            .round()) as u8;
+        let d = (out[0] as i32 - expected as i32).abs();
+        assert!(
+            d <= 1,
+            "luminance scalar off by {d} (got {} vs {expected})",
+            out[0]
+        );
+    }
+
+    #[test]
+    fn hue_rotate_zero_is_identity() {
+        // θ = 0 ⇒ cos = 1, sin = 0. const + 1·cos_m = identity 3×3
+        // (verified by hand: row 0 → (0.213+0.787, 0.715−0.715,
+        // 0.072−0.072) = (1, 0, 0); row 1 → (0, 1, 0); row 2 → (0, 0,
+        // 1)). Therefore hue_rotate(0) is the identity modulo the
+        // quantise round-off (≤ 1 LSB).
+        let img = build(5, 3, |x, y| {
+            Rgba::new((x * 41) as u8, (y * 71) as u8, 100, 200)
+        });
+        let m = ColorMatrix::hue_rotate(0.0);
+        let out = color_matrix(&img, 5, 3, &m);
+        for i in 0..img.len() {
+            let d = (out[i] as i32 - img[i] as i32).abs();
+            assert!(d <= 1, "hue_rotate(0) byte {i} differs by {d}");
+        }
+    }
+
+    #[test]
+    fn hue_rotate_preserves_grey_axis() {
+        // A pure grey pixel (R == G == B) lies on the achromatic axis,
+        // which is the rotation axis of `hueRotate`. Therefore any
+        // rotation must leave a grey pixel grey (and very nearly the
+        // same brightness — modulo the inevitable round-off in the
+        // float multiply, the coefficients have ≤ 3 dp so the rounding
+        // can be up to ~1 LSB).
+        let img = build(1, 1, |_, _| Rgba::new(140, 140, 140, 255));
+        for theta in [30.0_f32, 90.0, 120.0, 180.0, 270.0, -45.0] {
+            let m = ColorMatrix::hue_rotate(theta);
+            let out = color_matrix(&img, 1, 1, &m);
+            assert!(
+                (out[0] as i32 - out[1] as i32).abs() <= 1,
+                "θ={theta}: R != G after rotation"
+            );
+            assert!(
+                (out[1] as i32 - out[2] as i32).abs() <= 1,
+                "θ={theta}: G != B after rotation"
+            );
+            assert!(
+                (out[0] as i32 - 140).abs() <= 2,
+                "θ={theta}: grey brightness drift {} → {}",
+                140,
+                out[0]
+            );
+            assert_eq!(out[3], 255, "alpha must pass through hue rotation");
+        }
+    }
+
+    #[test]
+    fn hue_rotate_full_turn_is_identity() {
+        // 360° rotation ⇒ cos = 1, sin = 0 again ⇒ same as θ = 0.
+        // Round-off ≤ 1 LSB on each channel.
+        let img = build(4, 3, |x, y| {
+            Rgba::new((x * 60) as u8, (y * 80) as u8, ((x + y) * 30) as u8, 255)
+        });
+        let m = ColorMatrix::hue_rotate(360.0);
+        let out = color_matrix(&img, 4, 3, &m);
+        for i in 0..img.len() {
+            let d = (out[i] as i32 - img[i] as i32).abs();
+            assert!(d <= 1, "θ=360 byte {i} differs by {d}");
+        }
+    }
+
+    #[test]
+    fn luminance_to_alpha_zeros_rgb_and_writes_luminance_to_alpha() {
+        // The luminanceToAlpha matrix is the §15.10-mandated fixed
+        // matrix that produces transparent black RGB and alpha equal
+        // to the BT.709 luminance of the input. Verify both halves.
+        let img = build(1, 1, |_, _| Rgba::new(255, 128, 64, 200));
+        let m = ColorMatrix::luminance_to_alpha();
+        let out = color_matrix(&img, 1, 1, &m);
+        assert_eq!(out[0], 0, "R must be cleared");
+        assert_eq!(out[1], 0, "G must be cleared");
+        assert_eq!(out[2], 0, "B must be cleared");
+        // Expected alpha: 0.2125·255 + 0.7154·128 + 0.0721·64
+        // = 54.1875 + 91.5712 + 4.6144 = 150.3731 ⇒ quantises to 150.
+        let expected = ((0.2125_f32 * 255.0 + 0.7154 * 128.0 + 0.0721 * 64.0).round()) as u8;
+        let d = (out[3] as i32 - expected as i32).abs();
+        assert!(
+            d <= 1,
+            "luminance-to-alpha α off by {d} (got {} vs {expected})",
+            out[3]
+        );
+    }
+
+    #[test]
+    fn op_dispatch_matches_direct_construction() {
+        // The `color_matrix_op` thin wrapper must produce byte-exact
+        // output relative to `color_matrix` on the resolved matrix —
+        // this is the documented invariant `ColorMatrix::from_op`.
+        let img = build(3, 2, |x, y| {
+            Rgba::new((x * 90) as u8, (y * 110) as u8, 60, 240)
+        });
+        let user = ColorMatrix::identity(); // unused for non-Matrix ops
+        for op in [
+            ColorMatrixOp::Matrix,
+            ColorMatrixOp::Saturate(0.5),
+            ColorMatrixOp::HueRotate(123.0),
+            ColorMatrixOp::LuminanceToAlpha,
+        ] {
+            let direct = color_matrix(&img, 3, 2, &ColorMatrix::from_op(op, &user));
+            let via_op = color_matrix_op(&img, 3, 2, op, &user);
+            assert_eq!(direct, via_op, "dispatch mismatch for {op:?}");
+        }
+    }
+
+    #[test]
+    fn channel_clamping_is_applied() {
+        // A matrix that would produce R' = 2·R (out of gamut for any
+        // R > 127) must clamp to 255, not wrap.
+        let m = ColorMatrix([
+            [2.0, 0.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0, 0.0],
+        ]);
+        let img = build(1, 1, |_, _| Rgba::new(200, 0, 0, 255));
+        let out = color_matrix(&img, 1, 1, &m);
+        assert_eq!(out[0], 255, "R must clamp at upper bound");
+        // A negative-doubling matrix must clamp to 0.
+        let m = ColorMatrix([
+            [-1.0, 0.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0, 0.0],
+        ]);
+        let out = color_matrix(&img, 1, 1, &m);
+        assert_eq!(out[0], 0, "R must clamp at lower bound");
+    }
+
+    #[test]
+    fn bias_column_adds_constant_offset() {
+        // The 5th column (the homogeneous-1 multiplier) lets a matrix
+        // add a constant offset. A row of (0, 0, 0, 0, 0.5) should
+        // produce a constant 0.5 → 128 in that channel regardless of
+        // the input pixel.
+        let m = ColorMatrix([
+            [0.0, 0.0, 0.0, 0.0, 0.5],
+            [0.0, 0.0, 0.0, 0.0, 0.25],
+            [0.0, 0.0, 0.0, 0.0, 0.75],
+            [0.0, 0.0, 0.0, 1.0, 0.0],
+        ]);
+        let img = build(2, 2, |x, y| {
+            Rgba::new((x * 100) as u8, (y * 50) as u8, 33, 200)
+        });
+        let out = color_matrix(&img, 2, 2, &m);
+        for chunk in out.chunks_exact(4) {
+            assert!(
+                (chunk[0] as i32 - 128).abs() <= 1,
+                "R bias drift: {}",
+                chunk[0]
+            );
+            assert!(
+                (chunk[1] as i32 - 64).abs() <= 1,
+                "G bias drift: {}",
+                chunk[1]
+            );
+            assert!(
+                (chunk[2] as i32 - 191).abs() <= 1,
+                "B bias drift: {}",
+                chunk[2]
+            );
+            assert_eq!(chunk[3], 200, "alpha pass-through");
+        }
+    }
+
+    #[test]
+    fn color_matrix_pixels_wrapper_matches_byte_api() {
+        let w = 4u32;
+        let h = 3u32;
+        let mut bytes = Vec::with_capacity((w * h * 4) as usize);
+        let mut pixels = Vec::with_capacity((w * h) as usize);
+        for i in 0..(w * h) as u8 {
+            let r = i.wrapping_mul(7);
+            let g = i.wrapping_mul(17).wrapping_add(3);
+            let b = i.wrapping_mul(31).wrapping_add(5);
+            let a = 255u8;
+            bytes.extend_from_slice(&[r, g, b, a]);
+            pixels.push(Rgba::new(r, g, b, a));
+        }
+        for m in [
+            ColorMatrix::identity(),
+            ColorMatrix::saturate(0.3),
+            ColorMatrix::hue_rotate(72.0),
+            ColorMatrix::luminance_to_alpha(),
+        ] {
+            let bytes_out = color_matrix(&bytes, w, h, &m);
+            let pix_out = color_matrix_pixels(&pixels, w, h, &m);
+            let recombined: Vec<u8> = pix_out.iter().flat_map(|p| [p.r, p.g, p.b, p.a]).collect();
+            assert_eq!(bytes_out, recombined, "wrapper / byte API divergence");
+        }
+    }
+
+    #[test]
+    fn empty_image_returns_empty_buffer() {
+        let img: Vec<u8> = Vec::new();
+        let out = color_matrix(&img, 0, 0, &ColorMatrix::saturate(0.5));
+        assert!(
+            out.is_empty(),
+            "zero-area image must produce zero-byte output"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "color_matrix: src.len() ==")]
+    fn color_matrix_panics_on_wrong_length() {
+        let bad = vec![0u8; 7]; // not w·h·4 for w=2, h=2
+        let _ = color_matrix(&bad, 2, 2, &ColorMatrix::identity());
     }
 }

@@ -9,6 +9,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `feColorMatrix` filter primitive (SVG 1.1 §15.10) — per-pixel
+  4×5 colour-matrix transform on packed-RGBA buffers. The §15.10
+  spec defines the operation on un-premultiplied normalised channel
+  values: `(R', G', B', A')ᵀ = M · (R, G, B, A, 1)ᵀ`, with the
+  trailing `1` acting as a bias-column multiplier so a matrix row
+  can encode a constant offset. Output is clamped to `[0, 1]` and
+  re-quantised to `u8`. Exposed as
+  `pub fn color_matrix(src, w, h, &m) -> Vec<u8>` plus the typed-
+  pixel convenience wrapper `color_matrix_pixels(&[Rgba], ...)`,
+  the `ColorMatrix([[f32; 5]; 4])` row-major 4×5 matrix type, and
+  the `color_matrix_op(src, w, h, op, &user)` dispatcher driven by
+  the `ColorMatrixOp { Matrix, Saturate(f32), HueRotate(f32),
+  LuminanceToAlpha }` enum (mirroring the SVG `type=` attribute).
+  The three parameterised matrices are reproduced verbatim from
+  §15.10's coefficient tables:
+  - `ColorMatrix::saturate(s)` — desaturation/saturation factor `s`
+    (clamped to `[0, ∞)`; `s = 1` is identity, `s = 0` collapses
+    RGB to the spec's `(0.213, 0.715, 0.072)` BT.709 luminance
+    scalar).
+  - `ColorMatrix::hue_rotate(degrees)` — rotation around the
+    achromatic axis, built as
+    `const_matrix + cos(θ)·cos_matrix + sin(θ)·sin_matrix` from the
+    three §15.10 coefficient blocks; alpha row stays identity.
+  - `ColorMatrix::luminance_to_alpha()` — fixed matrix producing
+    transparent black RGB and alpha equal to
+    `0.2125·R + 0.7154·G + 0.0721·B` (the §15.10 luminance triple,
+    distinct from the rounded saturate set above — we follow the
+    spec literally for each operator). Used as the matrix back-end
+    for SVG `mask-type="luminance"` / PDF `SMask` `Luminosity`.
+  - `ColorMatrix::identity()` and `ColorMatrix::from_op(op, user)`
+    constructors for callers that want to inspect / cache /
+    compose the matrix before applying it.
+  21 new tests: 13 in the `src/filter.rs` unit suite (identity
+  byte-for-byte round-trip on a pseudo-random pattern; saturate(1)
+  ≈ identity within 1 LSB; saturate(0) collapses RGB to the
+  analytic luminance scalar; hueRotate(0) ≈ identity; hueRotate
+  preserves grey-axis pixels across 6 angles; hueRotate(360°) ≈
+  identity; luminanceToAlpha zeros RGB and writes the §15.10
+  luminance to alpha at the analytic value; `color_matrix_op`
+  dispatches byte-exactly against `ColorMatrix::from_op`; positive
+  + negative out-of-gamut matrix entries clamp at 255/0 rather than
+  wrap; bias column adds a constant offset across all pixels;
+  typed-pixel wrapper round-trips through the byte API across all
+  four operator families; zero-area image returns an empty buffer;
+  `#[should_panic]` guard for wrong-length input) plus 8 integration
+  tests in `tests/filter_color_matrix.rs` (public-API identity
+  byte-exact; saturate(0) greyscale invariant across every pixel of
+  an 8×5 buffer; hueRotate preserves alpha and grey-axis brightness
+  across 6 angles; luminanceToAlpha analytic check across 5
+  representative pixels including pure primaries; typed-pixel
+  wrapper agreement across all four operator families; user-supplied
+  matrix branch halves every channel correctly; hueRotate(180°) on
+  pure red clamps R to 0 and lifts G to the analytic `0.426·255`
+  value; zero-area image returns empty across every operator). Math
+  cited to `docs/image/svg/svg11-second-edition.pdf` §15.10; no
+  `image` / `imageproc` / `opencv` / `cairo` / `skia` source
+  consulted.
 - `feMorphology` filter primitive (SVG 1.1 §15.20) — erosion and
   dilation of a packed-RGBA buffer by an axis-aligned rectangular
   structuring element of half-extents `(rx, ry)`, exposed as

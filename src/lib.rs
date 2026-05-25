@@ -73,11 +73,20 @@
 //!   `f ⊖ B = (f ⊖ Bx) ⊖ By`, `f ⊕ B = (f ⊕ Bx) ⊕ By` (Serra 1982
 //!   §I.4 Theorem 4.1 / Gonzalez & Woods 2008 §9.4.1) so the
 //!   per-pixel work scales as `O(rx + ry)` instead of `O(rx · ry)`.
+//! * `<feColorMatrix>` (SVG 1.1 §15.10) per-pixel 4×5 colour-matrix
+//!   transform, exposed as [`color_matrix`] (with a typed-pixel
+//!   wrapper [`color_matrix_pixels`]) and the [`color_matrix_op`]
+//!   shortcut that dispatches a [`ColorMatrixOp`] (general matrix /
+//!   `saturate(s)` / `hueRotate(θ)` / `luminanceToAlpha`). The three
+//!   parameterised operators are pre-built from the spec's
+//!   coefficient tables in [`ColorMatrix::saturate`] /
+//!   [`ColorMatrix::hue_rotate`] / [`ColorMatrix::luminance_to_alpha`].
 //!
 //! Deferred to a later round:
 //!
-//! * remaining filters (Gaussian blur, drop shadow, feColorMatrix,
-//!   feTurbulence, feConvolveMatrix, feDisplacementMap, lighting),
+//! * remaining filters (Gaussian blur, drop shadow,
+//!   feComponentTransfer, feTurbulence, feConvolveMatrix,
+//!   feDisplacementMap, lighting),
 //! * `<pattern>` paints,
 //! * full ICC-tagged color-managed pipeline (the `linearRGB`
 //!   interpolation space is implemented; per-channel ICC profile
@@ -104,7 +113,10 @@ pub use blend::{blend_channel, blend_over, BlendMode};
 pub use cache::{CacheStats, RasterizedSubtree};
 pub use composite::{composite_rgba_premultiplied, composite_rgba_premultiplied_blend};
 pub use fill::{rasterize_fill, AlphaMask};
-pub use filter::{morphology, morphology_pixels, MorphologyOp};
+pub use filter::{
+    color_matrix, color_matrix_op, color_matrix_pixels, morphology, morphology_pixels, ColorMatrix,
+    ColorMatrixOp, MorphologyOp,
+};
 pub use flatten::{flatten_arc_to_cubics, flatten_path, FlatContour};
 pub use gradient::{
     eval_linear_gradient, eval_linear_gradient_in, eval_linear_gradient_lut, eval_radial_gradient,

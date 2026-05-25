@@ -37,7 +37,8 @@ produces a packed `Rgba` `VideoFrame`.
 | 12 separable blend modes (PDF §11.3.5.2)  | done (round 5)       |
 | 4 non-separable HSL modes (PDF §11.3.5.3) | done (round 6)       |
 | `feMorphology` erode / dilate (SVG §15.20)| done (round 11)      |
-| Filters (blur, drop-shadow, …)            | partial (morphology) |
+| `feColorMatrix` matrix/sat/hue/luma (§15.10)| done (round 12)    |
+| Filters (blur, drop-shadow, …)            | partial (morphology + color-matrix) |
 | `<pattern>` paint                         | pending              |
 | Full ICC color-managed pipeline           | pending              |
 
