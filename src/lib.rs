@@ -81,10 +81,17 @@
 //!   parameterised operators are pre-built from the spec's
 //!   coefficient tables in [`ColorMatrix::saturate`] /
 //!   [`ColorMatrix::hue_rotate`] / [`ColorMatrix::luminance_to_alpha`].
+//! * `<feGaussianBlur>` (SVG 1.1 §15.17) separable Gaussian blur on
+//!   packed-RGBA, exposed as [`gaussian_blur`] (with the typed-pixel
+//!   wrapper [`gaussian_blur_pixels`]). For small `stdDeviation`
+//!   (`s < `[`GAUSSIAN_BLUR_BOX_THRESHOLD`]`= 2.0`) a direct discrete
+//!   convolution with a half-width `ceil(3·s)` kernel is used; for
+//!   larger `s` the spec's three-box-blur approximation
+//!   (`d = floor(s · 3·sqrt(2π)/4 + 0.5)`) is used.
 //!
 //! Deferred to a later round:
 //!
-//! * remaining filters (Gaussian blur, drop shadow,
+//! * remaining filters (drop shadow,
 //!   feComponentTransfer, feTurbulence, feConvolveMatrix,
 //!   feDisplacementMap, lighting),
 //! * `<pattern>` paints,
@@ -114,8 +121,9 @@ pub use cache::{CacheStats, RasterizedSubtree};
 pub use composite::{composite_rgba_premultiplied, composite_rgba_premultiplied_blend};
 pub use fill::{rasterize_fill, AlphaMask};
 pub use filter::{
-    color_matrix, color_matrix_op, color_matrix_pixels, morphology, morphology_pixels, ColorMatrix,
-    ColorMatrixOp, MorphologyOp,
+    color_matrix, color_matrix_op, color_matrix_pixels, gaussian_blur, gaussian_blur_pixels,
+    morphology, morphology_pixels, ColorMatrix, ColorMatrixOp, MorphologyOp,
+    GAUSSIAN_BLUR_BOX_THRESHOLD,
 };
 pub use flatten::{flatten_arc_to_cubics, flatten_path, FlatContour};
 pub use gradient::{

@@ -31,9 +31,24 @@
 //!   [`ColorMatrix::luminance_to_alpha`] so callers do not have to
 //!   re-derive them.
 //!
+//! * **Gaussian blur** — `feGaussianBlur` from SVG 1.1 §15.17.
+//!   Convolves a packed-RGBA buffer with the separable normalised
+//!   Gaussian `G(x, y) = H(x)·I(y)` where
+//!   `H(x) = exp(-x²/(2s²)) / sqrt(2π·s²)` and
+//!   `I(y) = exp(-y²/(2t²)) / sqrt(2π·t²)`. For small standard
+//!   deviations (`s < 2.0`) the spec's "separable convolution" route is
+//!   taken directly with a discrete kernel of half-width `ceil(3·s)`
+//!   (≈99.7% of the analytical mass). For `s ≥ 2.0` the spec's
+//!   three-box-blur approximation is used:
+//!   `d = floor(s · 3·sqrt(2π)/4 + 0.5)`; if `d` is odd three centred
+//!   box-blurs of size `d` are composed, if `d` is even two box-blurs
+//!   of size `d` (centred on the left and right pixel boundaries
+//!   respectively) are composed with one box-blur of size `d + 1`.
+//!   Boundary handling is clamp-to-edge for both modes.
+//!
 //! # Deferred
 //!
-//! Gaussian blur (`feGaussianBlur`), drop shadow (`feDropShadow`),
+//! Drop shadow (`feDropShadow`),
 //! `feComponentTransfer`, `feConvolveMatrix`, `feTurbulence` (Perlin),
 //! `feDisplacementMap`, `feSpecularLighting`, `feDiffuseLighting`.
 //!
@@ -48,8 +63,11 @@
 //! & Woods (2008) §9.4.1 for the separability decomposition; §15.10
 //! for the `feColorMatrix` matrix forms (general 4×5 matrix; the
 //! saturate / hueRotate / luminanceToAlpha pre-built matrices are
-//! reproduced verbatim from the spec table). No `image` / `imageproc`
-//! / `opencv` / `cairo` / `skia` source consulted.
+//! reproduced verbatim from the spec table); §15.17 for the Gaussian
+//! blur kernel definition and the three-box-blur approximation
+//! formula `d = floor(s · 3·sqrt(2π)/4 + 0.5)` for `s ≥ 2.0`. No
+//! `image` / `imageproc` / `opencv` / `cairo` / `skia` source
+//! consulted.
 
 use oxideav_core::Rgba;
 
@@ -1203,5 +1221,684 @@ mod color_matrix_tests {
     fn color_matrix_panics_on_wrong_length() {
         let bad = vec![0u8; 7]; // not w·h·4 for w=2, h=2
         let _ = color_matrix(&bad, 2, 2, &ColorMatrix::identity());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// feGaussianBlur — SVG 1.1 §15.17
+// ---------------------------------------------------------------------------
+
+/// Threshold above which the SVG 1.1 §15.17 three-box-blur approximation
+/// is used in place of the direct discrete Gaussian convolution. The
+/// spec says "For larger values of 's' (s >= 2.0), an approximation can
+/// be used"; the same `2.0` value is exposed here so that callers and
+/// tests can reason about which mode a given `stdDeviation` will take.
+pub const GAUSSIAN_BLUR_BOX_THRESHOLD: f32 = 2.0;
+
+/// SVG 1.1 §15.17 `<feGaussianBlur>`: separable Gaussian blur on a
+/// packed-RGBA byte buffer.
+///
+/// `width × height` is the image extent in pixels. `src` is a
+/// packed-RGBA byte buffer of exactly `width * height * 4` bytes in
+/// row-major order — the same packing produced by
+/// [`crate::Renderer::render`].
+///
+/// `std_x` and `std_y` are the X / Y standard deviations of the
+/// Gaussian, in pixels. Per the spec, a negative value is an error and
+/// will panic; a value of zero disables the effect along that axis (a
+/// zero on both axes returns the input unchanged).
+///
+/// # Algorithm
+///
+/// Per the spec the kernel is the normalised separable Gaussian
+/// `G(x, y) = H(x)·I(y)` with
+/// `H(x) = exp(-x²/(2s²)) / sqrt(2π·s²)` and `I(y) =
+/// exp(-y²/(2t²)) / sqrt(2π·t²)`. Two implementation modes are used:
+///
+/// * **Direct mode (`s < 2.0`)** — separable convolution with a
+///   discrete kernel of half-width `r = ceil(3·s)` (capturing
+///   ≈99.7% of the analytical Gaussian mass). The kernel is
+///   re-normalised after discretisation so that the row sum equals
+///   exactly 1.0 in `f32`, eliminating the residual DC error from
+///   truncating the tails.
+/// * **Box mode (`s ≥ 2.0`)** — the §15.17 three-box-blur
+///   approximation. Let `d = floor(s · 3·sqrt(2π)/4 + 0.5)`. If `d`
+///   is odd, three centred box-blurs of size `d` are composed; if
+///   `d` is even, two box-blurs of size `d` (centred on the pixel
+///   boundary on the left and right respectively) and one
+///   box-blur of size `d + 1` centred on the pixel are composed.
+///   This is the formula given verbatim by the spec and produces
+///   a piece-wise quadratic kernel that matches the Gaussian to
+///   within ≈3%.
+///
+/// Both modes are fully separable: an X-pass over rows followed by a
+/// Y-pass over columns. Boundary handling is **clamp-to-edge** (the
+/// same convention used by [`morphology`]).
+///
+/// # Panics
+///
+/// * If `src.len() != width as usize * height as usize * 4`.
+/// * If `std_x < 0.0` or `std_y < 0.0` (spec error).
+/// * If either standard deviation is NaN.
+///
+/// # Returns
+///
+/// A new packed-RGBA `Vec<u8>` of the same dimensions. With
+/// `std_x == 0.0` and `std_y == 0.0` the input is returned unchanged.
+pub fn gaussian_blur(src: &[u8], width: u32, height: u32, std_x: f32, std_y: f32) -> Vec<u8> {
+    let w = width as usize;
+    let h = height as usize;
+    let expected = w
+        .checked_mul(h)
+        .and_then(|n| n.checked_mul(4))
+        .expect("gaussian_blur: width * height * 4 overflowed usize");
+    assert_eq!(
+        src.len(),
+        expected,
+        "gaussian_blur: src.len() == {} but width*height*4 == {expected}",
+        src.len()
+    );
+    assert!(
+        !std_x.is_nan() && !std_y.is_nan(),
+        "gaussian_blur: stdDeviation must not be NaN"
+    );
+    assert!(
+        std_x >= 0.0 && std_y >= 0.0,
+        "gaussian_blur: stdDeviation must be non-negative (spec error processing): \
+         got std_x={std_x}, std_y={std_y}"
+    );
+
+    if width == 0 || height == 0 {
+        return Vec::new();
+    }
+    if std_x == 0.0 && std_y == 0.0 {
+        return src.to_vec();
+    }
+
+    let mut buf = src.to_vec();
+
+    if std_x > 0.0 {
+        if std_x < GAUSSIAN_BLUR_BOX_THRESHOLD {
+            let kernel = build_gaussian_kernel(std_x);
+            gaussian_separable_pass(&mut buf, w, h, &kernel, Axis::X);
+        } else {
+            box_blur_three_pass(&mut buf, w, h, box_sizes_for_std(std_x), Axis::X);
+        }
+    }
+    if std_y > 0.0 {
+        if std_y < GAUSSIAN_BLUR_BOX_THRESHOLD {
+            let kernel = build_gaussian_kernel(std_y);
+            gaussian_separable_pass(&mut buf, w, h, &kernel, Axis::Y);
+        } else {
+            box_blur_three_pass(&mut buf, w, h, box_sizes_for_std(std_y), Axis::Y);
+        }
+    }
+    buf
+}
+
+/// Convenience wrapper that runs [`gaussian_blur`] on a slice of [`Rgba`]
+/// pixels and returns a `Vec<Rgba>` of the same length.
+pub fn gaussian_blur_pixels(
+    src: &[Rgba],
+    width: u32,
+    height: u32,
+    std_x: f32,
+    std_y: f32,
+) -> Vec<Rgba> {
+    assert_eq!(
+        src.len(),
+        width as usize * height as usize,
+        "gaussian_blur_pixels: src.len() == {} but width*height == {}",
+        src.len(),
+        width as usize * height as usize
+    );
+    let mut bytes = Vec::with_capacity(src.len() * 4);
+    for p in src {
+        bytes.push(p.r);
+        bytes.push(p.g);
+        bytes.push(p.b);
+        bytes.push(p.a);
+    }
+    let out = gaussian_blur(&bytes, width, height, std_x, std_y);
+    out.chunks_exact(4)
+        .map(|c| Rgba::new(c[0], c[1], c[2], c[3]))
+        .collect()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Axis {
+    X,
+    Y,
+}
+
+/// Build a discrete 1-D normalised Gaussian kernel for the given
+/// standard deviation. Half-width is `ceil(3·s)`, capturing ≈99.7% of
+/// the analytical mass; the kernel is renormalised so that the sum
+/// equals exactly `1.0` in `f32`, which removes the DC bias that would
+/// otherwise creep in from truncating the tails.
+fn build_gaussian_kernel(std: f32) -> Vec<f32> {
+    debug_assert!(std > 0.0);
+    let half = (std * 3.0).ceil() as usize;
+    let len = 2 * half + 1;
+    let mut k = Vec::with_capacity(len);
+    let two_sigma_sq = 2.0 * std * std;
+    // Per the §15.17 closed form: H(x) = exp(-x²/(2s²)) / sqrt(2π·s²).
+    // The leading 1/sqrt(2π·s²) factor is a constant per-kernel — it
+    // drops out cleanly when we renormalise below, so we omit it from
+    // the discrete samples.
+    for i in 0..len {
+        let x = i as f32 - half as f32;
+        k.push((-x * x / two_sigma_sq).exp());
+    }
+    let sum: f32 = k.iter().sum();
+    debug_assert!(sum > 0.0);
+    for v in &mut k {
+        *v /= sum;
+    }
+    k
+}
+
+/// Sliding-window separable Gaussian pass along the requested axis,
+/// in-place on a packed-RGBA byte buffer. Channels are processed
+/// independently; the accumulator is `f32` per-channel; boundary
+/// samples reuse the nearest edge pixel (clamp-to-edge).
+fn gaussian_separable_pass(buf: &mut [u8], w: usize, h: usize, kernel: &[f32], axis: Axis) {
+    debug_assert_eq!(buf.len(), w * h * 4);
+    let half = (kernel.len() - 1) / 2;
+    let (stride, primary, secondary) = match axis {
+        Axis::X => (4usize, w, h),
+        Axis::Y => (w * 4, h, w),
+    };
+    let mut line_in = vec![0u8; primary * 4];
+    let mut line_out = vec![0u8; primary * 4];
+    let imax = primary as isize - 1;
+    for s in 0..secondary {
+        // Gather one "line" (row for X-pass, column for Y-pass) into a
+        // contiguous scratch buffer so the inner loop is sequential.
+        let start = match axis {
+            Axis::X => s * w * 4,
+            Axis::Y => s * 4,
+        };
+        for i in 0..primary {
+            let off = start + i * stride;
+            line_in[i * 4..i * 4 + 4].copy_from_slice(&buf[off..off + 4]);
+        }
+
+        for i in 0..primary {
+            let mut acc = [0f32; 4];
+            for (k_idx, w_coef) in kernel.iter().enumerate() {
+                let pi = (i as isize + k_idx as isize - half as isize).clamp(0, imax) as usize;
+                let p = &line_in[pi * 4..pi * 4 + 4];
+                acc[0] += p[0] as f32 * w_coef;
+                acc[1] += p[1] as f32 * w_coef;
+                acc[2] += p[2] as f32 * w_coef;
+                acc[3] += p[3] as f32 * w_coef;
+            }
+            let off = i * 4;
+            line_out[off] = quantise_u8(acc[0]);
+            line_out[off + 1] = quantise_u8(acc[1]);
+            line_out[off + 2] = quantise_u8(acc[2]);
+            line_out[off + 3] = quantise_u8(acc[3]);
+        }
+
+        for i in 0..primary {
+            let off = start + i * stride;
+            buf[off..off + 4].copy_from_slice(&line_out[i * 4..i * 4 + 4]);
+        }
+    }
+}
+
+/// Round a non-negative `f32` channel accumulator to `u8` with
+/// clamp-to-[0, 255]. Negative inputs (which Gaussian blur should not
+/// produce but the helper is conservative anyway) clamp to `0`.
+#[inline]
+fn quantise_u8(v: f32) -> u8 {
+    if v.is_nan() {
+        return 0;
+    }
+    let clamped = v.clamp(0.0, 255.0);
+    (clamped + 0.5) as u8
+}
+
+/// Compute the three box-blur sizes for the §15.17 approximation.
+///
+/// Per the spec:
+///
+/// > let `d = floor(s · 3·sqrt(2π)/4 + 0.5)`
+/// > * if `d` is odd, use three box-blurs of size `d`, centered on the
+/// >   output pixel.
+/// > * if `d` is even, two box-blurs of size `d` (the first one
+/// >   centered on the pixel boundary between the output pixel and the
+/// >   one to the left, the second one centered on the pixel boundary
+/// >   between the output pixel and the one to the right) and one box
+/// >   blur of size `d + 1` centered on the output pixel.
+///
+/// Returns `[BoxKind; 3]` describing the three passes in order. The
+/// "kind" carries both the box size and, for even-`d` passes, the
+/// side the boundary is offset toward.
+fn box_sizes_for_std(std: f32) -> [BoxKind; 3] {
+    debug_assert!(std >= GAUSSIAN_BLUR_BOX_THRESHOLD);
+    // 3·sqrt(2π)/4 ≈ 1.8800316...
+    let d_f = std * (3.0 * (2.0 * std::f32::consts::PI).sqrt() / 4.0) + 0.5;
+    let d = d_f.floor() as u32;
+    let d = d.max(1);
+    if d % 2 == 1 {
+        [
+            BoxKind::Centered(d),
+            BoxKind::Centered(d),
+            BoxKind::Centered(d),
+        ]
+    } else {
+        [
+            BoxKind::OffsetLeft(d),
+            BoxKind::OffsetRight(d),
+            BoxKind::Centered(d + 1),
+        ]
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BoxKind {
+    /// Box-blur of (odd) size `n`, kernel centred on the output pixel.
+    Centered(u32),
+    /// Box-blur of (even) size `n`, kernel centred on the pixel
+    /// boundary between the output pixel and the one to the **left**.
+    /// In integer indices, the window covers `[i - n/2 .. i + n/2 - 1]`
+    /// inclusive (i.e. one more sample to the left than to the right).
+    OffsetLeft(u32),
+    /// Box-blur of (even) size `n`, kernel centred on the pixel
+    /// boundary between the output pixel and the one to the **right**.
+    /// In integer indices the window covers
+    /// `[i - n/2 + 1 .. i + n/2]` inclusive.
+    OffsetRight(u32),
+}
+
+/// Apply the three box-blur passes that approximate one Gaussian pass,
+/// in-place along the requested axis.
+fn box_blur_three_pass(buf: &mut [u8], w: usize, h: usize, kinds: [BoxKind; 3], axis: Axis) {
+    for k in kinds {
+        box_blur_pass(buf, w, h, k, axis);
+    }
+}
+
+/// Run one box-blur pass along `axis` on the packed-RGBA buffer using
+/// a rolling-sum O(W·H) per pass (per channel). Boundary handling is
+/// clamp-to-edge.
+fn box_blur_pass(buf: &mut [u8], w: usize, h: usize, kind: BoxKind, axis: Axis) {
+    debug_assert_eq!(buf.len(), w * h * 4);
+    let (n, lo_off, hi_off) = match kind {
+        BoxKind::Centered(n) => {
+            let half = (n / 2) as isize;
+            (n as usize, -half, half)
+        }
+        BoxKind::OffsetLeft(n) => {
+            let half = (n / 2) as isize;
+            // Window inclusive of [i - half .. i + half - 1], total `n`
+            // samples; the window centroid sits half a pixel to the
+            // left of `i`.
+            (n as usize, -half, half - 1)
+        }
+        BoxKind::OffsetRight(n) => {
+            let half = (n / 2) as isize;
+            (n as usize, -half + 1, half)
+        }
+    };
+    debug_assert_eq!((hi_off - lo_off + 1) as usize, n);
+
+    let (stride, primary, secondary) = match axis {
+        Axis::X => (4usize, w, h),
+        Axis::Y => (w * 4, h, w),
+    };
+    let mut line_in = vec![0u8; primary * 4];
+    let mut line_out = vec![0u8; primary * 4];
+    let imax = primary as isize - 1;
+    let inv_n = 1.0f32 / n as f32;
+    for s in 0..secondary {
+        let start = match axis {
+            Axis::X => s * w * 4,
+            Axis::Y => s * 4,
+        };
+        for i in 0..primary {
+            let off = start + i * stride;
+            line_in[i * 4..i * 4 + 4].copy_from_slice(&buf[off..off + 4]);
+        }
+
+        // Rolling sum: prime the accumulator with the window at i=0,
+        // then for each subsequent i add the new right edge and
+        // subtract the old left edge. Edge handling uses clamp-to-edge
+        // (samples outside [0, primary) reuse index 0 / imax).
+        let mut acc = [0u32; 4];
+        for k_off in lo_off..=hi_off {
+            let pi = k_off.clamp(0, imax) as usize;
+            let p = &line_in[pi * 4..pi * 4 + 4];
+            acc[0] += p[0] as u32;
+            acc[1] += p[1] as u32;
+            acc[2] += p[2] as u32;
+            acc[3] += p[3] as u32;
+        }
+
+        for i in 0..primary {
+            // Write current sample.
+            let off = i * 4;
+            line_out[off] = (acc[0] as f32 * inv_n + 0.5) as u8;
+            line_out[off + 1] = (acc[1] as f32 * inv_n + 0.5) as u8;
+            line_out[off + 2] = (acc[2] as f32 * inv_n + 0.5) as u8;
+            line_out[off + 3] = (acc[3] as f32 * inv_n + 0.5) as u8;
+
+            // Advance: incoming sample at i + 1 + hi_off, outgoing at
+            // i + lo_off.
+            if i + 1 < primary {
+                let next_i = (i + 1) as isize;
+                let in_idx = (next_i + hi_off).clamp(0, imax) as usize;
+                let out_idx = (next_i + lo_off - 1).clamp(0, imax) as usize;
+                let p_in = &line_in[in_idx * 4..in_idx * 4 + 4];
+                let p_out = &line_in[out_idx * 4..out_idx * 4 + 4];
+                acc[0] = acc[0] + p_in[0] as u32 - p_out[0] as u32;
+                acc[1] = acc[1] + p_in[1] as u32 - p_out[1] as u32;
+                acc[2] = acc[2] + p_in[2] as u32 - p_out[2] as u32;
+                acc[3] = acc[3] + p_in[3] as u32 - p_out[3] as u32;
+            }
+        }
+
+        for i in 0..primary {
+            let off = start + i * stride;
+            buf[off..off + 4].copy_from_slice(&line_out[i * 4..i * 4 + 4]);
+        }
+    }
+}
+
+#[cfg(test)]
+mod gaussian_blur_tests {
+    use super::*;
+
+    fn solid(w: u32, h: u32, c: Rgba) -> Vec<u8> {
+        let mut v = Vec::with_capacity((w * h * 4) as usize);
+        for _ in 0..(w * h) {
+            v.extend_from_slice(&[c.r, c.g, c.b, c.a]);
+        }
+        v
+    }
+
+    #[test]
+    fn zero_stddev_is_identity() {
+        let mut img = solid(5, 4, Rgba::new(10, 20, 30, 40));
+        // Perturb a couple of pixels so we'd notice smearing.
+        img[5 * 4] = 200;
+        img[7 * 4 + 2] = 250;
+        let out = gaussian_blur(&img, 5, 4, 0.0, 0.0);
+        assert_eq!(out, img);
+    }
+
+    #[test]
+    fn solid_image_is_invariant_for_any_stddev() {
+        // Gaussian convolution of a constant image gives the same
+        // constant; only the boundary handling could perturb it. With
+        // clamp-to-edge a constant image is perfectly preserved.
+        let img = solid(11, 7, Rgba::new(80, 120, 200, 255));
+        for &(sx, sy) in &[
+            (0.3, 0.0),
+            (0.0, 0.7),
+            (0.5, 0.5),
+            (1.0, 1.0),
+            (1.7, 1.9),
+            (2.0, 2.0),
+            (3.5, 0.0),
+            (4.0, 6.0),
+            (8.0, 8.0),
+        ] {
+            let out = gaussian_blur(&img, 11, 7, sx, sy);
+            assert_eq!(out, img, "(sx, sy) = ({sx}, {sy})");
+        }
+    }
+
+    #[test]
+    fn small_stddev_uses_direct_kernel_branch() {
+        // For s < 2.0 we use the direct discrete convolution. Sanity:
+        // a centred bright pixel diffuses into a symmetric pattern.
+        let w = 9u32;
+        let h = 9u32;
+        let mut img = solid(w, h, Rgba::new(0, 0, 0, 0));
+        let cx = 4usize;
+        let cy = 4usize;
+        let off = (cy * w as usize + cx) * 4;
+        img[off..off + 4].copy_from_slice(&[255, 255, 255, 255]);
+
+        let out = gaussian_blur(&img, w, h, 1.0, 1.0);
+
+        // Centre pixel must still be the brightest.
+        let centre = out[off];
+        assert!(centre > 0);
+        for y in 0..h as usize {
+            for x in 0..w as usize {
+                let o = (y * w as usize + x) * 4;
+                if (x, y) != (cx, cy) {
+                    assert!(
+                        out[o] <= centre,
+                        "centre {centre} must dominate ({x},{y}) = {}",
+                        out[o]
+                    );
+                }
+            }
+        }
+
+        // Four-fold symmetry: the diffusion is identical along ±x, ±y.
+        for d in 1..=3usize {
+            let n = out[((cy - d) * w as usize + cx) * 4];
+            let s = out[((cy + d) * w as usize + cx) * 4];
+            let e = out[(cy * w as usize + (cx + d)) * 4];
+            let west = out[(cy * w as usize + (cx - d)) * 4];
+            assert_eq!(n, s, "vertical symmetry at d={d}");
+            assert_eq!(e, west, "horizontal symmetry at d={d}");
+            // Separable kernel ⇒ horizontal and vertical neighbours at
+            // the same distance get the same coefficient.
+            assert_eq!(n, e, "x/y symmetry at d={d}");
+        }
+    }
+
+    #[test]
+    fn large_stddev_uses_box_approximation_branch() {
+        // For s >= 2.0 we use the three-box-blur approximation. A
+        // bright impulse should spread into a roughly bell-shaped
+        // pattern that's centred on the original pixel.
+        let w = 21u32;
+        let h = 21u32;
+        let mut img = solid(w, h, Rgba::new(0, 0, 0, 0));
+        let cx = 10usize;
+        let cy = 10usize;
+        let off = (cy * w as usize + cx) * 4;
+        img[off..off + 4].copy_from_slice(&[255, 255, 255, 255]);
+
+        let out = gaussian_blur(&img, w, h, 3.0, 3.0);
+
+        // Diffusion is monotone non-increasing radially (we only check
+        // axis-aligned because box-blur cascades aren't exactly
+        // rotation-invariant — but along the axes monotonicity holds).
+        for d in 1..=4usize {
+            let a = out[(cy * w as usize + cx + d - 1) * 4];
+            let b = out[(cy * w as usize + cx + d) * 4];
+            assert!(b <= a, "horizontal monotonicity broken at d={d}: {a}→{b}");
+            let a = out[((cy + d - 1) * w as usize + cx) * 4];
+            let b = out[((cy + d) * w as usize + cx) * 4];
+            assert!(b <= a, "vertical monotonicity broken at d={d}: {a}→{b}");
+        }
+
+        // Centre got dimmer than the original impulse.
+        let centre = out[off];
+        assert!(
+            centre < 255,
+            "centre should diffuse below the impulse but got {centre}"
+        );
+        assert!(centre > 0);
+    }
+
+    #[test]
+    fn separable_decomposition_matches_two_separate_passes() {
+        // gaussian_blur(s_x, s_y) ≡ gaussian_blur(s_x, 0) followed by
+        // gaussian_blur(0, s_y). (Both branches of the algorithm
+        // satisfy this because separability is the defining property of
+        // the Gaussian kernel; the spec literally says "this can be
+        // implemented as a separable convolution".)
+        let w = 11u32;
+        let h = 9u32;
+        let mut img = vec![0u8; (w * h * 4) as usize];
+        // Pseudo-random deterministic content.
+        let mut acc: u32 = 0x1234_5678;
+        for byte in &mut img {
+            acc = acc.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            *byte = (acc >> 16) as u8;
+        }
+        for &(sx, sy) in &[(0.7, 0.5), (1.5, 1.0), (2.0, 2.0), (3.0, 4.0)] {
+            let combined = gaussian_blur(&img, w, h, sx, sy);
+            let stepwise_x = gaussian_blur(&img, w, h, sx, 0.0);
+            let stepwise = gaussian_blur(&stepwise_x, w, h, 0.0, sy);
+            assert_eq!(
+                combined, stepwise,
+                "separability broke at (sx={sx}, sy={sy})"
+            );
+        }
+    }
+
+    #[test]
+    fn axis_only_blur_preserves_orthogonal_axis() {
+        // A horizontal-only Gaussian blur must leave the vertical
+        // signal alone. We set up a buffer with one bright row at
+        // y = 0 and verify that no other row gains any energy from
+        // the X-only pass.
+        let w = 9u32;
+        let h = 5u32;
+        let mut img = solid(w, h, Rgba::new(0, 0, 0, 0));
+        for x in 0..w as usize {
+            let off = x * 4;
+            img[off..off + 4].copy_from_slice(&[200, 100, 50, 255]);
+        }
+        let out = gaussian_blur(&img, w, h, 1.5, 0.0);
+        // Row 0 sits inside the kernel of itself only; rows 1..h must
+        // remain transparent black (they had no source energy).
+        for y in 1..h as usize {
+            for x in 0..w as usize {
+                let off = (y * w as usize + x) * 4;
+                assert_eq!(
+                    &out[off..off + 4],
+                    &[0, 0, 0, 0],
+                    "y={y} x={x} should still be transparent"
+                );
+            }
+        }
+        // And the bright row must still be the bright colour exactly
+        // (clamp-to-edge horizontally + a row that's constant in x).
+        for x in 0..w as usize {
+            let off = x * 4;
+            assert_eq!(&out[off..off + 4], &[200, 100, 50, 255]);
+        }
+    }
+
+    #[test]
+    fn pixels_wrapper_matches_byte_api() {
+        let w = 7u32;
+        let h = 5u32;
+        let pixels: Vec<Rgba> = (0..(w * h))
+            .map(|i| Rgba::new((i * 7) as u8, (i * 11) as u8, (i * 13) as u8, 255))
+            .collect();
+        let mut bytes = Vec::with_capacity(pixels.len() * 4);
+        for p in &pixels {
+            bytes.extend_from_slice(&[p.r, p.g, p.b, p.a]);
+        }
+
+        for &(sx, sy) in &[(0.0, 0.0), (0.6, 0.6), (1.5, 0.0), (2.5, 2.5)] {
+            let from_bytes = gaussian_blur(&bytes, w, h, sx, sy);
+            let from_pixels = gaussian_blur_pixels(&pixels, w, h, sx, sy);
+            let repacked: Vec<u8> = from_pixels
+                .iter()
+                .flat_map(|p| [p.r, p.g, p.b, p.a])
+                .collect();
+            assert_eq!(repacked, from_bytes, "(sx, sy) = ({sx}, {sy})");
+        }
+    }
+
+    #[test]
+    fn empty_image_returns_empty_buffer() {
+        let out = gaussian_blur(&[], 0, 5, 1.0, 1.0);
+        assert!(out.is_empty());
+        let out = gaussian_blur(&[], 5, 0, 1.0, 1.0);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn box_sizes_table_for_known_stddevs() {
+        // s = 2.0 ⇒ d = floor(2.0 · 1.8800316 + 0.5) = floor(4.26..)
+        // = 4. d is even ⇒ [OffsetLeft(4), OffsetRight(4), Centered(5)].
+        let k = box_sizes_for_std(2.0);
+        assert_eq!(k[0], BoxKind::OffsetLeft(4));
+        assert_eq!(k[1], BoxKind::OffsetRight(4));
+        assert_eq!(k[2], BoxKind::Centered(5));
+
+        // s = 3.0 ⇒ d = floor(3.0 · 1.8800316 + 0.5) = floor(6.14..)
+        // = 6. d is even ⇒ [OffsetLeft(6), OffsetRight(6), Centered(7)].
+        let k = box_sizes_for_std(3.0);
+        assert_eq!(k[0], BoxKind::OffsetLeft(6));
+        assert_eq!(k[1], BoxKind::OffsetRight(6));
+        assert_eq!(k[2], BoxKind::Centered(7));
+
+        // s = 4.0 ⇒ d = floor(4.0 · 1.8800316 + 0.5) = floor(8.02..)
+        // = 8. d is even ⇒ [OffsetLeft(8), OffsetRight(8), Centered(9)].
+        let k = box_sizes_for_std(4.0);
+        assert_eq!(k[0], BoxKind::OffsetLeft(8));
+        assert_eq!(k[1], BoxKind::OffsetRight(8));
+        assert_eq!(k[2], BoxKind::Centered(9));
+
+        // s = 5.0 ⇒ d = floor(5.0 · 1.8800316 + 0.5) = floor(9.90..)
+        // = 9. d is odd ⇒ three Centered(9).
+        let k = box_sizes_for_std(5.0);
+        assert_eq!(
+            k,
+            [
+                BoxKind::Centered(9),
+                BoxKind::Centered(9),
+                BoxKind::Centered(9)
+            ]
+        );
+    }
+
+    #[test]
+    fn kernel_normalisation_preserves_constant_image_exactly() {
+        // The renormalisation step in build_gaussian_kernel ensures
+        // that on an unsaturated constant image the result is byte-
+        // exactly the input — i.e. no DC drift from truncating the
+        // Gaussian tails. We already check the surface property in
+        // `solid_image_is_invariant_for_any_stddev`; here we exercise
+        // the kernel-construction invariant directly.
+        for &s in &[0.3f32, 0.7, 1.0, 1.5, 1.99] {
+            let k = build_gaussian_kernel(s);
+            let sum: f32 = k.iter().sum();
+            assert!((sum - 1.0).abs() < 1e-6, "kernel for s={s} has sum {sum}");
+            // The largest coefficient is the centre tap.
+            let half = (k.len() - 1) / 2;
+            assert!(k[half] > 0.0);
+            for (i, &v) in k.iter().enumerate() {
+                if i != half {
+                    assert!(v <= k[half], "tap {i} {} > centre {}", v, k[half]);
+                }
+            }
+            // Symmetry: k[half - d] == k[half + d].
+            for d in 1..=half {
+                let l = k[half - d];
+                let r = k[half + d];
+                assert!((l - r).abs() < 1e-12, "asymmetry at d={d}");
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "stdDeviation must be non-negative")]
+    fn negative_stddev_panics() {
+        let img = solid(2, 2, Rgba::new(0, 0, 0, 0));
+        let _ = gaussian_blur(&img, 2, 2, -0.5, 1.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "gaussian_blur: src.len() ==")]
+    fn wrong_length_panics() {
+        let bad = vec![0u8; 7];
+        let _ = gaussian_blur(&bad, 2, 2, 1.0, 1.0);
     }
 }

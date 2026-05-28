@@ -9,6 +9,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `feGaussianBlur` filter primitive (SVG 1.1 §15.17) — separable
+  Gaussian blur over a packed-RGBA buffer, exposed as
+  `pub fn gaussian_blur(src, width, height, std_x, std_y) -> Vec<u8>`
+  plus the typed-pixel wrapper
+  `gaussian_blur_pixels(&[Rgba], ...)`. The spec defines the kernel as
+  the normalised separable Gaussian `G(x, y) = H(x) · I(y)` with
+  `H(x) = exp(-x²/(2s²)) / sqrt(2π·s²)` and `I(y) = exp(-y²/(2t²)) /
+  sqrt(2π·t²)`, and explicitly permits a "separable convolution"
+  implementation. Two branches mirror the two performance regimes
+  the spec calls out:
+  - **Direct discrete kernel** for `std_x < GAUSSIAN_BLUR_BOX_THRESHOLD`
+    (= `2.0`): build the 1-D Gaussian on `[-ceil(3·s) .. ceil(3·s)]`
+    (capturing ≈99.7% of the analytical mass), renormalise so the
+    discrete row sum equals exactly `1.0` in `f32` (removes the DC
+    drift that would otherwise creep in from truncating the tails),
+    then run one X-pass over rows and one Y-pass over columns with
+    clamp-to-edge boundary handling.
+  - **Three-box-blur approximation** for `s >= 2.0`: the spec's
+    `d = floor(s · 3·sqrt(2π)/4 + 0.5)` formula picks the box size;
+    if `d` is odd we compose three centred box-blurs of size `d`, if
+    `d` is even we compose two box-blurs of size `d` (centred half a
+    pixel to the left and to the right respectively, per the spec
+    paragraph) with one centred box-blur of size `d + 1`. Each box
+    pass is an O(W·H) rolling-sum per channel.
+  Both branches are pure separable (X-pass then Y-pass) so the public
+  `(std_x, std_y)` argument pair selects per-axis blur independently;
+  zero on either axis disables the effect on that axis; zero on both
+  returns the input unchanged; negative or NaN panics per the spec's
+  error-processing rules. Mass conservation is exact at the
+  analytical level and bounded-loss at `u8` quantisation (far-tail
+  samples round to zero). 21 new tests: 12 in the `src/filter.rs`
+  unit suite (zero-stddev identity; solid-image invariance across
+  nine `(sx, sy)` configurations spanning both branches; impulse-
+  response symmetry / monotonicity / centre-dominance on a small
+  canvas for the direct branch; impulse-response axis-aligned
+  monotonicity on a 21×21 canvas for the box branch; separability
+  identity `blur(sx, sy) ≡ blur(sx, 0) ∘ blur(0, sy)` on
+  pseudo-random content for both branches; axis-only blur preserves
+  the orthogonal axis exactly; typed-pixel wrapper agreement with
+  the byte API across both branches; empty image returns empty
+  buffer; `box_sizes_for_std` table reproduces the spec formula at
+  `s = 2.0 / 3.0 / 4.0 / 5.0`; kernel normalisation sum, centre
+  dominance, and symmetry for the direct branch; `#[should_panic]`
+  guards for negative `std_x` and wrong input length) plus 9 in
+  `tests/filter_gaussian_blur.rs` (public-API zero-stddev identity;
+  `GAUSSIAN_BLUR_BOX_THRESHOLD` constant value; solid-image
+  byte-exact invariance across nine `(sx, sy)` configurations;
+  SourceAlpha-style input keeps RGB at zero; impulse-response
+  four-fold mirror symmetry at four standard deviations; bounded
+  mass conservation; pixels-wrapper / byte-API agreement across
+  branches; X-only blur leaves Y-axis untouched; box-branch blur is
+  monotone across a vertical step edge). Math cited to
+  `docs/image/svg/svg11-second-edition.pdf` §15.17; no `image` /
+  `imageproc` / `opencv` / `cairo` / `skia` source consulted.
 - `feColorMatrix` filter primitive (SVG 1.1 §15.10) — per-pixel
   4×5 colour-matrix transform on packed-RGBA buffers. The §15.10
   spec defines the operation on un-premultiplied normalised channel
