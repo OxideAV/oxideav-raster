@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `feComposite` filter primitive (SVG 1.1 §15.12) — pixel-wise
+  combination of two equal-sized packed-RGBA buffers, exposed as
+  `pub fn composite_filter(in1, in2, width, height, op) -> Vec<u8>` plus
+  the typed-pixel wrapper `composite_filter_pixels(&[Rgba], &[Rgba], …)`,
+  selected by the new `CompositeOp` enum. `in1` maps to the spec's `in`
+  / `i1` operand and `in2` to `in2` / `i2`. The compositing algebra runs
+  in the premultiplied-alpha domain fixed by §14.2 ("all color values
+  use premultiplied alpha"): each straight-alpha input is converted to
+  premultiplied `[0, 1]`, the operator is evaluated, then the result is
+  un-premultiplied back to straight-alpha `u8`.
+  - The five Porter–Duff operators (`Over` / `In` / `Out` / `Atop` /
+    `Xor`, referenced by §15.12) are expressed through the standard
+    blend-factor pair `(Fa, Fb)`: `co = ca·Fa + cb·Fb`,
+    `αo = αa·Fa + αb·Fb`, derived from the §14.2 simple-alpha formula
+    `Cr' = (1 − Ea)·Cr + Er` already used by `composite_rgba_premultiplied`.
+    Factors: `over` `(1, 1−αa)`; `in` `(αb, 0)`; `out` `(1−αb, 0)`;
+    `atop` `(αb, 1−αa)`; `xor` `(1−αb, 1−αa)`.
+  - The `Arithmetic { k1, k2, k3, k4 }` operator evaluates the §15.12
+    per-channel formula `result = k1·i1·i2 + k2·i1 + k3·i2 + k4` on the
+    premultiplied channels, clamping each result channel to `[0, 1]`.
+  - Re-quantisation uses the same half-up `round(x · 255)` rule
+    (`quantise_unit`) as the rest of the filter module; a fully
+    transparent result normalises to `(0, 0, 0, 0)`.
 - `feComponentTransfer` filter primitive (SVG 1.1 §15.11) — per-pixel,
   per-channel transfer function over a packed-RGBA buffer, exposed as
   `pub fn component_transfer(src, width, height, &ct) -> Vec<u8>` plus

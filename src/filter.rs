@@ -55,6 +55,17 @@
 //!   on un-premultiplied channels normalised to `[0, 1]`, then
 //!   clamped to that range, then re-quantised back to `u8`.
 //!
+//! * **Composite** — `feComposite` from SVG 1.1 §15.12. Combines two
+//!   equal-sized RGBA buffers pixel-wise. The five Porter–Duff
+//!   operators (`over` / `in` / `out` / `atop` / `xor`) are expressed
+//!   through the premultiplied-alpha blend-factor pair `(Fa, Fb)` —
+//!   `co = ca·Fa + cb·Fb`, `αo = αa·Fa + αb·Fb` — consistent with the
+//!   §14.2 simple-alpha-compositing formula (`Cr' = (1 − Ea)·Cr + Er`,
+//!   i.e. `over`) already used by [`crate::composite_rgba_premultiplied`].
+//!   The `arithmetic` operator evaluates the §15.12 per-channel formula
+//!   `result = k1·i1·i2 + k2·i1 + k3·i2 + k4` on premultiplied channels,
+//!   clamped to `[0, 1]`. Selectable via [`CompositeOp`].
+//!
 //! # Deferred
 //!
 //! Drop shadow (`feDropShadow`), `feConvolveMatrix`, `feTurbulence`
@@ -76,7 +87,12 @@
 //! blur kernel definition and the three-box-blur approximation
 //! formula `d = floor(s · 3·sqrt(2π)/4 + 0.5)` for `s ≥ 2.0`; §15.11
 //! for the five `feComponentTransfer` modes (identity / table /
-//! discrete / linear / gamma). No `image` / `imageproc` / `opencv` /
+//! discrete / linear / gamma); §15.12 for the `feComposite` arithmetic
+//! formula `result = k1·i1·i2 + k2·i1 + k3·i2 + k4` (reproduced
+//! verbatim) and the §14.2 premultiplied simple-alpha-compositing
+//! algebra (`Cr' = (1 − Ea)·Cr + Er`) from which the Porter–Duff
+//! `over` / `in` / `out` / `atop` / `xor` blend-factor pairs are
+//! derived. No `image` / `imageproc` / `opencv` /
 //! `cairo` / `skia` / `resvg` / `librsvg` source consulted.
 
 use oxideav_core::Rgba;
@@ -2592,5 +2608,459 @@ mod component_transfer_tests {
             offset: 0.0,
         });
         let _ = component_transfer(&img, 2, 2, &ct);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// feComposite — SVG 1.1 §15.12
+// ---------------------------------------------------------------------------
+
+/// Operator selector for [`composite_filter`], mirroring the `operator`
+/// attribute of SVG 1.1 §15.12 `<feComposite>`
+/// (`"over" | "in" | "out" | "atop" | "xor" | "arithmetic"`).
+///
+/// The five non-arithmetic operators are the Porter–Duff compositing
+/// operations referenced by §15.12. They are expressed here through the
+/// standard premultiplied-alpha blend-factor pair `(Fa, Fb)` so that the
+/// per-channel result is
+///
+/// ```text
+/// co = ca · Fa + cb · Fb        (premultiplied colour)
+/// αo = αa · Fa + αb · Fb        (alpha)
+/// ```
+///
+/// where the *first* input (`in` / `i1`) is the `a` operand and the
+/// *second* input (`in2` / `i2`) is the `b` operand, consistent with the
+/// premultiplied source-over algebra of SVG 1.1 §14.2 already used by
+/// the crate's [`composite_rgba_premultiplied`](crate::composite_rgba_premultiplied)
+/// path (`Cr' = (1 − Ea)·Cr + Er`, i.e. `over` with `Fa = 1`,
+/// `Fb = 1 − αa`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CompositeOp {
+    /// `in` source-over `in2`. `Fa = 1`, `Fb = 1 − αa`.
+    Over,
+    /// `in` clipped to `in2`'s coverage. `Fa = αb`, `Fb = 0`.
+    In,
+    /// `in` outside `in2`'s coverage. `Fa = 1 − αb`, `Fb = 0`.
+    Out,
+    /// `in` atop `in2`. `Fa = αb`, `Fb = 1 − αa`.
+    Atop,
+    /// Symmetric difference. `Fa = 1 − αb`, `Fb = 1 − αa`.
+    Xor,
+    /// Component-wise arithmetic combination
+    /// `result = k1·i1·i2 + k2·i1 + k3·i2 + k4` (§15.12), evaluated on
+    /// premultiplied channels in `[0, 1]` and clamped to `[0, 1]`.
+    Arithmetic {
+        /// Coefficient on the `i1 · i2` product term.
+        k1: f32,
+        /// Coefficient on the `i1` term.
+        k2: f32,
+        /// Coefficient on the `i2` term.
+        k3: f32,
+        /// Constant offset term.
+        k4: f32,
+    },
+}
+
+impl CompositeOp {
+    /// The Porter–Duff `(Fa, Fb)` blend factors for the five
+    /// non-arithmetic operators, given the premultiplied alphas
+    /// `αa` (= `in`) and `αb` (= `in2`), both in `[0, 1]`.
+    ///
+    /// Returns `None` for [`CompositeOp::Arithmetic`], which is not a
+    /// blend-factor operator and is handled separately.
+    #[inline]
+    fn blend_factors(self, alpha_a: f32, alpha_b: f32) -> Option<(f32, f32)> {
+        Some(match self {
+            CompositeOp::Over => (1.0, 1.0 - alpha_a),
+            CompositeOp::In => (alpha_b, 0.0),
+            CompositeOp::Out => (1.0 - alpha_b, 0.0),
+            CompositeOp::Atop => (alpha_b, 1.0 - alpha_a),
+            CompositeOp::Xor => (1.0 - alpha_b, 1.0 - alpha_a),
+            CompositeOp::Arithmetic { .. } => return None,
+        })
+    }
+}
+
+/// SVG 1.1 §15.12 `<feComposite>` — combine two equally-sized
+/// packed-RGBA `u8` buffers pixel-wise with a [`CompositeOp`].
+///
+/// `in1` maps to the spec's `in` / `i1` operand and `in2` to `in2` /
+/// `i2`. Both buffers must be exactly `width * height * 4` bytes in
+/// row-major RGBA order and describe the same `width × height` extent.
+///
+/// **Pixel space.** §14.2 ("all color values use premultiplied alpha")
+/// fixes the compositing algebra in the premultiplied domain. This
+/// entry point converts each straight-alpha input byte triple to
+/// premultiplied `[0, 1]` floats (`c · α`), evaluates the operator, and
+/// converts the premultiplied result back to straight-alpha bytes. The
+/// arithmetic operator is likewise evaluated on the premultiplied
+/// channels, matching the spec's example use (combining lighting output
+/// with texture) where the operands are already premultiplied filter
+/// results.
+///
+/// Complexity is `O(W · H)` with a constant per-pixel cost.
+///
+/// # Panics
+///
+/// * If `in1.len() != width as usize * height as usize * 4`.
+/// * If `in2.len() != width as usize * height as usize * 4`.
+///
+/// # Returns
+///
+/// A new packed-RGBA `Vec<u8>` of the same dimensions.
+pub fn composite_filter(
+    in1: &[u8],
+    in2: &[u8],
+    width: u32,
+    height: u32,
+    op: CompositeOp,
+) -> Vec<u8> {
+    let w = width as usize;
+    let h = height as usize;
+    let expected = w
+        .checked_mul(h)
+        .and_then(|n| n.checked_mul(4))
+        .expect("composite_filter: width * height * 4 overflowed usize");
+    assert_eq!(
+        in1.len(),
+        expected,
+        "composite_filter: in1.len() == {} but width*height*4 == {expected}",
+        in1.len()
+    );
+    assert_eq!(
+        in2.len(),
+        expected,
+        "composite_filter: in2.len() == {} but width*height*4 == {expected}",
+        in2.len()
+    );
+
+    if width == 0 || height == 0 {
+        return Vec::new();
+    }
+
+    let mut out = Vec::with_capacity(expected);
+    for (pa, pb) in in1.chunks_exact(4).zip(in2.chunks_exact(4)) {
+        // Straight-alpha bytes → premultiplied [0, 1].
+        let aa = pa[3] as f32 / 255.0;
+        let ab = pb[3] as f32 / 255.0;
+        let a = [
+            pa[0] as f32 / 255.0 * aa,
+            pa[1] as f32 / 255.0 * aa,
+            pa[2] as f32 / 255.0 * aa,
+            aa,
+        ];
+        let b = [
+            pb[0] as f32 / 255.0 * ab,
+            pb[1] as f32 / 255.0 * ab,
+            pb[2] as f32 / 255.0 * ab,
+            ab,
+        ];
+
+        let (pr, pg, pb_, palpha) = match op {
+            CompositeOp::Arithmetic { k1, k2, k3, k4 } => {
+                let arith =
+                    |i1: f32, i2: f32| (k1 * i1 * i2 + k2 * i1 + k3 * i2 + k4).clamp(0.0, 1.0);
+                (
+                    arith(a[0], b[0]),
+                    arith(a[1], b[1]),
+                    arith(a[2], b[2]),
+                    arith(a[3], b[3]),
+                )
+            }
+            _ => {
+                // SAFETY of unwrap: every variant except Arithmetic
+                // returns Some, and Arithmetic is handled above.
+                let (fa, fb) = op.blend_factors(a[3], b[3]).unwrap();
+                (
+                    (a[0] * fa + b[0] * fb).clamp(0.0, 1.0),
+                    (a[1] * fa + b[1] * fb).clamp(0.0, 1.0),
+                    (a[2] * fa + b[2] * fb).clamp(0.0, 1.0),
+                    (a[3] * fa + b[3] * fb).clamp(0.0, 1.0),
+                )
+            }
+        };
+
+        // Premultiplied [0, 1] → straight-alpha bytes. When the result
+        // alpha is zero the colour is fully transparent; emit (0,0,0,0)
+        // so the un-premultiply division is well-defined.
+        if palpha <= 0.0 {
+            out.extend_from_slice(&[0, 0, 0, 0]);
+        } else {
+            let inv = 1.0 / palpha;
+            out.push(quantise_unit((pr * inv).min(1.0)));
+            out.push(quantise_unit((pg * inv).min(1.0)));
+            out.push(quantise_unit((pb_ * inv).min(1.0)));
+            out.push(quantise_unit(palpha));
+        }
+    }
+    out
+}
+
+/// Convenience wrapper that runs [`composite_filter`] on two slices of
+/// [`Rgba`] pixels and returns a `Vec<Rgba>` of the same length.
+/// Identical semantics — provided for callers that already have typed
+/// pixel buffers.
+pub fn composite_filter_pixels(
+    in1: &[Rgba],
+    in2: &[Rgba],
+    width: u32,
+    height: u32,
+    op: CompositeOp,
+) -> Vec<Rgba> {
+    let n = width as usize * height as usize;
+    assert_eq!(
+        in1.len(),
+        n,
+        "composite_filter_pixels: in1.len() == {} but width*height == {n}",
+        in1.len()
+    );
+    assert_eq!(
+        in2.len(),
+        n,
+        "composite_filter_pixels: in2.len() == {} but width*height == {n}",
+        in2.len()
+    );
+    let mut b1 = Vec::with_capacity(n * 4);
+    let mut b2 = Vec::with_capacity(n * 4);
+    for p in in1 {
+        b1.extend_from_slice(&[p.r, p.g, p.b, p.a]);
+    }
+    for p in in2 {
+        b2.extend_from_slice(&[p.r, p.g, p.b, p.a]);
+    }
+    let out = composite_filter(&b1, &b2, width, height, op);
+    out.chunks_exact(4)
+        .map(|c| Rgba::new(c[0], c[1], c[2], c[3]))
+        .collect()
+}
+
+#[cfg(test)]
+mod composite_tests {
+    use super::*;
+
+    fn build<F: FnMut(u32, u32) -> Rgba>(w: u32, h: u32, mut f: F) -> Vec<u8> {
+        let mut v = Vec::with_capacity((w * h * 4) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                let c = f(x, y);
+                v.extend_from_slice(&[c.r, c.g, c.b, c.a]);
+            }
+        }
+        v
+    }
+
+    #[test]
+    fn over_matches_simple_alpha_compositing() {
+        // §14.2 premultiplied "over": Cr' = (1 - Ea)*Cr + Er with
+        // E = in (a), C = in2 (b). Opaque blue over opaque red is just
+        // opaque blue. Half-alpha blue over opaque red blends.
+        let a = build(2, 1, |x, _| {
+            if x == 0 {
+                Rgba::new(0, 0, 255, 255) // opaque blue
+            } else {
+                Rgba::new(0, 0, 255, 128) // ~half blue
+            }
+        });
+        let b = build(2, 1, |_, _| Rgba::new(255, 0, 0, 255)); // opaque red
+        let out = composite_filter(&a, &b, 2, 1, CompositeOp::Over);
+        // Pixel 0: opaque blue wins outright.
+        assert_eq!(&out[0..4], &[0, 0, 255, 255]);
+        // Pixel 1: alpha stays opaque (1 - (1-0.5)*(1-1) = 1).
+        assert_eq!(out[7], 255);
+        // Red premult ≈ (1 - 0.502)*1.0 = 0.498 → round-trip ~127.
+        let r = out[4] as i32;
+        assert!((r - 127).abs() <= 2, "expected ~127 red got {r}");
+        // Blue premult ≈ 0.502 → straight ~128.
+        let bl = out[6] as i32;
+        assert!((bl - 128).abs() <= 2, "expected ~128 blue got {bl}");
+    }
+
+    #[test]
+    fn in_keeps_a_color_masked_by_b_alpha() {
+        // operator="in": Fa = αb, Fb = 0. Result = in clipped to in2's
+        // coverage. Opaque green "in" half-alpha anything → green at
+        // 50% alpha, original green RGB preserved (straight-alpha).
+        let a = build(1, 1, |_, _| Rgba::new(0, 200, 0, 255));
+        let b = build(1, 1, |_, _| Rgba::new(9, 9, 9, 128));
+        let out = composite_filter(&a, &b, 1, 1, CompositeOp::In);
+        // Alpha = 1.0 * (128/255) → ~128.
+        assert!((out[3] as i32 - 128).abs() <= 1, "alpha {}", out[3]);
+        // Straight-alpha green preserved exactly (premult then /α).
+        assert_eq!(out[1], 200);
+        // No contribution from in2's colour.
+        assert_eq!(out[0], 0);
+        assert_eq!(out[2], 0);
+    }
+
+    #[test]
+    fn out_removes_a_where_b_covers() {
+        // operator="out": Fa = 1 - αb, Fb = 0. Opaque a "out" opaque b
+        // → fully transparent everywhere b covers.
+        let a = build(1, 1, |_, _| Rgba::new(10, 20, 30, 255));
+        let b = build(1, 1, |_, _| Rgba::new(0, 0, 0, 255));
+        let out = composite_filter(&a, &b, 1, 1, CompositeOp::Out);
+        assert_eq!(&out[0..4], &[0, 0, 0, 0]);
+        // Where b is empty, a passes through untouched.
+        let b0 = build(1, 1, |_, _| Rgba::new(0, 0, 0, 0));
+        let out2 = composite_filter(&a, &b0, 1, 1, CompositeOp::Out);
+        assert_eq!(&out2[0..4], &[10, 20, 30, 255]);
+    }
+
+    #[test]
+    fn xor_of_disjoint_opaque_is_union() {
+        // operator="xor": Fa = 1 - αb, Fb = 1 - αa. Two opaque inputs
+        // that don't overlap (one empty per pixel) yield the non-empty
+        // one; full overlap of two opaque inputs cancels to transparent.
+        // `a` is opaque red at both pixels; only `b`'s coverage varies.
+        let a = build(2, 1, |_, _| Rgba::new(255, 0, 0, 255));
+        let b = build(2, 1, |x, _| {
+            if x == 0 {
+                Rgba::new(0, 0, 255, 0) // empty at pixel 0
+            } else {
+                Rgba::new(0, 0, 255, 255) // opaque overlap at pixel 1
+            }
+        });
+        let out = composite_filter(&a, &b, 2, 1, CompositeOp::Xor);
+        // Pixel 0: a opaque, b empty → a passes (Fa = 1 - 0 = 1).
+        assert_eq!(&out[0..4], &[255, 0, 0, 255]);
+        // Pixel 1: both opaque → αo = 1*0 + 1*0 = 0 → transparent.
+        assert_eq!(out[7], 0);
+    }
+
+    #[test]
+    fn atop_preserves_b_alpha() {
+        // operator="atop": Fa = αb, Fb = 1 - αa. The result alpha
+        // equals αb (a "atop" b is confined to b's silhouette):
+        // αo = αa*αb + αb*(1-αa) = αb.
+        let a = build(1, 1, |_, _| Rgba::new(255, 255, 255, 200));
+        let b = build(1, 1, |_, _| Rgba::new(0, 0, 0, 128));
+        let out = composite_filter(&a, &b, 1, 1, CompositeOp::Atop);
+        assert!((out[3] as i32 - 128).abs() <= 1, "alpha {}", out[3]);
+    }
+
+    #[test]
+    fn arithmetic_k2_one_passes_in1_through() {
+        // result = 0*i1*i2 + 1*i1 + 0*i2 + 0 = i1. With both inputs
+        // opaque the premultiplied channels equal the straight ones, so
+        // in1 round-trips byte-exact.
+        let a = build(3, 2, |x, y| {
+            Rgba::new((x * 50) as u8, (y * 90) as u8, 33, 255)
+        });
+        let b = build(3, 2, |_, _| Rgba::new(200, 200, 200, 255));
+        let out = composite_filter(
+            &a,
+            &b,
+            3,
+            2,
+            CompositeOp::Arithmetic {
+                k1: 0.0,
+                k2: 1.0,
+                k3: 0.0,
+                k4: 0.0,
+            },
+        );
+        assert_eq!(out, a);
+    }
+
+    #[test]
+    fn arithmetic_k4_floods_constant() {
+        // result = k4 on every channel (k1=k2=k3=0). k4=1 → opaque
+        // white everywhere regardless of inputs.
+        let a = build(2, 2, |_, _| Rgba::new(10, 20, 30, 40));
+        let b = build(2, 2, |_, _| Rgba::new(50, 60, 70, 80));
+        let out = composite_filter(
+            &a,
+            &b,
+            2,
+            2,
+            CompositeOp::Arithmetic {
+                k1: 0.0,
+                k2: 0.0,
+                k3: 0.0,
+                k4: 1.0,
+            },
+        );
+        // Premult result = (1,1,1,1) → straight (255,255,255,255).
+        assert!(out.iter().all(|&v| v == 255));
+    }
+
+    #[test]
+    fn arithmetic_clamps_to_unit_range() {
+        // k2=k3=2 drives premultiplied sums well past 1.0; the spec
+        // clamps each channel to [0,1]. Opaque inputs → channels clamp
+        // to opaque white.
+        let a = build(1, 1, |_, _| Rgba::new(200, 0, 0, 255));
+        let b = build(1, 1, |_, _| Rgba::new(0, 200, 0, 255));
+        let out = composite_filter(
+            &a,
+            &b,
+            1,
+            1,
+            CompositeOp::Arithmetic {
+                k1: 0.0,
+                k2: 2.0,
+                k3: 2.0,
+                k4: 0.0,
+            },
+        );
+        // Alpha: 2*1 + 2*1 = 4 → clamp 1 → 255.
+        assert_eq!(out[3], 255);
+    }
+
+    #[test]
+    fn typed_wrapper_matches_byte_path() {
+        let a_b = build(4, 3, |x, y| {
+            Rgba::new((x * 30) as u8, (y * 40) as u8, 11, ((x + y) * 25) as u8)
+        });
+        let b_b = build(4, 3, |x, y| {
+            Rgba::new(7, (x * 20) as u8, (y * 50) as u8, 200)
+        });
+        let a_p: Vec<Rgba> = a_b
+            .chunks_exact(4)
+            .map(|c| Rgba::new(c[0], c[1], c[2], c[3]))
+            .collect();
+        let b_p: Vec<Rgba> = b_b
+            .chunks_exact(4)
+            .map(|c| Rgba::new(c[0], c[1], c[2], c[3]))
+            .collect();
+        for op in [
+            CompositeOp::Over,
+            CompositeOp::In,
+            CompositeOp::Out,
+            CompositeOp::Atop,
+            CompositeOp::Xor,
+            CompositeOp::Arithmetic {
+                k1: 0.25,
+                k2: 0.5,
+                k3: 0.5,
+                k4: 0.1,
+            },
+        ] {
+            let via_bytes = composite_filter(&a_b, &b_b, 4, 3, op);
+            let via_typed = composite_filter_pixels(&a_p, &b_p, 4, 3, op);
+            let typed_bytes: Vec<u8> = via_typed
+                .iter()
+                .flat_map(|p| [p.r, p.g, p.b, p.a])
+                .collect();
+            assert_eq!(via_bytes, typed_bytes, "mismatch for {op:?}");
+        }
+    }
+
+    #[test]
+    fn empty_extent_is_empty_vec() {
+        assert!(composite_filter(&[], &[], 0, 0, CompositeOp::Over).is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "in1.len()")]
+    fn wrong_in1_length_panics() {
+        let _ = composite_filter(&[0u8; 8], &[0u8; 16], 2, 2, CompositeOp::Over);
+    }
+
+    #[test]
+    #[should_panic(expected = "in2.len()")]
+    fn wrong_in2_length_panics() {
+        let _ = composite_filter(&[0u8; 16], &[0u8; 8], 2, 2, CompositeOp::Over);
     }
 }
