@@ -46,11 +46,20 @@
 //!   respectively) are composed with one box-blur of size `d + 1`.
 //!   Boundary handling is clamp-to-edge for both modes.
 //!
+//! * **Component transfer** — `feComponentTransfer` from SVG 1.1
+//!   §15.11. Per-pixel, per-channel transfer function — each of R, G,
+//!   B, A carries one of the five §15.11 modes (`identity`, `table`
+//!   piecewise-linear over `N+1` values, `discrete` step over `N`
+//!   values, `linear` affine `slope · C + intercept`, `gamma`
+//!   `amplitude · C^exponent + offset`). The operation is performed
+//!   on un-premultiplied channels normalised to `[0, 1]`, then
+//!   clamped to that range, then re-quantised back to `u8`.
+//!
 //! # Deferred
 //!
-//! Drop shadow (`feDropShadow`),
-//! `feComponentTransfer`, `feConvolveMatrix`, `feTurbulence` (Perlin),
-//! `feDisplacementMap`, `feSpecularLighting`, `feDiffuseLighting`.
+//! Drop shadow (`feDropShadow`), `feConvolveMatrix`, `feTurbulence`
+//! (Perlin), `feDisplacementMap`, `feSpecularLighting`,
+//! `feDiffuseLighting`.
 //!
 //! # Wall provenance
 //!
@@ -65,9 +74,10 @@
 //! saturate / hueRotate / luminanceToAlpha pre-built matrices are
 //! reproduced verbatim from the spec table); §15.17 for the Gaussian
 //! blur kernel definition and the three-box-blur approximation
-//! formula `d = floor(s · 3·sqrt(2π)/4 + 0.5)` for `s ≥ 2.0`. No
-//! `image` / `imageproc` / `opencv` / `cairo` / `skia` source
-//! consulted.
+//! formula `d = floor(s · 3·sqrt(2π)/4 + 0.5)` for `s ≥ 2.0`; §15.11
+//! for the five `feComponentTransfer` modes (identity / table /
+//! discrete / linear / gamma). No `image` / `imageproc` / `opencv` /
+//! `cairo` / `skia` / `resvg` / `librsvg` source consulted.
 
 use oxideav_core::Rgba;
 
@@ -1900,5 +1910,687 @@ mod gaussian_blur_tests {
     fn wrong_length_panics() {
         let bad = vec![0u8; 7];
         let _ = gaussian_blur(&bad, 2, 2, 1.0, 1.0);
+    }
+}
+
+// =====================================================================
+// feComponentTransfer — SVG 1.1 §15.11
+// =====================================================================
+//
+// §15.11 defines a per-pixel, per-channel transfer function applied
+// independently to R, G, B, A. Each channel selects one of five
+// `type=` modes; channel inputs and outputs are normalised to the
+// `[0, 1]` interval, the operation is performed on un-premultiplied
+// channels, and the result is clamped to `[0, 1]` before re-quantising
+// back to `u8`. The five modes, in spec wording:
+//
+//   identity   C' = C
+//   table      a piecewise-linear function over a list of N+1 values
+//              v₀ … v_N; for a channel value C ∈ [0, 1], let
+//              k = floor(C · N) clamped to [0, N-1], let
+//              C_step = (C · N) − k; then C' = v_k + C_step · (v_{k+1} − v_k).
+//              (At C = 1.0 the spec's clamp on k pins the interpolation
+//              to the final segment v_{N-1}…v_N, so C' = v_N.)
+//   discrete   a step function over a list of N values
+//              v₀ … v_{N-1}; for C ∈ [0, 1], let k = floor(C · N)
+//              clamped to [0, N-1]; then C' = v_k.
+//   linear     C' = slope · C + intercept.
+//   gamma      C' = amplitude · pow(C, exponent) + offset.
+//
+// `feFuncR` / `feFuncG` / `feFuncB` / `feFuncA` are independent: each
+// channel carries its own [`TransferFunc`]. The API here lifts that
+// directly into a [`ComponentTransfer`] struct of four
+// [`TransferFunc`] values plus per-channel setters.
+
+/// Per-channel transfer function for [`component_transfer`], mirroring
+/// SVG 1.1 §15.11's `type=` attribute on the `<feFuncX>` child elements.
+///
+/// All inputs and outputs are normalised to `[0, 1]`; the implementation
+/// performs the operation, clamps the result to that range, and only
+/// then re-quantises back to `u8` for the byte API.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TransferFunc {
+    /// `type="identity"` — output equals input.
+    Identity,
+    /// `type="table"` — piecewise-linear interpolation across `N+1`
+    /// `tableValues`. With `N = 0` (`tableValues` empty or a single
+    /// value) the channel collapses to the identity (the spec's
+    /// fall-back when the value list is too short to define a segment).
+    Table(Vec<f32>),
+    /// `type="discrete"` — step function across `N` `tableValues`. An
+    /// empty list also collapses to identity (no step boundaries to
+    /// place).
+    Discrete(Vec<f32>),
+    /// `type="linear"` — affine transform.
+    Linear {
+        /// Spec attribute `slope`.
+        slope: f32,
+        /// Spec attribute `intercept`.
+        intercept: f32,
+    },
+    /// `type="gamma"` — `amplitude · C^exponent + offset`. `exponent`
+    /// must be strictly positive (§15.11 error processing); a
+    /// non-positive or NaN exponent panics.
+    Gamma {
+        /// Spec attribute `amplitude`.
+        amplitude: f32,
+        /// Spec attribute `exponent`. Must be strictly positive.
+        exponent: f32,
+        /// Spec attribute `offset`.
+        offset: f32,
+    },
+}
+
+impl TransferFunc {
+    /// Evaluate the transfer function on a single normalised channel
+    /// value `c ∈ [0, 1]`. The result is **not** pre-clamped — the
+    /// caller is responsible for the final clamp / quantisation. Out-of-
+    /// range inputs are passed through the spec formula unchanged.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `self` is [`TransferFunc::Gamma`] with a non-positive or
+    /// NaN exponent. The §15.11 error-processing rule forbids both, and
+    /// they make the `pow` undefined in general.
+    #[inline]
+    pub fn apply(&self, c: f32) -> f32 {
+        match self {
+            TransferFunc::Identity => c,
+            TransferFunc::Table(v) => table_interpolate(v, c),
+            TransferFunc::Discrete(v) => discrete_step(v, c),
+            TransferFunc::Linear { slope, intercept } => slope * c + intercept,
+            TransferFunc::Gamma {
+                amplitude,
+                exponent,
+                offset,
+            } => {
+                assert!(
+                    exponent.is_finite() && *exponent > 0.0,
+                    "feComponentTransfer: gamma exponent must be strictly positive, got {exponent}"
+                );
+                // The spec leaves pow on negative inputs unspecified;
+                // §15.11 normalises through clamp-to-[0,1] only at the
+                // output, so a negative `c` from the caller (e.g. via
+                // a feColorMatrix bias that left the channel slightly
+                // negative) would produce NaN under `f32::powf`. Treat
+                // negative inputs as zero before the pow — the
+                // subsequent output clamp already handles the positive
+                // side, and zero is the natural floor of the §15.11
+                // gamma curve at the channel boundary.
+                let base = c.max(0.0);
+                amplitude * base.powf(*exponent) + offset
+            }
+        }
+    }
+}
+
+/// Piecewise-linear table lookup for [`TransferFunc::Table`]. The spec
+/// places `N + 1` tableValues at the breakpoints `k / N` for `k ∈ 0..=N`
+/// and linearly interpolates between adjacent breakpoints.
+#[inline]
+fn table_interpolate(v: &[f32], c: f32) -> f32 {
+    let n_plus_one = v.len();
+    if n_plus_one < 2 {
+        // Empty list or a single tableValue defines no segment ⇒
+        // identity per the §15.11 fall-back.
+        return c;
+    }
+    let n = (n_plus_one - 1) as f32;
+    let scaled = c * n;
+    if scaled <= 0.0 {
+        return v[0];
+    }
+    if scaled >= n {
+        return v[n_plus_one - 1];
+    }
+    let k = scaled.floor() as usize;
+    let frac = scaled - k as f32;
+    v[k] + frac * (v[k + 1] - v[k])
+}
+
+/// Step lookup for [`TransferFunc::Discrete`]. The spec partitions
+/// `[0, 1]` into `N` half-open buckets `[k / N, (k+1) / N)` (with the
+/// final bucket closed at `1`) and emits `v[k]`.
+#[inline]
+fn discrete_step(v: &[f32], c: f32) -> f32 {
+    let n = v.len();
+    if n == 0 {
+        return c;
+    }
+    let scaled = c * n as f32;
+    if scaled <= 0.0 {
+        return v[0];
+    }
+    if scaled >= n as f32 {
+        return v[n - 1];
+    }
+    let k = scaled.floor() as usize;
+    v[k.min(n - 1)]
+}
+
+/// SVG 1.1 §15.11 `<feComponentTransfer>` configuration — one
+/// [`TransferFunc`] per RGBA channel, applied independently per pixel.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ComponentTransfer {
+    /// Red-channel function (`<feFuncR>`).
+    pub r: TransferFunc,
+    /// Green-channel function (`<feFuncG>`).
+    pub g: TransferFunc,
+    /// Blue-channel function (`<feFuncB>`).
+    pub b: TransferFunc,
+    /// Alpha-channel function (`<feFuncA>`).
+    pub a: TransferFunc,
+}
+
+impl ComponentTransfer {
+    /// Identity on every channel — equivalent to `<feComponentTransfer>`
+    /// with no `<feFuncX>` children, which the spec defines as a
+    /// no-op.
+    pub fn identity() -> Self {
+        Self {
+            r: TransferFunc::Identity,
+            g: TransferFunc::Identity,
+            b: TransferFunc::Identity,
+            a: TransferFunc::Identity,
+        }
+    }
+
+    /// Replace the red-channel transfer function and return `self`
+    /// (builder-style chain).
+    pub fn with_r(mut self, f: TransferFunc) -> Self {
+        self.r = f;
+        self
+    }
+
+    /// Replace the green-channel transfer function and return `self`.
+    pub fn with_g(mut self, f: TransferFunc) -> Self {
+        self.g = f;
+        self
+    }
+
+    /// Replace the blue-channel transfer function and return `self`.
+    pub fn with_b(mut self, f: TransferFunc) -> Self {
+        self.b = f;
+        self
+    }
+
+    /// Replace the alpha-channel transfer function and return `self`.
+    pub fn with_a(mut self, f: TransferFunc) -> Self {
+        self.a = f;
+        self
+    }
+}
+
+impl Default for ComponentTransfer {
+    fn default() -> Self {
+        Self::identity()
+    }
+}
+
+/// SVG 1.1 §15.11 `<feComponentTransfer>` — apply one [`TransferFunc`]
+/// per channel to each pixel of a packed-RGBA `u8` buffer.
+///
+/// `width × height` is the input/output image extent in pixels. `src`
+/// is a packed-RGBA byte buffer of exactly `width * height * 4` bytes
+/// in row-major order.
+///
+/// **Pixel space.** §15.11 explicitly says the operation is performed
+/// on the un-premultiplied colour channels, with channel values in
+/// `[0, 1]`. This entry point therefore treats input bytes as
+/// straight-alpha samples, normalises by `/ 255.0`, applies the
+/// per-channel function, clamps to `[0, 1]`, and re-quantises back via
+/// the same `round(x · 255)` rule the rest of the filter module uses
+/// (`quantise_unit`).
+///
+/// Complexity is `O(W · H)` with a constant per-pixel cost — independent
+/// of the size of any [`TransferFunc::Table`] / [`TransferFunc::Discrete`]
+/// list (each lookup is `O(1)` against `floor`).
+///
+/// # Panics
+///
+/// * If `src.len() != width as usize * height as usize * 4`.
+/// * If any channel uses [`TransferFunc::Gamma`] with a non-positive or
+///   NaN exponent.
+///
+/// # Returns
+///
+/// A new packed-RGBA `Vec<u8>` of the same dimensions. With every
+/// channel set to [`TransferFunc::Identity`] the input is returned
+/// bytewise unchanged (no f32 round-trip).
+pub fn component_transfer(src: &[u8], width: u32, height: u32, ct: &ComponentTransfer) -> Vec<u8> {
+    let w = width as usize;
+    let h = height as usize;
+    let expected = w
+        .checked_mul(h)
+        .and_then(|n| n.checked_mul(4))
+        .expect("component_transfer: width * height * 4 overflowed usize");
+    assert_eq!(
+        src.len(),
+        expected,
+        "component_transfer: src.len() == {} but width*height*4 == {expected}",
+        src.len()
+    );
+
+    if width == 0 || height == 0 {
+        return Vec::new();
+    }
+
+    // Fast path: all-identity is a pure byte copy (avoids the f32
+    // round-trip which, while idempotent under the half-up quantiser
+    // for in-range integers, would unnecessarily reallocate).
+    if matches!(ct.r, TransferFunc::Identity)
+        && matches!(ct.g, TransferFunc::Identity)
+        && matches!(ct.b, TransferFunc::Identity)
+        && matches!(ct.a, TransferFunc::Identity)
+    {
+        return src.to_vec();
+    }
+
+    let mut out = Vec::with_capacity(src.len());
+    for chunk in src.chunks_exact(4) {
+        let r = chunk[0] as f32 / 255.0;
+        let g = chunk[1] as f32 / 255.0;
+        let b = chunk[2] as f32 / 255.0;
+        let a = chunk[3] as f32 / 255.0;
+        out.push(quantise_unit(ct.r.apply(r)));
+        out.push(quantise_unit(ct.g.apply(g)));
+        out.push(quantise_unit(ct.b.apply(b)));
+        out.push(quantise_unit(ct.a.apply(a)));
+    }
+    out
+}
+
+/// Convenience wrapper that runs [`component_transfer`] on a slice of
+/// [`Rgba`] pixels and returns a `Vec<Rgba>` of the same length.
+/// Identical semantics — provided for callers that already have a typed
+/// pixel buffer.
+pub fn component_transfer_pixels(
+    src: &[Rgba],
+    width: u32,
+    height: u32,
+    ct: &ComponentTransfer,
+) -> Vec<Rgba> {
+    assert_eq!(
+        src.len(),
+        width as usize * height as usize,
+        "component_transfer_pixels: src.len() == {} but width*height == {}",
+        src.len(),
+        width as usize * height as usize
+    );
+    let mut bytes = Vec::with_capacity(src.len() * 4);
+    for p in src {
+        bytes.push(p.r);
+        bytes.push(p.g);
+        bytes.push(p.b);
+        bytes.push(p.a);
+    }
+    let out = component_transfer(&bytes, width, height, ct);
+    out.chunks_exact(4)
+        .map(|c| Rgba::new(c[0], c[1], c[2], c[3]))
+        .collect()
+}
+
+#[cfg(test)]
+mod component_transfer_tests {
+    use super::*;
+
+    fn build<F: FnMut(u32, u32) -> Rgba>(w: u32, h: u32, mut f: F) -> Vec<u8> {
+        let mut v = Vec::with_capacity((w * h * 4) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                let c = f(x, y);
+                v.extend_from_slice(&[c.r, c.g, c.b, c.a]);
+            }
+        }
+        v
+    }
+
+    #[test]
+    fn identity_on_every_channel_is_bytewise_identity() {
+        // §15.11 collapses to a no-op when every <feFuncX> is
+        // `type="identity"`. The fast path avoids the f32 round-trip
+        // and returns the input bytes verbatim.
+        let img = build(5, 3, |x, y| {
+            Rgba::new(
+                (x * 47 + y * 11) as u8,
+                (x * 17 + y * 5) as u8,
+                (y.wrapping_mul(31).wrapping_add(x)) as u8,
+                ((x + y) * 7) as u8,
+            )
+        });
+        let ct = ComponentTransfer::identity();
+        let out = component_transfer(&img, 5, 3, &ct);
+        assert_eq!(out, img);
+    }
+
+    #[test]
+    fn linear_slope_minus_one_intercept_one_inverts_red_only() {
+        // Linear { slope: -1, intercept: 1 } on R encodes the §15.11
+        // standard channel inversion: `R' = 1 - R`, equivalent to
+        // `255 - R` after quantisation. The other channels carry the
+        // identity, so they must round-trip byte-exact.
+        let img = build(4, 4, |x, y| {
+            Rgba::new((x * 60) as u8, (y * 80) as u8, 17, 200)
+        });
+        let ct = ComponentTransfer::identity().with_r(TransferFunc::Linear {
+            slope: -1.0,
+            intercept: 1.0,
+        });
+        let out = component_transfer(&img, 4, 4, &ct);
+        for i in (0..img.len()).step_by(4) {
+            // R inverted (±1 LSB for the f32 round-trip).
+            let want_r = 255 - img[i] as i32;
+            let got_r = out[i] as i32;
+            assert!(
+                (got_r - want_r).abs() <= 1,
+                "R at pixel {} got {got_r} want {want_r}",
+                i / 4
+            );
+            // G, B, A untouched (the byte path is the identity).
+            assert_eq!(out[i + 1], img[i + 1]);
+            assert_eq!(out[i + 2], img[i + 2]);
+            assert_eq!(out[i + 3], img[i + 3]);
+        }
+    }
+
+    #[test]
+    fn gamma_2_2_then_inverse_round_trips_in_mid_to_high_range() {
+        // gamma(amp=1, exp=2.2, off=0) followed by its inverse
+        // gamma(amp=1, exp=1/2.2, off=0) reproduces the analytical
+        // input C exactly: `(C^2.2)^(1/2.2) = C`. The lossy step is
+        // the pair of u8 quantisations on either side. The forward
+        // curve compresses hard at the low end (e.g. 16/255 → 1/255
+        // → 21/255 after inverse) because 8-bit precision is too
+        // coarse to represent the bent samples below the curve's
+        // knee. Restrict the round-trip assertion to mid-to-high
+        // inputs (C ≥ 64/255) where the forward derivative is
+        // moderate enough that the two ½-LSB quantisation errors
+        // compose into ≤ 2 LSBs at the output. Low-end recovery is
+        // a property of the bit depth, not the implementation; the
+        // analytical correctness of the §15.11 formula is exercised
+        // by the linear and table tests in this same suite.
+        let img = build(8, 8, |x, y| {
+            Rgba::new(
+                64 + (x * 24) as u8,
+                64 + (y * 24) as u8,
+                100 + (((x + y) * 11) as u8),
+                255,
+            )
+        });
+        let fwd = ComponentTransfer {
+            r: TransferFunc::Gamma {
+                amplitude: 1.0,
+                exponent: 2.2,
+                offset: 0.0,
+            },
+            g: TransferFunc::Gamma {
+                amplitude: 1.0,
+                exponent: 2.2,
+                offset: 0.0,
+            },
+            b: TransferFunc::Gamma {
+                amplitude: 1.0,
+                exponent: 2.2,
+                offset: 0.0,
+            },
+            a: TransferFunc::Identity,
+        };
+        let inv = ComponentTransfer {
+            r: TransferFunc::Gamma {
+                amplitude: 1.0,
+                exponent: 1.0 / 2.2,
+                offset: 0.0,
+            },
+            g: TransferFunc::Gamma {
+                amplitude: 1.0,
+                exponent: 1.0 / 2.2,
+                offset: 0.0,
+            },
+            b: TransferFunc::Gamma {
+                amplitude: 1.0,
+                exponent: 1.0 / 2.2,
+                offset: 0.0,
+            },
+            a: TransferFunc::Identity,
+        };
+        let bent = component_transfer(&img, 8, 8, &fwd);
+        let back = component_transfer(&bent, 8, 8, &inv);
+        for i in 0..img.len() {
+            let d = (back[i] as i32 - img[i] as i32).abs();
+            assert!(
+                d <= 2,
+                "gamma round-trip differs by {d} at byte {i} ({} → {} → {})",
+                img[i],
+                bent[i],
+                back[i]
+            );
+        }
+    }
+
+    #[test]
+    fn discrete_three_entry_thresholds_correctly() {
+        // Discrete(vec![0.0, 0.5, 1.0]) with N=3 partitions [0,1] into
+        // three buckets: [0, 1/3) → 0.0 → 0u8, [1/3, 2/3) → 0.5 → 128u8,
+        // [2/3, 1] → 1.0 → 255u8. The boundary samples land at
+        // 85 (1/3·255) and 170 (2/3·255); test exact-integer inputs
+        // that bracket those breakpoints.
+        let ct = ComponentTransfer::identity().with_r(TransferFunc::Discrete(vec![0.0, 0.5, 1.0]));
+        let pixels: Vec<u8> = vec![0, 84, 86, 169, 171, 255];
+        // 6 R values, each in its own 1×1 pixel with G/B/A = 0.
+        let mut img = Vec::new();
+        for r in &pixels {
+            img.extend_from_slice(&[*r, 0, 0, 0]);
+        }
+        let out = component_transfer(&img, 6, 1, &ct);
+        let want: [u8; 6] = [0, 0, 128, 128, 255, 255];
+        for (idx, &w) in want.iter().enumerate() {
+            assert_eq!(
+                out[idx * 4],
+                w,
+                "discrete[{idx}] for input {} got {}, want {w}",
+                pixels[idx],
+                out[idx * 4]
+            );
+        }
+    }
+
+    #[test]
+    fn table_two_entry_is_identity() {
+        // Table(vec![0.0, 1.0]) with N=1 places the breakpoints at
+        // C=0 → 0 and C=1 → 1, so the piecewise-linear interpolation
+        // is C' = C — the identity. Must be byte-exact (±1 LSB for
+        // the f32 round-trip; ½ LSB on each side and a ≤1 LSB
+        // worst-case after rounding).
+        let img = build(6, 2, |x, y| {
+            Rgba::new((x * 51) as u8, (y * 127) as u8, 13, 200)
+        });
+        let ct = ComponentTransfer::identity().with_r(TransferFunc::Table(vec![0.0, 1.0]));
+        let out = component_transfer(&img, 6, 2, &ct);
+        for i in 0..img.len() {
+            let d = (out[i] as i32 - img[i] as i32).abs();
+            assert!(d <= 1, "table-identity differs by {d} at byte {i}");
+        }
+    }
+
+    #[test]
+    fn table_two_entry_zero_half_halves_the_value() {
+        // Table(vec![0.0, 0.5]) with N=1 places C=0 → 0, C=1 → 0.5,
+        // so C' = 0.5 · C, equivalent to `R / 2` after quantisation
+        // (±1 LSB). Apply to R, leave G/B/A alone.
+        let img = build(4, 4, |x, _| Rgba::new((x * 60) as u8, 100, 50, 200));
+        let ct = ComponentTransfer::identity().with_r(TransferFunc::Table(vec![0.0, 0.5]));
+        let out = component_transfer(&img, 4, 4, &ct);
+        for i in (0..img.len()).step_by(4) {
+            // Expected: (R / 255) · 0.5 · 255 = R · 0.5, rounded half-up.
+            let want = ((img[i] as f32 / 255.0) * 0.5 * 255.0 + 0.5) as i32;
+            let got = out[i] as i32;
+            assert!(
+                (got - want).abs() <= 1,
+                "table-half R got {got} want {want} for input {}",
+                img[i]
+            );
+            assert_eq!(out[i + 1], img[i + 1]);
+            assert_eq!(out[i + 2], img[i + 2]);
+            assert_eq!(out[i + 3], img[i + 3]);
+        }
+    }
+
+    #[test]
+    fn empty_image_returns_empty_buffer() {
+        // §15.11 doesn't pin down behaviour on a zero-extent input
+        // (the filter region degenerates to empty); we choose the
+        // same convention as gaussian_blur and color_matrix and
+        // return an empty buffer.
+        let ct = ComponentTransfer::identity();
+        assert_eq!(component_transfer(&[], 0, 5, &ct), Vec::<u8>::new());
+        assert_eq!(component_transfer(&[], 5, 0, &ct), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn solid_image_under_identity_is_invariant() {
+        // A uniform image under all-identity must come back byte-exact;
+        // this exercises the fast path explicitly on a non-trivial
+        // pixel value.
+        let img = build(4, 4, |_, _| Rgba::new(123, 45, 67, 200));
+        let ct = ComponentTransfer::identity();
+        let out = component_transfer(&img, 4, 4, &ct);
+        assert_eq!(out, img);
+    }
+
+    #[test]
+    fn linear_on_alpha_keeps_rgb_byte_exact() {
+        // Linear { slope: 0.5, intercept: 0 } on A only must scale
+        // alpha by half and leave RGB byte-exact. Exercises that the
+        // per-channel dispatch really is per-channel.
+        let img = build(3, 3, |x, y| {
+            Rgba::new((x * 80) as u8, (y * 80) as u8, 7, 200)
+        });
+        let ct = ComponentTransfer::identity().with_a(TransferFunc::Linear {
+            slope: 0.5,
+            intercept: 0.0,
+        });
+        let out = component_transfer(&img, 3, 3, &ct);
+        for i in (0..img.len()).step_by(4) {
+            assert_eq!(out[i], img[i]);
+            assert_eq!(out[i + 1], img[i + 1]);
+            assert_eq!(out[i + 2], img[i + 2]);
+            let want = ((img[i + 3] as f32 / 255.0) * 0.5 * 255.0 + 0.5) as i32;
+            let got = out[i + 3] as i32;
+            assert!((got - want).abs() <= 1, "alpha half got {got} want {want}");
+        }
+    }
+
+    #[test]
+    fn linear_intercept_one_saturates_to_255() {
+        // Linear { slope: 0, intercept: 1 } sets every pixel of the
+        // affected channel to 1.0 → 255u8, regardless of input. Tests
+        // the §15.11 output clamp implicitly via the saturating cap.
+        let img = build(2, 2, |_, _| Rgba::new(0, 0, 0, 0));
+        let ct = ComponentTransfer::identity().with_g(TransferFunc::Linear {
+            slope: 0.0,
+            intercept: 1.0,
+        });
+        let out = component_transfer(&img, 2, 2, &ct);
+        for i in (0..img.len()).step_by(4) {
+            assert_eq!(out[i], 0);
+            assert_eq!(out[i + 1], 255);
+            assert_eq!(out[i + 2], 0);
+            assert_eq!(out[i + 3], 0);
+        }
+    }
+
+    #[test]
+    fn typed_pixel_wrapper_agrees_with_byte_api() {
+        // The Vec<Rgba> wrapper must produce the byte-equivalent result
+        // for any ComponentTransfer; pick a non-trivial mix of modes
+        // across the four channels.
+        let img: Vec<Rgba> = (0..16)
+            .map(|i| Rgba::new(i as u8 * 16, (16 - i) as u8 * 15, 50, 200))
+            .collect();
+        let bytes: Vec<u8> = img.iter().flat_map(|p| [p.r, p.g, p.b, p.a]).collect();
+        let ct = ComponentTransfer {
+            r: TransferFunc::Gamma {
+                amplitude: 1.0,
+                exponent: 2.0,
+                offset: 0.0,
+            },
+            g: TransferFunc::Linear {
+                slope: 0.75,
+                intercept: 0.25,
+            },
+            b: TransferFunc::Discrete(vec![0.0, 1.0]),
+            a: TransferFunc::Identity,
+        };
+        let via_bytes = component_transfer(&bytes, 4, 4, &ct);
+        let via_pixels = component_transfer_pixels(&img, 4, 4, &ct);
+        let want_pixels: Vec<Rgba> = via_bytes
+            .chunks_exact(4)
+            .map(|c| Rgba::new(c[0], c[1], c[2], c[3]))
+            .collect();
+        assert_eq!(via_pixels, want_pixels);
+    }
+
+    #[test]
+    fn empty_table_collapses_to_identity() {
+        // §15.11's "type=table with insufficient values" fall-back is
+        // an identity. An empty Vec defines no segment, so we return
+        // C' = C. Exercises that the fall-back is taken before any
+        // f32 lookup that would dereference out of range.
+        let img = build(2, 2, |x, y| {
+            Rgba::new((x * 100) as u8, (y * 100) as u8, 7, 200)
+        });
+        let ct = ComponentTransfer::identity().with_r(TransferFunc::Table(Vec::new()));
+        let out = component_transfer(&img, 2, 2, &ct);
+        for i in 0..img.len() {
+            let d = (out[i] as i32 - img[i] as i32).abs();
+            assert!(d <= 1, "table-empty differs by {d} at byte {i}");
+        }
+    }
+
+    #[test]
+    fn empty_discrete_collapses_to_identity() {
+        // Same as table-empty: zero-entry discrete defines no buckets,
+        // collapse to identity rather than panic on the floor lookup.
+        let img = build(2, 2, |x, y| {
+            Rgba::new((x * 100) as u8, (y * 100) as u8, 7, 200)
+        });
+        let ct = ComponentTransfer::identity().with_g(TransferFunc::Discrete(Vec::new()));
+        let out = component_transfer(&img, 2, 2, &ct);
+        for i in 0..img.len() {
+            let d = (out[i] as i32 - img[i] as i32).abs();
+            assert!(d <= 1, "discrete-empty differs by {d} at byte {i}");
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "component_transfer: src.len() ==")]
+    fn wrong_length_panics() {
+        let bad = vec![0u8; 7];
+        let ct = ComponentTransfer::identity();
+        let _ = component_transfer(&bad, 2, 2, &ct);
+    }
+
+    #[test]
+    #[should_panic(expected = "gamma exponent must be strictly positive")]
+    fn gamma_zero_exponent_panics() {
+        let img = vec![0u8; 16];
+        let ct = ComponentTransfer::identity().with_r(TransferFunc::Gamma {
+            amplitude: 1.0,
+            exponent: 0.0,
+            offset: 0.0,
+        });
+        let _ = component_transfer(&img, 2, 2, &ct);
+    }
+
+    #[test]
+    #[should_panic(expected = "gamma exponent must be strictly positive")]
+    fn gamma_negative_exponent_panics() {
+        let img = vec![0u8; 16];
+        let ct = ComponentTransfer::identity().with_r(TransferFunc::Gamma {
+            amplitude: 1.0,
+            exponent: -0.5,
+            offset: 0.0,
+        });
+        let _ = component_transfer(&img, 2, 2, &ct);
     }
 }

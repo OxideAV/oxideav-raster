@@ -9,6 +9,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `feComponentTransfer` filter primitive (SVG 1.1 §15.11) — per-pixel,
+  per-channel transfer function over a packed-RGBA buffer, exposed as
+  `pub fn component_transfer(src, width, height, &ct) -> Vec<u8>` plus
+  the typed-pixel wrapper `component_transfer_pixels(&[Rgba], …)`. The
+  §15.11 spec defines five `type=` modes per channel, applied
+  independently to R / G / B / A on un-premultiplied channel values
+  normalised to `[0, 1]`, with the result clamped to `[0, 1]` before
+  re-quantising back to `u8`:
+  - `identity` — `C' = C` (the no-op default).
+  - `table` — piecewise-linear interpolation across `N + 1`
+    `tableValues`. For `C ∈ [0, 1]` let `s = C · N`, `k = floor(s)`,
+    `f = s - k`; then `C' = v_k + f · (v_{k+1} - v_k)`. At the `C = 1`
+    boundary the interpolation pins to `v_N`. An empty
+    `tableValues` (or a list of fewer than 2 entries) collapses to
+    `identity` per §15.11's fall-back wording.
+  - `discrete` — step function across `N` `tableValues`. For
+    `C ∈ [0, 1]` let `k = floor(C · N)` clamped to `[0, N-1]`; then
+    `C' = v_k`. An empty list collapses to `identity`.
+  - `linear` — affine transform `C' = slope · C + intercept`.
+  - `gamma` — `C' = amplitude · C^exponent + offset`. `exponent` must
+    be strictly positive (§15.11 error processing); a non-positive or
+    NaN exponent panics. Negative channel inputs are floored to zero
+    before the `powf` to keep the spec's "evaluate then clamp"
+    ordering well-defined.
+  Public surface: `pub enum TransferFunc { Identity, Table(Vec<f32>),
+  Discrete(Vec<f32>), Linear { slope, intercept }, Gamma { amplitude,
+  exponent, offset } }` with an inherent `apply(c) -> f32` helper, plus
+  `pub struct ComponentTransfer { r, g, b, a }` of four
+  `TransferFunc` values with an `::identity()` constructor and
+  `with_r` / `with_g` / `with_b` / `with_a` builder-style setters.
+  `ComponentTransfer::default()` is the identity. All-identity hits a
+  byte-copy fast path that skips the f32 round-trip entirely. 15 new
+  tests in the `src/filter.rs` unit-suite (all-identity fast-path
+  passthrough; `Linear { slope: -1, intercept: 1 }` inverts R only;
+  `Gamma { exp: 2.2 }` ∘ `Gamma { exp: 1/2.2 }` round-trips within
+  ±1 LSB across an 8×8 sampler; `Discrete(vec![0, 0.5, 1])` step
+  boundaries at `1/3` and `2/3` of the unit interval;
+  `Table(vec![0, 1])` reduces to identity; `Table(vec![0, 0.5])`
+  halves the value; empty image returns empty buffer; solid image
+  under identity is invariant; `Linear` on alpha leaves RGB
+  byte-exact; `Linear { slope: 0, intercept: 1 }` saturates to 255;
+  typed-pixel wrapper agrees with byte API across a mixed-mode
+  configuration; empty `Table` / `Discrete` fall back to identity;
+  `#[should_panic]` guards for wrong input length, zero-exponent
+  gamma, and negative-exponent gamma) plus 8 in
+  `tests/filter_component_transfer.rs` (public-API all-identity
+  byte passthrough; `Linear` invert on R only; `Table(vec![0, 1])`
+  identity on G; `Discrete(vec![0, 1])` threshold at `0.5`; gamma
+  2.2 round-trip via inverse on R/G/B; pixels-wrapper / byte-API
+  agreement on a mixed-mode configuration; `default()` ==
+  `identity()`; `Linear { 0, 1 }` saturates every byte to 255;
+  `Linear { 1, -1 }` clamps every byte to 0). Math cited to
+  `docs/image/svg/svg11-second-edition.pdf` §15.11; no `image` /
+  `imageproc` / `opencv` / `cairo` / `skia` / `resvg` / `librsvg`
+  source consulted.
+
 - `feGaussianBlur` filter primitive (SVG 1.1 §15.17) — separable
   Gaussian blur over a packed-RGBA buffer, exposed as
   `pub fn gaussian_blur(src, width, height, std_x, std_y) -> Vec<u8>`

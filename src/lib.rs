@@ -88,11 +88,18 @@
 //!   convolution with a half-width `ceil(3·s)` kernel is used; for
 //!   larger `s` the spec's three-box-blur approximation
 //!   (`d = floor(s · 3·sqrt(2π)/4 + 0.5)`) is used.
+//! * `<feComponentTransfer>` (SVG 1.1 §15.11) per-pixel per-channel
+//!   transfer function — `identity`, `table` (piecewise-linear N+1),
+//!   `discrete` (step N), `linear` (`slope · C + intercept`), and
+//!   `gamma` (`amplitude · C^exponent + offset`). Exposed as
+//!   [`component_transfer`] (with the typed-pixel wrapper
+//!   [`component_transfer_pixels`]), driven by a [`ComponentTransfer`]
+//!   struct of four independent [`TransferFunc`] values (one per RGBA
+//!   channel).
 //!
 //! Deferred to a later round:
 //!
-//! * remaining filters (drop shadow,
-//!   feComponentTransfer, feTurbulence, feConvolveMatrix,
+//! * remaining filters (drop shadow, feTurbulence, feConvolveMatrix,
 //!   feDisplacementMap, lighting),
 //! * `<pattern>` paints,
 //! * full ICC-tagged color-managed pipeline (the `linearRGB`
@@ -121,8 +128,9 @@ pub use cache::{CacheStats, RasterizedSubtree};
 pub use composite::{composite_rgba_premultiplied, composite_rgba_premultiplied_blend};
 pub use fill::{rasterize_fill, AlphaMask};
 pub use filter::{
-    color_matrix, color_matrix_op, color_matrix_pixels, gaussian_blur, gaussian_blur_pixels,
-    morphology, morphology_pixels, ColorMatrix, ColorMatrixOp, MorphologyOp,
+    color_matrix, color_matrix_op, color_matrix_pixels, component_transfer,
+    component_transfer_pixels, gaussian_blur, gaussian_blur_pixels, morphology, morphology_pixels,
+    ColorMatrix, ColorMatrixOp, ComponentTransfer, MorphologyOp, TransferFunc,
     GAUSSIAN_BLUR_BOX_THRESHOLD,
 };
 pub use flatten::{flatten_arc_to_cubics, flatten_path, FlatContour};

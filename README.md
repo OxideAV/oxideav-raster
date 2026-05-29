@@ -39,7 +39,8 @@ produces a packed `Rgba` `VideoFrame`.
 | `feMorphology` erode / dilate (SVG §15.20)| done (round 11)      |
 | `feColorMatrix` matrix/sat/hue/luma (§15.10)| done (round 12)    |
 | `feGaussianBlur` separable Gaussian (§15.17)| done (round 13)    |
-| Filters (drop-shadow, componentTransfer, …)| partial (morphology + color-matrix + Gaussian blur) |
+| `feComponentTransfer` 5-mode per-channel (§15.11)| done (round 14)|
+| Filters (drop-shadow, feTurbulence, lighting, …)| partial (morphology + color-matrix + Gaussian blur + component-transfer) |
 | `<pattern>` paint                         | pending              |
 | Full ICC color-managed pipeline           | pending              |
 
