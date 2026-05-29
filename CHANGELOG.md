@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2](https://github.com/OxideAV/oxideav-raster/compare/v0.1.1...v0.1.2) - 2026-05-29
+
+### Other
+
+- feComposite Porter-Duff + arithmetic (SVG 1.1 §15.12)
+- feComponentTransfer 5-mode per-channel transfer function (SVG 1.1 §15.11)
+- feGaussianBlur separable Gaussian blur (SVG 1.1 §15.17)
+- feColorMatrix (SVG 1.1 §15.10) — matrix / saturate / hueRotate / luminanceToAlpha
+- feMorphology erode/dilate filter primitive (SVG 1.1 §15.20)
+- Catmull–Rom round-trip + PSNR regression coverage
+- add ImageFilter::Lanczos3 (6×6 windowed-sinc image resampling)
+- add ImageFilter::BSpline cubic B-spline image resampling
+- Catmull–Rom bicubic image filter (B=0, C=1/2)
+- pre-baked 256-entry stops LUT for linear / radial paints
+- 4 non-separable HSL blend modes (PDF §11.3.5.3 / W3C §11)
+- 11 PDF §11.3.5 standard separable blend modes
+- Mitchell–Netravali bicubic image filter + linear-RGB gradient interpolation
+
 ### Added
 
 - `feComposite` filter primitive (SVG 1.1 §15.12) — pixel-wise
