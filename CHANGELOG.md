@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `feFlood` filter primitive (SVG 1.1 §15.16) — fill a `width × height`
+  packed-RGBA buffer with the constant straight-alpha tuple
+  `(flood-color.r, flood-color.g, flood-color.b, flood-opacity)`,
+  exposed as `pub fn flood(width, height, flood_color, flood_opacity)
+  -> Vec<u8>` plus the typed-pixel wrapper `flood_pixels(width, height,
+  flood_color, flood_opacity) -> Vec<Rgba>`. `flood_color` carries
+  RGB (alpha is ignored — §15.16 routes alpha through the separate
+  `flood-opacity` property); `flood_opacity` is clamped to the
+  `<opacity-value>` unit range with NaN treated as zero. The output is
+  straight-alpha and matches the byte layout produced by `Renderer::render`,
+  so it composes directly through the rest of the `u8` RGBA pipeline.
+- `feOffset` filter primitive (SVG 1.1 §15.21) — translate a packed-RGBA
+  buffer by an integer pixel vector `(dx, dy)`, exposed as `pub fn
+  offset_filter(src, width, height, dx, dy, edge) -> Vec<u8>` plus the
+  typed-pixel wrapper `offset_filter_pixels(&[Rgba], width, height, dx,
+  dy, edge) -> Vec<Rgba>`. For an output pixel `(x, y)` the sampled
+  input position is `(x − dx, y − dy)`, matching the §15.21 "input
+  image relative to its current position" wording. Out-of-input samples
+  follow a new `OffsetEdge` enum:
+  - `TransparentBlack` — the SVG §15.7 default ("if there is no defined
+    input for `in`, the value … shall be the transparent black value")
+    used by `<filter>` graph plumbing.
+  - `ClampToEdge` — replicate the nearest border pixel, matching the
+    boundary mode already used by `gaussian_blur` / `morphology`.
+  Integer-only sub-pixel placement is supported (`dx`, `dy` are `i32`);
+  fractional placement is the caller's job (compose with one of the
+  existing `ImageFilter::Bilinear` / `Lanczos3` resample paths first),
+  matching the §15.21 note that "high quality viewer[s] should make use
+  of appropriate interpolation techniques" for sub-pixel destination
+  locations. `dx == 0 && dy == 0` short-circuits to a byte-exact copy
+  of the input regardless of `edge`. Complexity is `O(W · H)` with one
+  source read per output pixel.
+
 ## [0.1.2](https://github.com/OxideAV/oxideav-raster/compare/v0.1.1...v0.1.2) - 2026-05-29
 
 ### Other

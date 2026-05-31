@@ -66,11 +66,28 @@
 //!   `result = k1·i1·i2 + k2·i1 + k3·i2 + k4` on premultiplied channels,
 //!   clamped to `[0, 1]`. Selectable via [`CompositeOp`].
 //!
+//! * **Constant flood** — `feFlood` from SVG 1.1 §15.16. Fills the filter
+//!   primitive subregion with the constant tuple
+//!   `(flood-color.r, flood-color.g, flood-color.b, flood-opacity)`. The
+//!   opacity argument is clamped into the `<opacity-value>` unit range
+//!   (NaN ⇒ 0). Output is straight-alpha so it round-trips byte-exact
+//!   through the rest of the pipeline.
+//!
+//! * **Image translation** — `feOffset` from SVG 1.1 §15.21. Translates a
+//!   packed-RGBA buffer by an integer pixel vector `(dx, dy)`: output
+//!   pixel `(x, y)` reads input pixel `(x − dx, y − dy)`. Sub-pixel
+//!   placement is the caller's job (compose with one of the
+//!   image-resample paths first); the integer entry point exists for the
+//!   common drop-shadow recipe where the input is an already-blurred
+//!   mask. Vacated regions follow [`OffsetEdge`] — `TransparentBlack`
+//!   matches SVG §15.7's "no defined input ⇒ transparent black" default;
+//!   `ClampToEdge` replicates the nearest border pixel.
+//!
 //! # Deferred
 //!
 //! Drop shadow (`feDropShadow`), `feConvolveMatrix`, `feTurbulence`
-//! (Perlin), `feDisplacementMap`, `feSpecularLighting`,
-//! `feDiffuseLighting`.
+//! (Perlin), `feDisplacementMap`, `feTile`, `feMerge`,
+//! `feSpecularLighting`, `feDiffuseLighting`.
 //!
 //! # Wall provenance
 //!
@@ -92,7 +109,10 @@
 //! verbatim) and the §14.2 premultiplied simple-alpha-compositing
 //! algebra (`Cr' = (1 − Ea)·Cr + Er`) from which the Porter–Duff
 //! `over` / `in` / `out` / `atop` / `xor` blend-factor pairs are
-//! derived. No `image` / `imageproc` / `opencv` /
+//! derived; §15.16 for the `feFlood` (`flood-color` × `flood-opacity`)
+//! filling of the primitive subregion and §15.21 for the `feOffset`
+//! `(dx, dy)` translation, with the §15.7 "transparent black" default
+//! used for out-of-input samples. No `image` / `imageproc` / `opencv` /
 //! `cairo` / `skia` / `resvg` / `librsvg` source consulted.
 
 use oxideav_core::Rgba;
@@ -3062,5 +3082,418 @@ mod composite_tests {
     #[should_panic(expected = "in2.len()")]
     fn wrong_in2_length_panics() {
         let _ = composite_filter(&[0u8; 16], &[0u8; 8], 2, 2, CompositeOp::Over);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SVG 1.1 §15.16 `<feFlood>` — flood the filter primitive subregion with a
+// constant straight-alpha `(flood-color, flood-opacity)` tuple.
+// ---------------------------------------------------------------------------
+
+/// SVG 1.1 §15.16 `<feFlood>` — fill a `width × height` packed-RGBA buffer
+/// with the constant colour tuple `(flood_color.r, flood_color.g,
+/// flood_color.b, flood_opacity)`.
+///
+/// `flood_color` carries the SVG `flood-color` property as a
+/// straight-alpha [`Rgba`]; only its RGB channels are read here, because
+/// §15.16 specifies the alpha through the separate `flood-opacity`
+/// property. `flood_opacity` is a `[0, 1]` scalar matching the
+/// `<opacity-value>` syntax of the spec (NaN and values outside the unit
+/// range are clamped). The output uses straight-alpha encoding so it
+/// composes byte-identically with the rest of the crate's `u8` RGBA
+/// pipeline; callers wanting premultiplied output can run
+/// [`crate::premultiply`]-equivalent logic downstream.
+///
+/// The spec's "rectangle as large as the filter primitive subregion"
+/// wording means the *whole* output buffer is painted — the subregion
+/// rectangle is handed in by the caller as `width × height`, since this
+/// crate's filter primitives operate on bare buffers rather than a
+/// `<filter>` graph plumbing layer.
+///
+/// Complexity: `O(W · H)` writes, with a constant per-pixel cost.
+///
+/// # Returns
+///
+/// A freshly-allocated packed-RGBA `Vec<u8>` of length
+/// `width * height * 4`. Width or height of zero returns an empty `Vec`.
+pub fn flood(width: u32, height: u32, flood_color: Rgba, flood_opacity: f32) -> Vec<u8> {
+    let w = width as usize;
+    let h = height as usize;
+    let n = w
+        .checked_mul(h)
+        .and_then(|n| n.checked_mul(4))
+        .expect("flood: width * height * 4 overflowed usize");
+    if width == 0 || height == 0 {
+        return Vec::new();
+    }
+    // Clamp opacity into the SVG <opacity-value> unit range. NaN is
+    // treated as zero ("not a valid opacity" ⇒ no contribution).
+    let a_unit = if flood_opacity.is_nan() {
+        0.0
+    } else {
+        flood_opacity.clamp(0.0, 1.0)
+    };
+    let a = quantise_unit(a_unit);
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..(w * h) {
+        out.extend_from_slice(&[flood_color.r, flood_color.g, flood_color.b, a]);
+    }
+    out
+}
+
+/// Typed-pixel wrapper around [`flood`]. Returns a `Vec<Rgba>` of length
+/// `width * height` carrying the same straight-alpha flood tuple at
+/// every pixel.
+pub fn flood_pixels(width: u32, height: u32, flood_color: Rgba, flood_opacity: f32) -> Vec<Rgba> {
+    if width == 0 || height == 0 {
+        return Vec::new();
+    }
+    let a_unit = if flood_opacity.is_nan() {
+        0.0
+    } else {
+        flood_opacity.clamp(0.0, 1.0)
+    };
+    let a = quantise_unit(a_unit);
+    let px = Rgba::new(flood_color.r, flood_color.g, flood_color.b, a);
+    vec![px; (width as usize) * (height as usize)]
+}
+
+#[cfg(test)]
+mod flood_tests {
+    use super::*;
+
+    #[test]
+    fn opaque_red_fills_whole_buffer() {
+        // (255, 0, 0, 255) is the §15.16 example "initial: black" override
+        // with flood-color="red". A 3×2 buffer should be 6 copies of that
+        // tuple.
+        let out = flood(3, 2, Rgba::new(255, 0, 0, 255), 1.0);
+        assert_eq!(out.len(), 3 * 2 * 4);
+        for chunk in out.chunks_exact(4) {
+            assert_eq!(chunk, &[255, 0, 0, 255]);
+        }
+    }
+
+    #[test]
+    fn opacity_scales_alpha_not_rgb() {
+        // §15.16 separates flood-color (RGB) from flood-opacity (alpha).
+        // The straight-alpha output keeps R,G,B verbatim regardless of
+        // the opacity — premultiplication is the caller's job.
+        let out = flood(1, 1, Rgba::new(100, 150, 200, 255), 0.5);
+        // alpha = round(0.5 * 255) = 128 (half-up).
+        assert_eq!(out, vec![100, 150, 200, 128]);
+    }
+
+    #[test]
+    fn opacity_clamps_to_unit_range() {
+        // Out-of-range opacities are clamped: 1.5 → 1.0 → 255,
+        // -0.4 → 0.0 → 0.
+        let high = flood(1, 1, Rgba::new(7, 8, 9, 200), 1.5);
+        assert_eq!(high, vec![7, 8, 9, 255]);
+        let low = flood(1, 1, Rgba::new(7, 8, 9, 200), -0.4);
+        assert_eq!(low, vec![7, 8, 9, 0]);
+    }
+
+    #[test]
+    fn nan_opacity_treated_as_zero() {
+        let out = flood(2, 2, Rgba::new(50, 60, 70, 80), f32::NAN);
+        for chunk in out.chunks_exact(4) {
+            assert_eq!(chunk, &[50, 60, 70, 0]);
+        }
+    }
+
+    #[test]
+    fn empty_extent_returns_empty_vec() {
+        assert!(flood(0, 4, Rgba::new(0, 0, 0, 255), 1.0).is_empty());
+        assert!(flood(4, 0, Rgba::new(0, 0, 0, 255), 1.0).is_empty());
+    }
+
+    #[test]
+    fn typed_wrapper_matches_byte_path() {
+        let bytes = flood(5, 4, Rgba::new(11, 22, 33, 200), 0.75);
+        let pixels = flood_pixels(5, 4, Rgba::new(11, 22, 33, 200), 0.75);
+        let flattened: Vec<u8> = pixels.iter().flat_map(|p| [p.r, p.g, p.b, p.a]).collect();
+        assert_eq!(bytes, flattened);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SVG 1.1 §15.21 `<feOffset>` — translate the input image by an integer
+// pixel vector `(dx, dy)`. Vacated regions are filled with transparent
+// black (the SVG default for "out of filter input" samples).
+// ---------------------------------------------------------------------------
+
+/// Edge-handling mode for [`offset_filter`].
+///
+/// SVG 1.1 §15.21 itself only describes the geometric translation; what
+/// happens in the *vacated* region (the strip uncovered by the shift) is
+/// fixed by the surrounding filter-pipeline conventions: samples that
+/// fall outside the input's filter primitive subregion are treated as
+/// transparent black (§15.7 wording, "if there is no defined input for
+/// `in`, the value … shall be the transparent black value").
+///
+/// The crate exposes both behaviours so a caller doing image processing
+/// outside a `<filter>` graph (e.g. a UI-level animation translate) can
+/// pick clamp-to-edge instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OffsetEdge {
+    /// Vacated region becomes transparent black `(0, 0, 0, 0)` — the SVG
+    /// 1.1 default per §15.7.
+    TransparentBlack,
+    /// Vacated region replicates the nearest border pixel (clamp-to-edge),
+    /// matching the boundary mode already used by [`gaussian_blur`] and
+    /// [`morphology`] in this module.
+    ClampToEdge,
+}
+
+/// SVG 1.1 §15.21 `<feOffset>` — translate a packed-RGBA buffer by the
+/// pixel vector `(dx, dy)`.
+///
+/// `dx` and `dy` are *integer* pixel offsets in image-space. The spec
+/// allows fractional offsets and recommends bilinear/bicubic
+/// interpolation for "high quality viewer[s]"; this entry point handles
+/// the integer-translation case that round-trips byte-exact and is the
+/// shape used by virtually every drop-shadow recipe (where `feOffset`
+/// is fed an already-blurred mask, so sub-pixel placement is dominated
+/// by the upstream blur). Sub-pixel translation can be composed by the
+/// caller through one of the existing image-resample paths
+/// ([`crate::ImageFilter::Bilinear`] / [`crate::ImageFilter::Lanczos3`]
+/// etc.).
+///
+/// For an output pixel `(x, y)`, the sampled input position is
+/// `(x − dx, y − dy)` (a *shift right by `dx`* means every output pixel
+/// reads from `dx` pixels to its left in the input). Samples that fall
+/// outside `[0, width) × [0, height)` follow `edge`:
+/// `OffsetEdge::TransparentBlack` writes `(0, 0, 0, 0)`,
+/// `OffsetEdge::ClampToEdge` replicates the nearest border pixel.
+///
+/// Complexity: `O(W · H)` with one source read per output pixel.
+///
+/// # Panics
+///
+/// Panics if `src.len() != width as usize * height as usize * 4`.
+///
+/// # Returns
+///
+/// A new packed-RGBA `Vec<u8>` of the same dimensions. `dx == 0 &&
+/// dy == 0` returns a straight copy of `src` regardless of `edge`.
+pub fn offset_filter(
+    src: &[u8],
+    width: u32,
+    height: u32,
+    dx: i32,
+    dy: i32,
+    edge: OffsetEdge,
+) -> Vec<u8> {
+    let w = width as usize;
+    let h = height as usize;
+    let expected = w
+        .checked_mul(h)
+        .and_then(|n| n.checked_mul(4))
+        .expect("offset_filter: width * height * 4 overflowed usize");
+    assert_eq!(
+        src.len(),
+        expected,
+        "offset_filter: src.len() == {} but width*height*4 == {expected}",
+        src.len()
+    );
+
+    if width == 0 || height == 0 {
+        return Vec::new();
+    }
+    if dx == 0 && dy == 0 {
+        return src.to_vec();
+    }
+
+    let iw = width as i64;
+    let ih = height as i64;
+    let mut out = Vec::with_capacity(expected);
+    for y in 0..ih {
+        for x in 0..iw {
+            // Output (x, y) reads from input (x − dx, y − dy).
+            let sx = x - dx as i64;
+            let sy = y - dy as i64;
+            let inside = sx >= 0 && sx < iw && sy >= 0 && sy < ih;
+            if inside {
+                let off = ((sy as usize) * w + (sx as usize)) * 4;
+                out.extend_from_slice(&src[off..off + 4]);
+            } else {
+                match edge {
+                    OffsetEdge::TransparentBlack => out.extend_from_slice(&[0, 0, 0, 0]),
+                    OffsetEdge::ClampToEdge => {
+                        let cx = sx.clamp(0, iw - 1) as usize;
+                        let cy = sy.clamp(0, ih - 1) as usize;
+                        let off = (cy * w + cx) * 4;
+                        out.extend_from_slice(&src[off..off + 4]);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Typed-pixel wrapper around [`offset_filter`]. Identical semantics on
+/// a `&[Rgba]` slice.
+pub fn offset_filter_pixels(
+    src: &[Rgba],
+    width: u32,
+    height: u32,
+    dx: i32,
+    dy: i32,
+    edge: OffsetEdge,
+) -> Vec<Rgba> {
+    let n = width as usize * height as usize;
+    assert_eq!(
+        src.len(),
+        n,
+        "offset_filter_pixels: src.len() == {} but width*height == {n}",
+        src.len()
+    );
+    if width == 0 || height == 0 {
+        return Vec::new();
+    }
+    let mut bytes = Vec::with_capacity(n * 4);
+    for p in src {
+        bytes.extend_from_slice(&[p.r, p.g, p.b, p.a]);
+    }
+    let out = offset_filter(&bytes, width, height, dx, dy, edge);
+    out.chunks_exact(4)
+        .map(|c| Rgba::new(c[0], c[1], c[2], c[3]))
+        .collect()
+}
+
+#[cfg(test)]
+mod offset_tests {
+    use super::*;
+
+    fn build<F: FnMut(u32, u32) -> Rgba>(w: u32, h: u32, mut f: F) -> Vec<u8> {
+        let mut v = Vec::with_capacity((w * h * 4) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                let c = f(x, y);
+                v.extend_from_slice(&[c.r, c.g, c.b, c.a]);
+            }
+        }
+        v
+    }
+
+    #[test]
+    fn zero_offset_is_identity() {
+        let src = build(3, 2, |x, y| {
+            Rgba::new((x * 50) as u8, (y * 90) as u8, 11, 200)
+        });
+        let out = offset_filter(&src, 3, 2, 0, 0, OffsetEdge::TransparentBlack);
+        assert_eq!(out, src);
+        let out_clamp = offset_filter(&src, 3, 2, 0, 0, OffsetEdge::ClampToEdge);
+        assert_eq!(out_clamp, src);
+    }
+
+    #[test]
+    fn positive_shift_right_vacates_left_column() {
+        // (1, 0) shift: every output column `x` reads input column `x-1`.
+        // Column 0 is vacated.
+        let src = build(3, 1, |x, _| Rgba::new((x * 80) as u8, 0, 0, 255));
+        let out = offset_filter(&src, 3, 1, 1, 0, OffsetEdge::TransparentBlack);
+        assert_eq!(&out[0..4], &[0, 0, 0, 0]); // vacated → transparent
+        assert_eq!(&out[4..8], &src[0..4]); // out[1] = src[0]
+        assert_eq!(&out[8..12], &src[4..8]); // out[2] = src[1]
+    }
+
+    #[test]
+    fn negative_shift_left_vacates_right_column() {
+        let src = build(3, 1, |x, _| Rgba::new((x * 80) as u8, 0, 0, 255));
+        let out = offset_filter(&src, 3, 1, -1, 0, OffsetEdge::TransparentBlack);
+        // out[0] = src[1]; out[1] = src[2]; out[2] vacated.
+        assert_eq!(&out[0..4], &src[4..8]);
+        assert_eq!(&out[4..8], &src[8..12]);
+        assert_eq!(&out[8..12], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn clamp_edge_replicates_border() {
+        // (1, 0) shift with clamp: vacated left column becomes a copy of
+        // the source column 0 (instead of transparent black).
+        let src = build(3, 1, |x, _| Rgba::new((x * 80) as u8, 0, 0, 255));
+        let out = offset_filter(&src, 3, 1, 1, 0, OffsetEdge::ClampToEdge);
+        // out[0] reads sx = -1 → clamped to 0 → src[0].
+        assert_eq!(&out[0..4], &src[0..4]);
+        assert_eq!(&out[4..8], &src[0..4]); // out[1] = src[0] (natural)
+        assert_eq!(&out[8..12], &src[4..8]);
+    }
+
+    #[test]
+    fn shift_larger_than_extent_zeros_whole_image() {
+        let src = build(2, 2, |_, _| Rgba::new(200, 100, 50, 255));
+        let out = offset_filter(&src, 2, 2, 10, 10, OffsetEdge::TransparentBlack);
+        assert!(out.iter().all(|&v| v == 0));
+    }
+
+    #[test]
+    fn shift_larger_than_extent_clamps_to_border_pixel() {
+        // dx = dy = 10 with clamp ⇒ every output pixel samples the
+        // top-left corner of the input (sx, sy = -10, -10 ⇒ clamp to 0, 0).
+        let src = build(2, 2, |x, y| Rgba::new((x * 100 + y * 10) as u8, 0, 0, 255));
+        let out = offset_filter(&src, 2, 2, 10, 10, OffsetEdge::ClampToEdge);
+        for chunk in out.chunks_exact(4) {
+            assert_eq!(chunk, &src[0..4]);
+        }
+    }
+
+    #[test]
+    fn diagonal_shift_round_trip_is_identity() {
+        // (dx, dy) followed by (-dx, -dy) restores the interior of the
+        // image exactly when the vacated strip fits back inside the
+        // original frame, since clamp-to-edge round-trips an inner pixel
+        // through itself.
+        let src = build(4, 3, |x, y| {
+            Rgba::new((x * 40) as u8, (y * 50) as u8, ((x ^ y) * 30) as u8, 255)
+        });
+        let step1 = offset_filter(&src, 4, 3, 1, 1, OffsetEdge::ClampToEdge);
+        let step2 = offset_filter(&step1, 4, 3, -1, -1, OffsetEdge::ClampToEdge);
+        // Only the strictly interior pixel (1, 1) is guaranteed to
+        // survive both shifts intact under clamp — the borders get
+        // overwritten by the replicated edge on the way out. Pixel
+        // (1, 1) in a 4-wide row-major buffer starts at byte offset
+        // (y * w + x) * 4 = (1 * 4 + 1) * 4 = 20.
+        let off: usize = 20;
+        assert_eq!(&step2[off..off + 4], &src[off..off + 4]);
+    }
+
+    #[test]
+    fn empty_extent_returns_empty_vec() {
+        let out = offset_filter(&[], 0, 0, 3, 5, OffsetEdge::TransparentBlack);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "src.len()")]
+    fn wrong_length_panics() {
+        let _ = offset_filter(&[0u8; 8], 2, 2, 0, 0, OffsetEdge::TransparentBlack);
+    }
+
+    #[test]
+    fn typed_wrapper_matches_byte_path() {
+        let bytes = build(4, 3, |x, y| {
+            Rgba::new((x * 30) as u8, (y * 40) as u8, 11, ((x + y) * 25) as u8)
+        });
+        let pixels: Vec<Rgba> = bytes
+            .chunks_exact(4)
+            .map(|c| Rgba::new(c[0], c[1], c[2], c[3]))
+            .collect();
+        for &(dx, dy) in &[(0, 0), (1, 0), (-2, 1), (3, -1), (10, 10)] {
+            for edge in [OffsetEdge::TransparentBlack, OffsetEdge::ClampToEdge] {
+                let via_bytes = offset_filter(&bytes, 4, 3, dx, dy, edge);
+                let via_typed = offset_filter_pixels(&pixels, 4, 3, dx, dy, edge);
+                let typed_bytes: Vec<u8> = via_typed
+                    .iter()
+                    .flat_map(|p| [p.r, p.g, p.b, p.a])
+                    .collect();
+                assert_eq!(
+                    via_bytes, typed_bytes,
+                    "mismatch for dx={dx} dy={dy} edge={edge:?}"
+                );
+            }
+        }
     }
 }

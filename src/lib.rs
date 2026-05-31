@@ -104,11 +104,25 @@
 //!   `arithmetic` operator `result = k1·i1·i2 + k2·i1 + k3·i2 + k4`
 //!   (premultiplied, clamped to `[0, 1]`). Exposed as [`composite_filter`]
 //!   (with the typed-pixel wrapper [`composite_filter_pixels`]).
+//! * `<feFlood>` (SVG 1.1 §15.16) — fill the filter primitive subregion
+//!   with the constant straight-alpha tuple
+//!   `(flood-color.r, flood-color.g, flood-color.b, flood-opacity)`.
+//!   Exposed as [`flood`] (with the typed-pixel wrapper [`flood_pixels`]).
+//!   The opacity argument is clamped to the SVG `<opacity-value>` unit
+//!   range; NaN is treated as zero.
+//! * `<feOffset>` (SVG 1.1 §15.21) — translate a packed-RGBA buffer by
+//!   an integer pixel vector `(dx, dy)`; output pixel `(x, y)` samples
+//!   input pixel `(x − dx, y − dy)`. Vacated regions follow [`OffsetEdge`]
+//!   — `TransparentBlack` matches the SVG §15.7 "no defined input ⇒
+//!   transparent black" default; `ClampToEdge` replicates the nearest
+//!   border pixel (matching the boundary mode used by [`gaussian_blur`]
+//!   and [`morphology`]). Exposed as [`offset_filter`] (with the typed-
+//!   pixel wrapper [`offset_filter_pixels`]).
 //!
 //! Deferred to a later round:
 //!
 //! * remaining filters (drop shadow, feTurbulence, feConvolveMatrix,
-//!   feDisplacementMap, lighting),
+//!   feDisplacementMap, feTile, feMerge, lighting),
 //! * `<pattern>` paints,
 //! * full ICC-tagged color-managed pipeline (the `linearRGB`
 //!   interpolation space is implemented; per-channel ICC profile
@@ -137,9 +151,10 @@ pub use composite::{composite_rgba_premultiplied, composite_rgba_premultiplied_b
 pub use fill::{rasterize_fill, AlphaMask};
 pub use filter::{
     color_matrix, color_matrix_op, color_matrix_pixels, component_transfer,
-    component_transfer_pixels, composite_filter, composite_filter_pixels, gaussian_blur,
-    gaussian_blur_pixels, morphology, morphology_pixels, ColorMatrix, ColorMatrixOp,
-    ComponentTransfer, CompositeOp, MorphologyOp, TransferFunc, GAUSSIAN_BLUR_BOX_THRESHOLD,
+    component_transfer_pixels, composite_filter, composite_filter_pixels, flood, flood_pixels,
+    gaussian_blur, gaussian_blur_pixels, morphology, morphology_pixels, offset_filter,
+    offset_filter_pixels, ColorMatrix, ColorMatrixOp, ComponentTransfer, CompositeOp, MorphologyOp,
+    OffsetEdge, TransferFunc, GAUSSIAN_BLUR_BOX_THRESHOLD,
 };
 pub use flatten::{flatten_arc_to_cubics, flatten_path, FlatContour};
 pub use gradient::{
