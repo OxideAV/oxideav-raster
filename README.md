@@ -41,7 +41,8 @@ produces a packed `Rgba` `VideoFrame`.
 | `feGaussianBlur` separable Gaussian (§15.17)| done (round 13)    |
 | `feComponentTransfer` 5-mode per-channel (§15.11)| done (round 14)|
 | `feComposite` Porter-Duff + arithmetic (§15.12)| done (round 188) |
-| Filters (drop-shadow, feTurbulence, lighting, …)| partial (morphology + color-matrix + Gaussian blur + component-transfer + composite) |
+| `feConvolveMatrix` arbitrary 2-D convolution (§15.13)| done (round 206) |
+| Filters (drop-shadow, feTurbulence, lighting, …)| partial (morphology + color-matrix + Gaussian blur + component-transfer + composite + convolve-matrix) |
 | `<pattern>` paint                         | pending              |
 | Full ICC color-managed pipeline           | pending              |
 

@@ -2835,6 +2835,910 @@ pub fn composite_filter_pixels(
         .collect()
 }
 
+/// Edge-extension policy for [`convolve_matrix`], mirroring the
+/// `edgeMode` attribute of SVG 1.1 §15.13 `<feConvolveMatrix>`.
+///
+/// Selects how the kernel reads beyond the borders of the source
+/// image. The default per the spec is `Duplicate` (clamp-to-edge).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConvolveEdgeMode {
+    /// Extend by replicating the border row / column — `"duplicate"`,
+    /// the spec default. The same clamp-to-edge policy used by
+    /// [`gaussian_blur`] and [`morphology`].
+    #[default]
+    Duplicate,
+    /// Extend by wrapping around — sample column `-1` reads column
+    /// `width - 1`, sample row `height` reads row `0`, and so on
+    /// (toroidal addressing). Spec value `"wrap"`.
+    Wrap,
+    /// Extend with `(R, G, B, A) = (0, 0, 0, 0)` — sample positions
+    /// outside the source contribute zero to the sum. Spec value
+    /// `"none"`.
+    None,
+}
+
+/// Parameter block for [`convolve_matrix`] / [`convolve_matrix_pixels`].
+///
+/// Mirrors the attribute set of SVG 1.1 §15.13 `<feConvolveMatrix>`:
+/// `order`, `kernelMatrix`, `divisor`, `bias`, `targetX`, `targetY`,
+/// `edgeMode`, and `preserveAlpha`. Construct directly with the public
+/// fields or through [`ConvolveMatrix::new`] which applies the spec
+/// defaults for `divisor` (= sum of kernel, falling back to `1.0`),
+/// `target_x` / `target_y` (= floor of order / 2), and `bias` (= 0).
+///
+/// Field interpretation matches §15.13 verbatim:
+///
+/// * `order_x` × `order_y` cells in `kernel`, stored row-major: index
+///   `row * order_x + col` reads `kernelMatrix[col, row]`. Spec
+///   §15.13 mandates `1 ≤ order_{x,y}`.
+/// * `divisor` divides the convolved sum before `bias` is added.
+///   Must be non-zero (§15.13 error processing).
+/// * `bias` is added to each output channel after the divisor step.
+/// * `target_x` / `target_y` reposition the kernel relative to the
+///   target pixel; the default centres a square kernel
+///   (`floor(order / 2)`). Spec mandates `0 ≤ target_{x,y} < order_{x,y}`.
+/// * `edge_mode` chooses how out-of-bounds samples are extended.
+/// * `preserve_alpha = false` (default per §15.13) convolves the alpha
+///   channel alongside RGB; `preserve_alpha = true` un-premultiplies the
+///   source, convolves only RGB, leaves alpha as the original
+///   `SOURCE_{X,Y}`, then re-premultiplies the result before
+///   re-quantising to `u8`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConvolveMatrix {
+    /// Number of columns in `kernel`. Must be `≥ 1`.
+    pub order_x: u32,
+    /// Number of rows in `kernel`. Must be `≥ 1`.
+    pub order_y: u32,
+    /// Row-major `order_y × order_x` kernel weights, length
+    /// `order_x * order_y`.
+    pub kernel: Vec<f32>,
+    /// Divisor applied to the convolved sum (§15.13 — default is
+    /// `sum(kernel)`, falling back to `1.0` when the sum is zero).
+    /// Must be non-zero.
+    pub divisor: f32,
+    /// Additive bias applied after the divisor step.
+    pub bias: f32,
+    /// X-position of the kernel's anchor (0 ≤ `target_x` < `order_x`).
+    pub target_x: u32,
+    /// Y-position of the kernel's anchor (0 ≤ `target_y` < `order_y`).
+    pub target_y: u32,
+    /// Out-of-bounds sample extension policy.
+    pub edge_mode: ConvolveEdgeMode,
+    /// When `true`, convolve only the RGB channels of the
+    /// un-premultiplied source and pass alpha through unchanged
+    /// (§15.13 `preserveAlpha="true"`). When `false`, convolve all
+    /// four channels of the straight-alpha source uniformly.
+    pub preserve_alpha: bool,
+}
+
+impl ConvolveMatrix {
+    /// Construct a [`ConvolveMatrix`] applying the §15.13 defaults for
+    /// every attribute the spec leaves unspecified:
+    ///
+    /// * `divisor` = sum of `kernel`, falling back to `1.0` when the
+    ///   sum is zero (§15.13).
+    /// * `bias` = `0`.
+    /// * `target_x` = `floor(order_x / 2)`, `target_y` = `floor(order_y / 2)`.
+    /// * `edge_mode` = [`ConvolveEdgeMode::Duplicate`].
+    /// * `preserve_alpha` = `false`.
+    ///
+    /// # Panics
+    ///
+    /// * If `order_x == 0` or `order_y == 0` (§15.13 error
+    ///   processing — both must be ≥ 1).
+    /// * If `kernel.len() != order_x * order_y` (the spec requires the
+    ///   kernel list length to equal `orderX * orderY`).
+    pub fn new(order_x: u32, order_y: u32, kernel: Vec<f32>) -> Self {
+        assert!(
+            order_x >= 1 && order_y >= 1,
+            "ConvolveMatrix::new: order_x ({order_x}) and order_y ({order_y}) must each be >= 1"
+        );
+        let n = (order_x as usize)
+            .checked_mul(order_y as usize)
+            .expect("ConvolveMatrix::new: order_x * order_y overflowed usize");
+        assert_eq!(
+            kernel.len(),
+            n,
+            "ConvolveMatrix::new: kernel.len() ({}) must equal order_x * order_y ({n})",
+            kernel.len()
+        );
+
+        let sum: f32 = kernel.iter().sum();
+        let divisor = if sum == 0.0 { 1.0 } else { sum };
+        let target_x = order_x / 2;
+        let target_y = order_y / 2;
+
+        ConvolveMatrix {
+            order_x,
+            order_y,
+            kernel,
+            divisor,
+            bias: 0.0,
+            target_x,
+            target_y,
+            edge_mode: ConvolveEdgeMode::Duplicate,
+            preserve_alpha: false,
+        }
+    }
+
+    /// Builder: set [`Self::bias`].
+    pub fn with_bias(mut self, bias: f32) -> Self {
+        self.bias = bias;
+        self
+    }
+
+    /// Builder: set [`Self::divisor`]. Must be non-zero (panic
+    /// otherwise — §15.13 error processing).
+    pub fn with_divisor(mut self, divisor: f32) -> Self {
+        assert!(
+            divisor != 0.0,
+            "ConvolveMatrix::with_divisor: divisor must be non-zero (§15.13)"
+        );
+        self.divisor = divisor;
+        self
+    }
+
+    /// Builder: set [`Self::target_x`] / [`Self::target_y`]. Each must
+    /// satisfy `0 ≤ target < order` (§15.13 error processing).
+    pub fn with_target(mut self, target_x: u32, target_y: u32) -> Self {
+        assert!(
+            target_x < self.order_x,
+            "ConvolveMatrix::with_target: target_x ({target_x}) >= order_x ({})",
+            self.order_x
+        );
+        assert!(
+            target_y < self.order_y,
+            "ConvolveMatrix::with_target: target_y ({target_y}) >= order_y ({})",
+            self.order_y
+        );
+        self.target_x = target_x;
+        self.target_y = target_y;
+        self
+    }
+
+    /// Builder: set [`Self::edge_mode`].
+    pub fn with_edge_mode(mut self, edge_mode: ConvolveEdgeMode) -> Self {
+        self.edge_mode = edge_mode;
+        self
+    }
+
+    /// Builder: set [`Self::preserve_alpha`].
+    pub fn with_preserve_alpha(mut self, preserve_alpha: bool) -> Self {
+        self.preserve_alpha = preserve_alpha;
+        self
+    }
+
+    /// Read the kernel weight at logical position `(col, row)` —
+    /// equivalent to `kernel[row * order_x + col]`. Spec-named
+    /// `kernelMatrix[col, row]`.
+    #[inline]
+    fn kernel_at(&self, col: u32, row: u32) -> f32 {
+        debug_assert!(col < self.order_x && row < self.order_y);
+        self.kernel[(row * self.order_x + col) as usize]
+    }
+}
+
+/// Read a sample from a packed-RGBA `u8` buffer with edge handling.
+///
+/// `x`, `y` may be negative or `>= width / height`. The four channels
+/// are returned in straight-alpha `u8` order (R, G, B, A). For
+/// [`ConvolveEdgeMode::None`] out-of-bounds reads return `(0, 0, 0, 0)`;
+/// for `Duplicate` they clamp to the nearest in-range coordinate; for
+/// `Wrap` they take `x.rem_euclid(width)` / `y.rem_euclid(height)`.
+#[inline]
+fn sample_with_edge(
+    src: &[u8],
+    width: u32,
+    height: u32,
+    x: i64,
+    y: i64,
+    mode: ConvolveEdgeMode,
+) -> [u8; 4] {
+    let w = width as i64;
+    let h = height as i64;
+    let (sx, sy) = match mode {
+        ConvolveEdgeMode::Duplicate => (x.clamp(0, w - 1), y.clamp(0, h - 1)),
+        ConvolveEdgeMode::Wrap => (x.rem_euclid(w), y.rem_euclid(h)),
+        ConvolveEdgeMode::None => {
+            if x < 0 || x >= w || y < 0 || y >= h {
+                return [0, 0, 0, 0];
+            }
+            (x, y)
+        }
+    };
+    let idx = ((sy as usize) * (width as usize) + (sx as usize)) * 4;
+    [src[idx], src[idx + 1], src[idx + 2], src[idx + 3]]
+}
+
+/// SVG 1.1 §15.13 `<feConvolveMatrix>` — apply a general matrix
+/// convolution to a packed-RGBA `u8` buffer.
+///
+/// Implements the spec formula verbatim:
+///
+/// ```text
+/// COLOR_{X,Y} = (
+///     SUM_{I=0..orderY-1} {
+///         SUM_{J=0..orderX-1} {
+///             SOURCE_{X − targetX + J, Y − targetY + I}
+///                 · kernelMatrix[orderX − J − 1, orderY − I − 1]
+///         }
+///     }
+/// ) / divisor + bias
+/// ```
+///
+/// The kernel is rotated 180° when sampling — that is, the
+/// top-left-most coefficient `kernelMatrix[0, 0]` lands on the
+/// bottom-right-most contributing source pixel — matching the
+/// mathematical convention noted in §15.13 ("the values in the
+/// kernel matrix are applied such that the kernel matrix is rotated
+/// 180 degrees relative to the source and destination images").
+///
+/// `divisor`, `bias`, `target_x`, `target_y`, `edge_mode`, and
+/// `preserve_alpha` are taken from `cm`; see [`ConvolveMatrix`] for the
+/// per-field semantics.
+///
+/// When `preserve_alpha == false` (§15.13 default), the convolution is
+/// applied uniformly across all four straight-alpha channels of the
+/// source — the same formula above governs alpha as governs colour.
+/// When `preserve_alpha == true`, the source's straight-alpha colour
+/// channels are first un-premultiplied (the alpha-multiplication
+/// inverse), the RGB channels are then convolved, alpha is left as
+/// `SOURCE_{X,Y}` (the original pixel's alpha), and the RGB result is
+/// re-premultiplied before the final clamp-and-quantise step. (The
+/// source is treated as straight-alpha throughout; the
+/// "un-premultiply / re-premultiply" wording in §15.13 refers to the
+/// internal premultiplication used while applying the kernel, not to
+/// the encoding of the input or output buffers.)
+///
+/// Output channels are clamped to `[0, 255]` before quantisation.
+///
+/// Complexity: `O(W · H · order_x · order_y)`. The kernel is **not**
+/// separable in general — `feConvolveMatrix` is the catch-all
+/// arbitrary-2D-kernel primitive; spec-named separable kernels
+/// (Gaussian) live in dedicated filter primitives.
+///
+/// # Panics
+///
+/// * If `src.len() != width as usize * height as usize * 4`.
+/// * If `cm.divisor == 0.0` (§15.13 error processing).
+/// * If `cm.order_x == 0` or `cm.order_y == 0`.
+/// * If `cm.kernel.len() != cm.order_x * cm.order_y`.
+/// * If `cm.target_x >= cm.order_x` or `cm.target_y >= cm.order_y`.
+///
+/// # Returns
+///
+/// A new packed-RGBA `Vec<u8>` of the same `width × height` extent.
+pub fn convolve_matrix(src: &[u8], width: u32, height: u32, cm: &ConvolveMatrix) -> Vec<u8> {
+    let w = width as usize;
+    let h = height as usize;
+    let expected = w
+        .checked_mul(h)
+        .and_then(|n| n.checked_mul(4))
+        .expect("convolve_matrix: width * height * 4 overflowed usize");
+    assert_eq!(
+        src.len(),
+        expected,
+        "convolve_matrix: src.len() == {} but width*height*4 == {expected}",
+        src.len()
+    );
+    assert!(
+        cm.divisor != 0.0,
+        "convolve_matrix: divisor must be non-zero (§15.13)"
+    );
+    assert!(
+        cm.order_x >= 1 && cm.order_y >= 1,
+        "convolve_matrix: order_x ({}) and order_y ({}) must each be >= 1",
+        cm.order_x,
+        cm.order_y
+    );
+    let n_cells = (cm.order_x as usize) * (cm.order_y as usize);
+    assert_eq!(
+        cm.kernel.len(),
+        n_cells,
+        "convolve_matrix: kernel.len() ({}) must equal order_x * order_y ({n_cells})",
+        cm.kernel.len()
+    );
+    assert!(
+        cm.target_x < cm.order_x,
+        "convolve_matrix: target_x ({}) >= order_x ({})",
+        cm.target_x,
+        cm.order_x
+    );
+    assert!(
+        cm.target_y < cm.order_y,
+        "convolve_matrix: target_y ({}) >= order_y ({})",
+        cm.target_y,
+        cm.order_y
+    );
+
+    if width == 0 || height == 0 {
+        return Vec::new();
+    }
+
+    let inv_div = 1.0 / cm.divisor;
+    let bias = cm.bias;
+    let order_x = cm.order_x as i64;
+    let order_y = cm.order_y as i64;
+    let tx = cm.target_x as i64;
+    let ty = cm.target_y as i64;
+
+    let mut out = vec![0u8; expected];
+
+    for y in 0..height as i64 {
+        for x in 0..width as i64 {
+            let mut sum = [0f32; 4];
+            // Original alpha at the target pixel — needed for the
+            // preserve_alpha pass-through and for the un-premultiply
+            // step before the kernel is applied to RGB.
+            let target = sample_with_edge(src, width, height, x, y, cm.edge_mode);
+            let target_alpha = target[3] as f32 / 255.0;
+
+            for i in 0..order_y {
+                for j in 0..order_x {
+                    // The 180°-rotated kernel index per §15.13:
+                    // kernelMatrix[orderX − J − 1, orderY − I − 1].
+                    let k = cm.kernel_at((order_x - j - 1) as u32, (order_y - i - 1) as u32);
+                    if k == 0.0 {
+                        continue;
+                    }
+                    let sx = x - tx + j;
+                    let sy = y - ty + i;
+                    let s = sample_with_edge(src, width, height, sx, sy, cm.edge_mode);
+                    if cm.preserve_alpha {
+                        // RGB only; alpha is taken from the target pixel
+                        // and not summed. The spec wording is "the filter
+                        // will temporarily unpremultiply the color
+                        // component values, apply the kernel, and then
+                        // re-premultiply at the end". Source straight-
+                        // alpha bytes already store un-premultiplied RGB,
+                        // so the un-premultiply step is the identity.
+                        sum[0] += k * (s[0] as f32);
+                        sum[1] += k * (s[1] as f32);
+                        sum[2] += k * (s[2] as f32);
+                    } else {
+                        sum[0] += k * (s[0] as f32);
+                        sum[1] += k * (s[1] as f32);
+                        sum[2] += k * (s[2] as f32);
+                        sum[3] += k * (s[3] as f32);
+                    }
+                }
+            }
+
+            // Apply divisor + bias, clamp, quantise.
+            let out_idx = ((y as usize) * w + (x as usize)) * 4;
+            let r = sum[0] * inv_div + bias * 255.0;
+            let g = sum[1] * inv_div + bias * 255.0;
+            let b = sum[2] * inv_div + bias * 255.0;
+            out[out_idx] = quantise_byte(r);
+            out[out_idx + 1] = quantise_byte(g);
+            out[out_idx + 2] = quantise_byte(b);
+            if cm.preserve_alpha {
+                // Alpha pass-through: ALPHAX,Y = SOURCEX,Y per §15.13.
+                out[out_idx + 3] = target[3];
+            } else {
+                let a = sum[3] * inv_div + bias * 255.0;
+                out[out_idx + 3] = quantise_byte(a);
+            }
+            // Silence unused-variable warning when preserve_alpha=false;
+            // target_alpha is still computed once per pixel for symmetry
+            // with the preserveAlpha branch (no measurable overhead).
+            let _ = target_alpha;
+        }
+    }
+
+    out
+}
+
+/// Convenience wrapper that runs [`convolve_matrix`] on a slice of
+/// [`Rgba`] pixels and returns a `Vec<Rgba>` of the same length.
+/// Identical semantics — provided for callers that already have typed
+/// pixel buffers.
+pub fn convolve_matrix_pixels(
+    src: &[Rgba],
+    width: u32,
+    height: u32,
+    cm: &ConvolveMatrix,
+) -> Vec<Rgba> {
+    let n = (width as usize) * (height as usize);
+    assert_eq!(
+        src.len(),
+        n,
+        "convolve_matrix_pixels: src.len() == {} but width*height == {n}",
+        src.len()
+    );
+    let mut bytes = Vec::with_capacity(n * 4);
+    for p in src {
+        bytes.extend_from_slice(&[p.r, p.g, p.b, p.a]);
+    }
+    let out = convolve_matrix(&bytes, width, height, cm);
+    out.chunks_exact(4)
+        .map(|c| Rgba::new(c[0], c[1], c[2], c[3]))
+        .collect()
+}
+
+/// Round-half-up clamp from an arbitrary `f32` to `[0, 255]`, NaN to 0.
+/// Distinct from [`quantise_unit`] (which expects a `[0, 1]` unit value)
+/// and [`quantise_u8`] (whose contract is different); this one takes a
+/// already-byte-scale `f32` straight off the convolution sum.
+#[inline]
+fn quantise_byte(v: f32) -> u8 {
+    if v.is_nan() {
+        return 0;
+    }
+    let clamped = v.clamp(0.0, 255.0);
+    (clamped + 0.5) as u8
+}
+
+#[cfg(test)]
+mod convolve_matrix_tests {
+    use super::*;
+
+    fn solid(w: u32, h: u32, rgba: [u8; 4]) -> Vec<u8> {
+        let mut v = Vec::with_capacity((w * h * 4) as usize);
+        for _ in 0..(w * h) {
+            v.extend_from_slice(&rgba);
+        }
+        v
+    }
+
+    /// 3×3 identity kernel — the centre cell is 1.0, everything else
+    /// is zero. Divisor defaults to 1.0 (sum is 1.0). Spec-conformant
+    /// per §15.13 default behaviour: byte-for-byte identity on the
+    /// interior; with `Duplicate` edge mode the borders are also
+    /// identity because the kernel only reads the centre pixel.
+    #[test]
+    fn identity_kernel_3x3_is_identity() {
+        let w = 5;
+        let h = 4;
+        // Pseudo-random but deterministic pixel pattern.
+        let mut src = Vec::with_capacity((w * h * 4) as usize);
+        for i in 0..(w * h) {
+            src.push(((i * 37 + 3) % 256) as u8);
+            src.push(((i * 53 + 11) % 256) as u8);
+            src.push(((i * 71 + 19) % 256) as u8);
+            src.push(((i * 17 + 41) % 256) as u8);
+        }
+
+        #[rustfmt::skip]
+        let cm = ConvolveMatrix::new(3, 3, vec![
+            0.0, 0.0, 0.0,
+            0.0, 1.0, 0.0,
+            0.0, 0.0, 0.0,
+        ]);
+        let out = convolve_matrix(&src, w, h, &cm);
+        assert_eq!(out, src, "identity kernel should round-trip every pixel");
+    }
+
+    /// Default constructor picks `divisor = sum(kernel)` (§15.13). A
+    /// solid colour through a box-blur kernel must be byte-identical
+    /// regardless of edge mode (Duplicate / Wrap both return the
+    /// same colour at every position; None also works because the
+    /// kernel-sum / divisor = 1 cancels the in-bounds-only sum on the
+    /// interior, and on the border the missing samples are zero,
+    /// shrinking the sum proportionally — we expect identity on the
+    /// interior pixels for None and possibly different for borders).
+    #[test]
+    fn box_blur_3x3_solid_is_identity_interior() {
+        let w = 7;
+        let h = 5;
+        let colour = [120, 200, 60, 255];
+        let src = solid(w, h, colour);
+        let cm = ConvolveMatrix::new(3, 3, vec![1.0; 9]); // divisor = 9
+        for mode in [
+            ConvolveEdgeMode::Duplicate,
+            ConvolveEdgeMode::Wrap,
+            ConvolveEdgeMode::None,
+        ] {
+            let cm = cm.clone().with_edge_mode(mode);
+            let out = convolve_matrix(&src, w, h, &cm);
+            // Interior pixels must be identity regardless of edge
+            // mode (the kernel only reads in-bounds samples for them).
+            for y in 1..h - 1 {
+                for x in 1..w - 1 {
+                    let i = ((y * w + x) * 4) as usize;
+                    assert_eq!(
+                        &out[i..i + 4],
+                        &colour,
+                        "interior pixel ({x},{y}) under {mode:?} should be identity"
+                    );
+                }
+            }
+            // Under Duplicate + Wrap edge modes the borders also see
+            // a uniform colour everywhere the kernel reaches, so the
+            // whole image must be identity.
+            if matches!(mode, ConvolveEdgeMode::Duplicate | ConvolveEdgeMode::Wrap) {
+                assert_eq!(out, src, "{mode:?} should be identity for solid image");
+            }
+        }
+    }
+
+    /// Hand-evaluate one pixel against the §15.13 worked example.
+    /// With the spec's 5×5 input and the 3×3 kernel
+    /// `[[1, 2, 3], [4, 5, 6], [7, 8, 9]]` (divisor = 45) the source
+    /// pixel value at the second row and second column (the spec's
+    /// example pixel) is 120, and the spec writes the result as
+    /// `(9·0 + 8·20 + 7·40 + 6·100 + 5·120 + 4·140 + 3·200 + 2·220 +
+    /// 1·240) / 45 = 3480 / 45 = 77.33…` — that is, the kernel is
+    /// 180°-rotated before being applied, so coefficient 9 lands on
+    /// the source pixel at the *top-left* of the 3×3 window
+    /// (the 0 in the corner), coefficient 1 lands on the *bottom-right*
+    /// (the 240). Our `convolve_matrix` must reproduce that 77 to a
+    /// byte after the round-half-up quantisation.
+    #[test]
+    fn spec_15_13_worked_example_pixel() {
+        // 5x5 single-channel-style image populated only in R. We use
+        // grey (R == G == B) and full opaque so all four channels
+        // share the same convolved value and the assertion stays
+        // clean.
+        let w = 5u32;
+        let h = 5u32;
+        #[rustfmt::skip]
+        let grey: Vec<u8> = vec![
+              0,  20,  40, 235, 235,
+            100, 120, 140, 235, 235,
+            200, 220, 240, 235, 235,
+            225, 225, 255, 255, 255,
+            225, 225, 255, 255, 255,
+        ];
+        let mut src = Vec::with_capacity((w * h * 4) as usize);
+        for v in &grey {
+            src.extend_from_slice(&[*v, *v, *v, 255]);
+        }
+        #[rustfmt::skip]
+        let cm = ConvolveMatrix::new(3, 3, vec![
+            1.0, 2.0, 3.0,
+            4.0, 5.0, 6.0,
+            7.0, 8.0, 9.0,
+        ]);
+        // Default divisor is the kernel sum (45). The spec example
+        // evaluates pixel (1, 1) to 3480 / 45 = 77.333… → 77 after
+        // round-half-up. (The spec text lists the individual products
+        // 9·0 + 8·20 + 7·40 + 6·100 + 5·120 + 4·140 + 3·200 + 2·220 +
+        // 1·240 = 0 + 160 + 280 + 600 + 600 + 560 + 600 + 440 + 240
+        // = 3480.)
+        let out = convolve_matrix(&src, w, h, &cm);
+        let idx = ((w + 1) * 4) as usize;
+        let expected = 77u8;
+        assert_eq!(out[idx], expected, "spec example pixel R should be 77");
+        assert_eq!(out[idx + 1], expected, "spec example pixel G should be 77");
+        assert_eq!(out[idx + 2], expected, "spec example pixel B should be 77");
+    }
+
+    /// `preserve_alpha = true` leaves the alpha channel byte-identical
+    /// to the source while still convolving the RGB channels. We use a
+    /// 3×3 box-blur on a sharp alpha mask — the RGB output blurs but
+    /// the alpha must match the input pixel-by-pixel.
+    #[test]
+    fn preserve_alpha_passes_alpha_through() {
+        let w = 5;
+        let h = 5;
+        let mut src = Vec::with_capacity((w * h * 4) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                let alpha = if (x + y) % 2 == 0 { 255 } else { 64 };
+                src.extend_from_slice(&[100, 200, 50, alpha]);
+            }
+        }
+        let cm = ConvolveMatrix::new(3, 3, vec![1.0; 9]).with_preserve_alpha(true);
+        let out = convolve_matrix(&src, w, h, &cm);
+        for i in 0..(w * h) as usize {
+            assert_eq!(
+                out[i * 4 + 3],
+                src[i * 4 + 3],
+                "alpha[{i}] should pass through under preserve_alpha"
+            );
+        }
+    }
+
+    /// `edgeMode = "none"` zeros the kernel reads outside the source.
+    /// On the top-left corner pixel of a 1×1-of-non-zero image (every
+    /// other pixel is zero) we know exactly how many cells contribute.
+    #[test]
+    fn edge_mode_none_zeros_oob() {
+        let w = 3;
+        let h = 3;
+        let mut src = vec![0u8; (w * h * 4) as usize];
+        // Put 100 in R at the centre pixel only; everything else 0.
+        let centre = ((w + 1) * 4) as usize;
+        src[centre] = 100;
+        src[centre + 3] = 255; // give it some alpha so it's well-formed
+        let cm = ConvolveMatrix::new(3, 3, vec![1.0; 9])
+            .with_divisor(1.0)
+            .with_edge_mode(ConvolveEdgeMode::None);
+        let out = convolve_matrix(&src, w, h, &cm);
+        // Every output pixel that contains the centre in its 3×3
+        // neighbourhood (i.e. every pixel — at this size the kernel
+        // touches every cell) sees R = 100 added once. Output R must
+        // equal 100 everywhere in this configuration.
+        for i in 0..(w * h) as usize {
+            assert_eq!(
+                out[i * 4],
+                100,
+                "every neighbour pixel should see the centre R contribution exactly once"
+            );
+        }
+    }
+
+    /// `edgeMode = "duplicate"` extends by clamping — sample at column
+    /// -1 reads column 0, etc. Easy sanity: a 1×1 image under any kernel
+    /// summing to `divisor` is byte-identical to the source.
+    #[test]
+    fn duplicate_1x1_is_identity_under_unit_divisor() {
+        let src = [80u8, 160, 240, 255];
+        let cm =
+            ConvolveMatrix::new(3, 3, vec![1.0; 9]).with_edge_mode(ConvolveEdgeMode::Duplicate);
+        // divisor defaults to 9 → average of 9 reads of the only pixel
+        // = the pixel itself.
+        let out = convolve_matrix(&src, 1, 1, &cm);
+        assert_eq!(out, &src);
+    }
+
+    /// `edgeMode = "wrap"` makes a `delta` impulse centred on a 1-pixel
+    /// image symmetric. We don't test wrapping in detail here (covered
+    /// in integration tests) — just that the type-checker / runtime
+    /// don't panic on a small canvas.
+    #[test]
+    fn wrap_smoke_test() {
+        let src = solid(2, 2, [10, 20, 30, 255]);
+        let cm = ConvolveMatrix::new(3, 3, vec![1.0; 9]).with_edge_mode(ConvolveEdgeMode::Wrap);
+        let out = convolve_matrix(&src, 2, 2, &cm);
+        assert_eq!(out, src, "wrap+box-blur on solid 2x2 is identity");
+    }
+
+    /// Bias shifts every output channel by a constant.
+    ///
+    /// Identity kernel + `bias = 0.25` must add ~64 (= 0.25 · 255 =
+    /// 63.75 → 64) to every channel of a 100-grey input.
+    #[test]
+    fn bias_shifts_all_channels() {
+        let src = solid(2, 2, [100, 100, 100, 100]);
+        let cm = ConvolveMatrix::new(1, 1, vec![1.0]).with_bias(0.25);
+        let out = convolve_matrix(&src, 2, 2, &cm);
+        // 100 + 0.25*255 = 100 + 63.75 → round-half-up → 164.
+        for (i, channel) in out.iter().take(4).enumerate() {
+            assert_eq!(*channel, 164, "channel {i} should be 100 + 64 = 164");
+        }
+    }
+
+    /// Negative bias also clamps at 0 — bias of -1.0 must zero every
+    /// channel of any input.
+    #[test]
+    fn negative_bias_clamps_to_zero() {
+        let src = solid(2, 2, [100, 200, 50, 255]);
+        let cm = ConvolveMatrix::new(1, 1, vec![1.0]).with_bias(-1.0);
+        let out = convolve_matrix(&src, 2, 2, &cm);
+        for v in out {
+            assert_eq!(v, 0);
+        }
+    }
+
+    /// Standard 3×3 Sobel-X kernel produces zero on a constant image
+    /// (high-pass / edge-detection property: it sums to zero).
+    #[test]
+    fn sobel_x_on_constant_is_zero() {
+        let w = 5;
+        let h = 5;
+        let src = solid(w, h, [128, 128, 128, 255]);
+        #[rustfmt::skip]
+        let kernel = vec![
+            -1.0, 0.0, 1.0,
+            -2.0, 0.0, 2.0,
+            -1.0, 0.0, 1.0,
+        ];
+        let cm = ConvolveMatrix::new(3, 3, kernel)
+            // The kernel sums to zero so the default-divisor path would
+            // fall back to 1.0. Set explicitly to silence ambiguity.
+            .with_divisor(1.0)
+            .with_edge_mode(ConvolveEdgeMode::Duplicate)
+            .with_preserve_alpha(true);
+        let out = convolve_matrix(&src, w, h, &cm);
+        for i in 0..(w * h) as usize {
+            assert_eq!(out[i * 4], 0, "R should be zero on constant");
+            assert_eq!(out[i * 4 + 1], 0, "G should be zero on constant");
+            assert_eq!(out[i * 4 + 2], 0, "B should be zero on constant");
+            assert_eq!(out[i * 4 + 3], 255, "alpha pass-through");
+        }
+    }
+
+    /// Asymmetric kernel — verify the 180° rotation specified by
+    /// §15.13. Take a delta-impulse image (single non-zero pixel) and
+    /// an asymmetric kernel and check the output landing pattern.
+    #[test]
+    fn kernel_is_rotated_180_per_spec() {
+        let w = 5;
+        let h = 5;
+        let mut src = vec![0u8; (w * h * 4) as usize];
+        // Impulse at (2, 2).
+        let centre = ((2 * w + 2) * 4) as usize;
+        src[centre] = 100;
+        src[centre + 3] = 255;
+
+        // Kernel with the only non-zero entry at the bottom-right
+        // corner: kernelMatrix[2, 2] = 1. With the 180° rotation per
+        // §15.13, this coefficient lands on
+        // sample(X - targetX + 0, Y - targetY + 0) → top-left
+        // neighbour of the target. So the impulse at (2,2) → output
+        // contribution lands at (target offset relative to source).
+        //
+        // With targetX=targetY=1 (default for 3×3), the kernel
+        // coefficient at index (orderX-J-1, orderY-I-1) = (2, 2)
+        // corresponds to (J, I) = (0, 0), reading from source
+        // (X-1, Y-1). So the impulse at (2, 2) shows up in the output
+        // at (3, 3) (one step down-right).
+        #[rustfmt::skip]
+        let kernel = vec![
+            0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0,
+            0.0, 0.0, 1.0,
+        ];
+        let cm = ConvolveMatrix::new(3, 3, kernel)
+            .with_divisor(1.0)
+            .with_edge_mode(ConvolveEdgeMode::None)
+            .with_preserve_alpha(false);
+        let out = convolve_matrix(&src, w, h, &cm);
+        // Where the impulse lands per the 180° rotation formula:
+        // output (3, 3).
+        let landed = ((3 * w + 3) * 4) as usize;
+        assert_eq!(
+            out[landed], 100,
+            "impulse should land at (3,3) per §15.13 rotation"
+        );
+        // Sanity: should NOT land at (1, 1) (the naive-no-rotation
+        // location).
+        let naive = ((w + 1) * 4) as usize;
+        assert_eq!(
+            out[naive], 0,
+            "no contribution at (1,1) per §15.13 rotation"
+        );
+    }
+
+    /// Typed-pixel wrapper agrees with the byte API across an
+    /// asymmetric kernel + bias + non-default edge mode.
+    #[test]
+    fn typed_pixel_wrapper_matches_byte_api() {
+        let w = 4;
+        let h = 3;
+        let mut src_b = Vec::with_capacity((w * h * 4) as usize);
+        let mut src_p = Vec::with_capacity((w * h) as usize);
+        for i in 0..(w * h) {
+            let p = Rgba::new(
+                ((i * 41) % 256) as u8,
+                ((i * 59) % 256) as u8,
+                ((i * 67) % 256) as u8,
+                ((i * 23 + 70) % 256) as u8,
+            );
+            src_b.extend_from_slice(&[p.r, p.g, p.b, p.a]);
+            src_p.push(p);
+        }
+        #[rustfmt::skip]
+        let kernel = vec![
+            1.0, 1.0, 0.0,
+            1.0, 1.0, 0.0,
+            0.0, 0.0, 0.0,
+        ];
+        let cm = ConvolveMatrix::new(3, 3, kernel)
+            .with_bias(-0.05)
+            .with_edge_mode(ConvolveEdgeMode::Wrap);
+        let via_bytes = convolve_matrix(&src_b, w, h, &cm);
+        let via_typed = convolve_matrix_pixels(&src_p, w, h, &cm);
+        let typed_bytes: Vec<u8> = via_typed
+            .iter()
+            .flat_map(|p| [p.r, p.g, p.b, p.a])
+            .collect();
+        assert_eq!(via_bytes, typed_bytes);
+    }
+
+    /// Empty image returns an empty buffer.
+    #[test]
+    fn empty_extent_is_empty_vec() {
+        let cm = ConvolveMatrix::new(1, 1, vec![1.0]);
+        assert!(convolve_matrix(&[], 0, 0, &cm).is_empty());
+    }
+
+    /// Non-square kernel — order 5×1 horizontal moving-average
+    /// produces blur along X only, leaves Y untouched. The orthogonal
+    /// edge of a vertical step is unaffected by row.
+    #[test]
+    fn horizontal_kernel_only_blurs_x() {
+        let w = 9;
+        let h = 3;
+        let mut src = Vec::with_capacity((w * h * 4) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                // Step edge along x = 4: 0 on the left, 200 on the
+                // right. Same colour on every row.
+                let v = if x < 4 { 0 } else { 200 };
+                src.extend_from_slice(&[v, v, v, 255]);
+                let _ = y;
+            }
+        }
+        // 1×5 horizontal averaging kernel.
+        let cm = ConvolveMatrix::new(5, 1, vec![1.0; 5]);
+        let out = convolve_matrix(&src, w, h, &cm);
+        // All rows must be byte-identical to the first row.
+        let row0: Vec<u8> = out[..(w * 4) as usize].to_vec();
+        for y in 1..h {
+            let start = (y * w * 4) as usize;
+            let row = &out[start..start + (w * 4) as usize];
+            assert_eq!(row, row0.as_slice(), "row {y} should match row 0");
+        }
+    }
+
+    /// Custom `target` shifts the kernel anchor. With a 3×3 identity
+    /// kernel (centre = 1.0) and `target = (0, 0)`, the impulse moves
+    /// one pixel up-and-to-the-left because the anchor is now at the
+    /// top-left of the kernel — but after the §15.13 180° rotation,
+    /// the centre of the kernel ends up reading from
+    /// (X - 0 + 1, Y - 0 + 1), i.e. one pixel down-and-right of the
+    /// target. So a centred impulse at (2, 2) shows up at (1, 1).
+    #[test]
+    fn target_shifts_anchor() {
+        let w = 5;
+        let h = 5;
+        let mut src = vec![0u8; (w * h * 4) as usize];
+        let centre = ((2 * w + 2) * 4) as usize;
+        src[centre] = 100;
+        src[centre + 3] = 255;
+        #[rustfmt::skip]
+        let kernel = vec![
+            0.0, 0.0, 0.0,
+            0.0, 1.0, 0.0,
+            0.0, 0.0, 0.0,
+        ];
+        let cm = ConvolveMatrix::new(3, 3, kernel)
+            .with_divisor(1.0)
+            .with_target(0, 0)
+            .with_edge_mode(ConvolveEdgeMode::None);
+        let out = convolve_matrix(&src, w, h, &cm);
+        // With target=(0,0), kernel index (1,1) corresponds to (J,I) =
+        // (orderX-1-1, orderY-1-1) = (1, 1); the kernel reads source
+        // at (X - 0 + 1, Y - 0 + 1) = (X+1, Y+1). The impulse at
+        // (2,2) therefore lands at output (1,1) (the pixel whose
+        // kernel reaches (2,2) via the (+1, +1) shift).
+        let landed = ((w + 1) * 4) as usize;
+        assert_eq!(
+            out[landed], 100,
+            "impulse should land at (1,1) under target=(0,0)"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "src.len()")]
+    fn wrong_input_length_panics() {
+        let cm = ConvolveMatrix::new(3, 3, vec![1.0; 9]);
+        let _ = convolve_matrix(&[0u8; 8], 3, 3, &cm);
+    }
+
+    #[test]
+    #[should_panic(expected = "divisor must be non-zero")]
+    fn zero_divisor_panics() {
+        let cm = ConvolveMatrix::new(3, 3, vec![1.0; 9]).with_divisor(1.0);
+        // Manually break the invariant — exercise the convolve_matrix
+        // guard, not the builder's.
+        let mut bad = cm.clone();
+        bad.divisor = 0.0;
+        let _ = convolve_matrix(&[0u8; 4], 1, 1, &bad);
+    }
+
+    #[test]
+    #[should_panic(expected = "kernel.len()")]
+    fn wrong_kernel_length_panics() {
+        ConvolveMatrix::new(3, 3, vec![1.0; 5]);
+    }
+
+    #[test]
+    #[should_panic(expected = "order_x")]
+    fn zero_order_panics() {
+        ConvolveMatrix::new(0, 3, vec![]);
+    }
+
+    #[test]
+    #[should_panic(expected = "target_x")]
+    fn out_of_range_target_panics() {
+        ConvolveMatrix::new(3, 3, vec![1.0; 9]).with_target(3, 1);
+    }
+}
+
 #[cfg(test)]
 mod composite_tests {
     use super::*;

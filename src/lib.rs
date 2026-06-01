@@ -104,10 +104,19 @@
 //!   `arithmetic` operator `result = k1·i1·i2 + k2·i1 + k3·i2 + k4`
 //!   (premultiplied, clamped to `[0, 1]`). Exposed as [`composite_filter`]
 //!   (with the typed-pixel wrapper [`composite_filter_pixels`]).
+//! * `<feConvolveMatrix>` (SVG 1.1 §15.13) general 2-D matrix
+//!   convolution on packed-RGBA. The spec formula `COLOR_{X,Y} =
+//!   (SUM SUM SOURCE · kernelMatrix[orderX-J-1, orderY-I-1]) /
+//!   divisor + bias` is applied verbatim, including the §15.13
+//!   180° kernel rotation. All three `edgeMode` policies (`duplicate`,
+//!   `wrap`, `none`) and both `preserveAlpha` settings are supported.
+//!   Exposed as [`convolve_matrix`] (with the typed-pixel wrapper
+//!   [`convolve_matrix_pixels`]), driven by a [`ConvolveMatrix`]
+//!   parameter block and [`ConvolveEdgeMode`] enum.
 //!
 //! Deferred to a later round:
 //!
-//! * remaining filters (drop shadow, feTurbulence, feConvolveMatrix,
+//! * remaining filters (drop shadow, feTurbulence,
 //!   feDisplacementMap, lighting),
 //! * `<pattern>` paints,
 //! * full ICC-tagged color-managed pipeline (the `linearRGB`
@@ -137,9 +146,10 @@ pub use composite::{composite_rgba_premultiplied, composite_rgba_premultiplied_b
 pub use fill::{rasterize_fill, AlphaMask};
 pub use filter::{
     color_matrix, color_matrix_op, color_matrix_pixels, component_transfer,
-    component_transfer_pixels, composite_filter, composite_filter_pixels, gaussian_blur,
-    gaussian_blur_pixels, morphology, morphology_pixels, ColorMatrix, ColorMatrixOp,
-    ComponentTransfer, CompositeOp, MorphologyOp, TransferFunc, GAUSSIAN_BLUR_BOX_THRESHOLD,
+    component_transfer_pixels, composite_filter, composite_filter_pixels, convolve_matrix,
+    convolve_matrix_pixels, gaussian_blur, gaussian_blur_pixels, morphology, morphology_pixels,
+    ColorMatrix, ColorMatrixOp, ComponentTransfer, CompositeOp, ConvolveEdgeMode, ConvolveMatrix,
+    MorphologyOp, TransferFunc, GAUSSIAN_BLUR_BOX_THRESHOLD,
 };
 pub use flatten::{flatten_arc_to_cubics, flatten_path, FlatContour};
 pub use gradient::{

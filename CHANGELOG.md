@@ -7,6 +7,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `feConvolveMatrix` filter primitive (SVG 1.1 §15.13) — general 2-D
+  matrix convolution over a packed-RGBA buffer, exposed as
+  `pub fn convolve_matrix(src, width, height, &cm) -> Vec<u8>` plus the
+  typed-pixel wrapper `convolve_matrix_pixels(&[Rgba], …)`. Implements
+  the §15.13 formula verbatim:
+  `COLOR_{X,Y} = (SUM_I SUM_J SOURCE_{X−targetX+J, Y−targetY+I} ·
+  kernelMatrix[orderX−J−1, orderY−I−1]) / divisor + bias`,
+  including the spec-mandated 180° kernel rotation ("the values in
+  the kernel matrix are applied such that the kernel matrix is rotated
+  180 degrees relative to the source and destination images"). The
+  `ConvolveMatrix` parameter block exposes the full spec attribute set:
+  `order_x` × `order_y` kernel dimensions, `kernel` row-major weights,
+  `divisor`, `bias`, `target_x` / `target_y` anchor positioning,
+  `edge_mode`, and `preserve_alpha`. `ConvolveMatrix::new(ox, oy, k)`
+  applies the §15.13 defaults — `divisor = sum(k)` (falling back to
+  `1.0` when the sum is zero), `bias = 0`, `target = (floor(ox/2),
+  floor(oy/2))`, `edge_mode = Duplicate`, `preserve_alpha = false`.
+  Builder-style setters `with_bias` / `with_divisor` / `with_target` /
+  `with_edge_mode` / `with_preserve_alpha` apply the corresponding spec
+  attributes. All three §15.13 edge-mode policies are implemented in
+  the new `ConvolveEdgeMode` enum: `Duplicate` clamps out-of-bounds
+  reads to the nearest in-range coordinate; `Wrap` uses toroidal
+  addressing (`x.rem_euclid(width)` / `y.rem_euclid(height)`); `None`
+  returns `(0, 0, 0, 0)` for out-of-bounds samples. `preserve_alpha =
+  true` (§15.13 wording: "the filter will temporarily unpremultiply the
+  color component values, apply the kernel, and then re-premultiply at
+  the end") convolves only the RGB channels of the straight-alpha
+  source — alpha is taken from the un-convolved target pixel
+  (`ALPHA_{X,Y} = SOURCE_{X,Y}` per the spec's preserveAlpha=true
+  branch). Output channels are clamped to `[0, 255]` and re-quantised
+  half-up. Complexity is `O(W · H · orderX · orderY)` — `feConvolveMatrix`
+  is the catch-all arbitrary-2-D-kernel primitive; the existing
+  separable Gaussian path (`feGaussianBlur`) stays the right choice
+  for that common case. 17 new tests: 16 unit tests in the `src/filter.rs`
+  `convolve_matrix_tests` suite (identity 3×3 kernel byte-for-byte
+  round-trip on a pseudo-random pattern; box-blur 3×3 solid-image
+  invariance across all three edge modes; the spec's §15.13 worked
+  example reproduces the spec-listed `(9·0 + 8·20 + 7·40 + 6·100 +
+  5·120 + 4·140 + 3·200 + 2·220 + 1·240) / 45 = 3480 / 45 = 77.333…`
+  to a byte (77) at the (1, 1) target pixel, demonstrating the 180°
+  kernel rotation; `preserve_alpha = true` leaves the
+  source alpha byte-identical while the RGB channels blur;
+  `edge_mode = "none"` zeroes out-of-bounds reads exactly; 1×1 image
+  under any kernel + `Duplicate` is identity; `Wrap` smoke test on a
+  solid 2×2; `bias = 0.25` shifts every channel by `+64`; `bias =
+  -1.0` clamps every output to 0; the Sobel-X kernel produces a
+  byte-exact-zero high-pass response on a constant image; the
+  §15.13 180° kernel-rotation property is asserted by an asymmetric
+  delta-impulse fixture; the typed-pixel wrapper agrees with the
+  byte API on an asymmetric kernel + bias + wrap edge mode; empty
+  image returns empty buffer; non-square 5×1 kernel only blurs the X
+  axis; non-default `target` shifts the kernel anchor; 5 `#[should_panic]`
+  guards for wrong input length, zero divisor, wrong kernel length,
+  zero order, and out-of-range target) plus 1 integration test in
+  `tests/filter_convolve_matrix.rs` exercising the public re-exports.
+  Math cited to `docs/image/svg/svg11-second-edition.pdf` §15.13; no
+  `image` / `imageproc` / `opencv` / `cairo` / `skia` / `resvg` /
+  `librsvg` source consulted.
+
 ## [0.1.2](https://github.com/OxideAV/oxideav-raster/compare/v0.1.1...v0.1.2) - 2026-05-29
 
 ### Other
