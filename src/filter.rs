@@ -66,11 +66,20 @@
 //!   `result = k1·i1·i2 + k2·i1 + k3·i2 + k4` on premultiplied channels,
 //!   clamped to `[0, 1]`. Selectable via [`CompositeOp`].
 //!
+//! * **Matrix convolution** — `feConvolveMatrix` from SVG 1.1 §15.13.
+//!   Applies an arbitrary `order_x × order_y` kernel to a packed-RGBA
+//!   buffer per the §15.13 formula
+//!   `COLOR_{X,Y} = (SUM SUM SOURCE · kernelMatrix[orderX-J-1,
+//!   orderY-I-1]) / divisor + bias`, including the spec-mandated 180°
+//!   kernel rotation. All three `edgeMode` policies (`duplicate` /
+//!   `wrap` / `none`) and both `preserveAlpha` settings are
+//!   implemented; `preserveAlpha = true` convolves RGB only and
+//!   passes alpha through unchanged.
+//!
 //! # Deferred
 //!
-//! Drop shadow (`feDropShadow`), `feConvolveMatrix`, `feTurbulence`
-//! (Perlin), `feDisplacementMap`, `feSpecularLighting`,
-//! `feDiffuseLighting`.
+//! Drop shadow (`feDropShadow`), `feTurbulence` (Perlin),
+//! `feDisplacementMap`, `feSpecularLighting`, `feDiffuseLighting`.
 //!
 //! # Wall provenance
 //!
@@ -92,8 +101,13 @@
 //! verbatim) and the §14.2 premultiplied simple-alpha-compositing
 //! algebra (`Cr' = (1 − Ea)·Cr + Er`) from which the Porter–Duff
 //! `over` / `in` / `out` / `atop` / `xor` blend-factor pairs are
-//! derived. No `image` / `imageproc` / `opencv` /
-//! `cairo` / `skia` / `resvg` / `librsvg` source consulted.
+//! derived. §15.13 for `feConvolveMatrix` (the per-pixel formula
+//! reproduced verbatim, the 180° kernel rotation called out
+//! explicitly, the three `edgeMode` policies — `duplicate` /
+//! `wrap` / `none` — and the `preserveAlpha = true` "convolve RGB
+//! only, pass alpha through" rule). No `image` / `imageproc` /
+//! `opencv` / `cairo` / `skia` / `resvg` / `librsvg` source
+//! consulted.
 
 use oxideav_core::Rgba;
 
