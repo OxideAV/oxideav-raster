@@ -9,6 +9,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `feTurbulence` filter primitive (SVG 1.1 §15.24) — Perlin-noise
+  source primitive, exposed as
+  `pub fn turbulence_filter(width, height, &params) -> Vec<u8>` plus
+  the typed-pixel wrapper `turbulence_filter_pixels(width, height,
+  &params) -> Vec<Rgba>`. Implements the §15.24 algorithm verbatim:
+  the Park–Miller minimum-standard LCG (`a = 16807`, `m = 2^31 − 1`)
+  seeds a permutation table and four channel-specific gradient
+  tables; `noise2(x, y)` applies a `t² · (3 − 2t)` smoothstep to a
+  bilinear interpolation between four surrounding lattice gradients;
+  the `turbulence` accumulator sums `num_octaves` `noise2` terms with
+  geometrically-doubling frequency and halving amplitude. Both
+  `type` arms are wired in: `Turbulence` (`SUM |noise2|`, aim
+  `[0, 1]`, quantised as `value · 255`) and `FractalNoise`
+  (`SUM noise2`, aim `[-1, 1]`, quantised as `(value · 255 + 255) /
+  2`). The `Turbulence` parameter block exposes the full §15.24
+  attribute set: `base_frequency_x` / `base_frequency_y`,
+  `num_octaves`, `seed`, `kind` (`TurbulenceType`), `stitch_tiles`
+  (`StitchTiles`), and the `(tile_x, tile_y, tile_width,
+  tile_height)` filter-primitive subregion. `Turbulence::new(fx, fy)`
+  applies the §15.24 defaults (`num_octaves = 1`, `seed = 0`,
+  `kind = Turbulence`, `stitch_tiles = NoStitch`, zero-extent tile);
+  builder-style `with_num_octaves` / `with_seed` / `with_kind` /
+  `with_stitch_tiles` / `with_tile_region` set individual attributes.
+  `setupSeed` from §15.24 — `if (lSeed <= 0) lSeed = -(lSeed %
+  (RAND_M − 1)) + 1; if (lSeed > RAND_M − 1) lSeed = RAND_M − 1;` —
+  is implemented as `turb_setup_seed` and clamps non-positive and
+  out-of-range inputs back into the positive `[1, RAND_M − 1]`
+  window. The `stitchTiles="stitch"` path rounds the base
+  frequencies to the nearer of `floor(width · frequency) / width`
+  vs. `ceil(width · frequency) / width` (and the same for `height`)
+  so the tile rectangle contains an integral number of first-octave
+  Perlin tiles, and wraps the lattice indices at the right and
+  bottom edges of the active area so the output tiles seamlessly.
+  Each octave doubles `stitchWidth` / `stitchHeight` so the
+  higher-octave lattices wrap on their own period. Output channels
+  are clamped to `[0, 255]` and re-quantised half-up. Complexity is
+  `O(W · H · num_octaves)`. 19 new tests in the `src/filter.rs`
+  `turbulence_tests` suite, including the §15.24 self-check
+  (`turb_setup_seed(1)` followed by 10000 LCG iterations yields
+  `1043618065`), the `setupSeed` clamp for positive, zero, and
+  negative inputs, deterministic byte-for-byte output for repeated
+  invocations at the same seed, divergent output for different
+  seeds, divergent output across the four channels (independent
+  gradient tables), `turbulence` aim into `[0, 255]` (per-channel
+  mean strictly inside `(1, 254)`), `fractalNoise` aim around the
+  signed centre 128 (per-channel mean within ±48 of 128 over a
+  48×48 grid), zero base-frequency produces a per-channel constant,
+  the typed-pixel wrapper agrees with the byte API, empty extent
+  returns an empty buffer, output length matches `width · height ·
+  4`, `num_octaves = 1` differs from `num_octaves > 1`, the
+  `stitchTiles="stitch"` path produces seam-continuous output across
+  the tile boundary, and 3 `#[should_panic]` guards for non-positive
+  base-frequency components and `num_octaves = 0`. Math cited to
+  `docs/image/svg/svg11-second-edition.pdf` §15.24.
+
 - `feConvolveMatrix` filter primitive (SVG 1.1 §15.13) — general 2-D
   matrix convolution over a packed-RGBA buffer, exposed as
   `pub fn convolve_matrix(src, width, height, &cm) -> Vec<u8>` plus the

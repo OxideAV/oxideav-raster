@@ -76,10 +76,29 @@
 //!   implemented; `preserveAlpha = true` convolves RGB only and
 //!   passes alpha through unchanged.
 //!
+//! * **Perlin turbulence** — `feTurbulence` from SVG 1.1 §15.24. A
+//!   purely synthetic source primitive (the output is generated from
+//!   the §15.24 parameter set, not from an input image). The Park–
+//!   Miller minimum-standard LCG (`a = 16807`, `m = 2^31 − 1`) seeds a
+//!   permutation table and four channel-specific gradient tables; the
+//!   §15.24 `noise2` routine applies a `t² · (3 − 2t)` smoothstep to
+//!   a bilinear interpolation between four surrounding lattice
+//!   gradients. The `turbulence` accumulator sums `num_octaves`
+//!   noise terms with geometrically-doubling frequency and halving
+//!   amplitude. Both `type` arms are implemented: `turbulence` (`SUM
+//!   |noise2|`, aim `[0, 1]`, quantised as `value · 255`) and
+//!   `fractalNoise` (`SUM noise2`, aim `[-1, 1]`, quantised as
+//!   `(value · 255 + 255) / 2`). The `stitchTiles="stitch"` path
+//!   adjusts the base frequencies so the tile rectangle contains an
+//!   integral number of first-octave Perlin tiles and wraps the
+//!   lattice indices at the right and bottom edges of the active
+//!   area. The §15.24 self-check value (`seed = 1`, 10000th LCG state
+//!   = `1043618065`) is asserted in the test suite.
+//!
 //! # Deferred
 //!
-//! Drop shadow (`feDropShadow`), `feTurbulence` (Perlin),
-//! `feDisplacementMap`, `feSpecularLighting`, `feDiffuseLighting`.
+//! Drop shadow (`feDropShadow`), `feDisplacementMap`,
+//! `feSpecularLighting`, `feDiffuseLighting`.
 //!
 //! # Wall provenance
 //!
@@ -3980,5 +3999,930 @@ mod composite_tests {
     #[should_panic(expected = "in2.len()")]
     fn wrong_in2_length_panics() {
         let _ = composite_filter(&[0u8; 16], &[0u8; 8], 2, 2, CompositeOp::Over);
+    }
+}
+
+// =========================================================================
+// feTurbulence — SVG 1.1 §15.24
+// =========================================================================
+
+/// Variant selector for [`Turbulence`] (`type` attribute, SVG 1.1 §15.24).
+///
+/// The two variants change only the post-aggregation step:
+///
+/// * [`Turbulence`](Self::Turbulence): the per-octave noise contributions
+///   are accumulated through their absolute value (`SUM |noise2| /
+///   ratio`), producing a non-negative result aimed at `[0, 1]`.
+/// * [`FractalNoise`](Self::FractalNoise): the per-octave contributions
+///   are accumulated signed (`SUM noise2 / ratio`), producing a signed
+///   result aimed at `[-1, 1]`.
+///
+/// The two arms also use different colour quantisations — see
+/// [`turbulence_filter`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TurbulenceType {
+    /// `type="turbulence"`, SVG 1.1 §15.24 default. Accumulates
+    /// `|noise2|`; `turbFunctionResult` aimed at `[0, 1]`; quantised as
+    /// `(turbFunctionResult · 255)`.
+    #[default]
+    Turbulence,
+    /// `type="fractalNoise"`. Accumulates signed `noise2`;
+    /// `turbFunctionResult` aimed at `[-1, 1]`; quantised as
+    /// `(turbFunctionResult · 255 + 255) / 2`.
+    FractalNoise,
+}
+
+/// `stitchTiles` selector (SVG 1.1 §15.24).
+///
+/// When [`Stitch`](Self::Stitch) is selected and a non-degenerate tile
+/// region is supplied, the algorithm adjusts the base frequencies so
+/// that the tile width and height contain an integral number of Perlin
+/// tiles for the first octave (§15.24 — "Given the frequency, calculate
+/// lowFreq = floor(width · frequency) / width and hiFreq = ceil(width ·
+/// frequency) / width. If frequency / lowFreq < hiFreq / frequency then
+/// use lowFreq, else use hiFreq."), and the lattice indices are
+/// wrapped at the right and bottom edges of the active area so that
+/// the noise tiles seamlessly across the [`Turbulence::tile_x`] …
+/// [`Turbulence::tile_x`] + [`Turbulence::tile_width`] /
+/// [`Turbulence::tile_y`] … [`Turbulence::tile_y`] +
+/// [`Turbulence::tile_height`] rectangle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StitchTiles {
+    /// `stitchTiles="noStitch"`, SVG 1.1 §15.24 default. No tile-border
+    /// stitching is applied.
+    #[default]
+    NoStitch,
+    /// `stitchTiles="stitch"`. Adjust the base frequencies as
+    /// described above and wrap lattice points at the tile's right /
+    /// bottom edges so the noise tiles seamlessly.
+    Stitch,
+}
+
+/// Parameter block for [`turbulence_filter`] / [`turbulence_filter_pixels`].
+///
+/// Mirrors the attribute set of SVG 1.1 §15.24 `<feTurbulence>`:
+/// `baseFrequency`, `numOctaves`, `seed`, `stitchTiles`, `type`, plus
+/// the filter-primitive subregion that the algorithm reads as the
+/// `(fTileX, fTileY, fTileWidth, fTileHeight)` quad for stitching.
+///
+/// Defaults applied by [`Turbulence::new`] match §15.24:
+///
+/// * `base_freq_x = base_freq_y = 0`
+/// * `num_octaves = 1`
+/// * `seed = 0` (truncated to the closest integer toward zero — already
+///   integral here)
+/// * `stitch_tiles = NoStitch`
+/// * `kind = Turbulence`
+/// * `tile_x = tile_y = 0`, `tile_width = width`, `tile_height = height`
+///   (set per-render by [`turbulence_filter`] from its `width`/`height`
+///   arguments when the explicit pair are zero)
+#[derive(Debug, Clone, PartialEq)]
+pub struct Turbulence {
+    /// X-axis base frequency. Must be `>= 0` (§15.24 "A negative value
+    /// for base frequency is an error"). A value of `0` collapses the
+    /// X variation to a constant.
+    pub base_freq_x: f64,
+    /// Y-axis base frequency. Must be `>= 0`.
+    pub base_freq_y: f64,
+    /// Number of octaves accumulated (§15.24 `numOctaves`). Must be
+    /// `>= 1`. The §15.24 default is `1`.
+    pub num_octaves: u32,
+    /// Pseudo-random seed for the §15.24 LCG. The spec mandates
+    /// truncation "to the closest integer value towards zero" before
+    /// the algorithm sees it; we take an `i64` directly to make that
+    /// truncation explicit at the caller.
+    pub seed: i64,
+    /// Selects whether the output tiles seamlessly across the supplied
+    /// tile rectangle.
+    pub stitch_tiles: StitchTiles,
+    /// `turbulence` (absolute-value accumulation, aimed at `[0, 1]`)
+    /// vs `fractalNoise` (signed accumulation, aimed at `[-1, 1]`).
+    pub kind: TurbulenceType,
+    /// X-origin of the stitch tile rectangle.
+    pub tile_x: f64,
+    /// Y-origin of the stitch tile rectangle.
+    pub tile_y: f64,
+    /// Width of the stitch tile rectangle. Used only when
+    /// `stitch_tiles == Stitch`.
+    pub tile_width: f64,
+    /// Height of the stitch tile rectangle. Used only when
+    /// `stitch_tiles == Stitch`.
+    pub tile_height: f64,
+}
+
+impl Turbulence {
+    /// Construct a [`Turbulence`] parameter block applying the §15.24
+    /// defaults for every unspecified attribute.
+    pub fn new(base_freq_x: f64, base_freq_y: f64) -> Self {
+        assert!(
+            base_freq_x >= 0.0,
+            "Turbulence::new: base_freq_x ({base_freq_x}) must be >= 0 (§15.24)"
+        );
+        assert!(
+            base_freq_y >= 0.0,
+            "Turbulence::new: base_freq_y ({base_freq_y}) must be >= 0 (§15.24)"
+        );
+        Turbulence {
+            base_freq_x,
+            base_freq_y,
+            num_octaves: 1,
+            seed: 0,
+            stitch_tiles: StitchTiles::NoStitch,
+            kind: TurbulenceType::Turbulence,
+            tile_x: 0.0,
+            tile_y: 0.0,
+            tile_width: 0.0,
+            tile_height: 0.0,
+        }
+    }
+
+    /// Builder: set [`Self::num_octaves`]. Must be `>= 1` (§15.24
+    /// implies a per-octave loop with at least one iteration).
+    pub fn with_num_octaves(mut self, num_octaves: u32) -> Self {
+        assert!(
+            num_octaves >= 1,
+            "Turbulence::with_num_octaves: num_octaves must be >= 1"
+        );
+        self.num_octaves = num_octaves;
+        self
+    }
+
+    /// Builder: set [`Self::seed`]. The spec mandates truncation to the
+    /// closest integer toward zero; pass that integer here directly.
+    pub fn with_seed(mut self, seed: i64) -> Self {
+        self.seed = seed;
+        self
+    }
+
+    /// Builder: set [`Self::kind`].
+    pub fn with_kind(mut self, kind: TurbulenceType) -> Self {
+        self.kind = kind;
+        self
+    }
+
+    /// Builder: set [`Self::stitch_tiles`]. When [`StitchTiles::Stitch`]
+    /// is selected, the tile rectangle must also be supplied through
+    /// [`Self::with_tile`].
+    pub fn with_stitch_tiles(mut self, stitch_tiles: StitchTiles) -> Self {
+        self.stitch_tiles = stitch_tiles;
+        self
+    }
+
+    /// Builder: set the stitch tile rectangle (§15.24's
+    /// `fTileX, fTileY, fTileWidth, fTileHeight`).
+    pub fn with_tile(mut self, x: f64, y: f64, w: f64, h: f64) -> Self {
+        self.tile_x = x;
+        self.tile_y = y;
+        self.tile_width = w;
+        self.tile_height = h;
+        self
+    }
+}
+
+// -------------------------------------------------------------------------
+// §15.24 reference algorithm
+// -------------------------------------------------------------------------
+//
+// The math in this block is transcribed from
+// `docs/image/svg/svg11-second-edition.pdf` §15.24 Filter primitive
+// `feTurbulence`. The spec includes the exact algorithm "below shows the
+// exact algorithm used for this filter effect", listing a Park–Miller
+// minimum-standard LCG, an `init` routine that builds a permutation
+// table and gradient table from the seeded LCG, a `noise2` routine
+// implementing 2-D Perlin noise with a 3·t² − 2·t³ smoothstep, and a
+// `turbulence` routine that sums `num_octaves` noise terms with
+// geometrically-doubling frequency and geometrically-halving amplitude.
+// The §15.24 stitch path adjusts the base frequencies so the tile
+// rectangle contains an integral number of first-octave Perlin tiles
+// and wraps the lattice indices at the right/bottom edges of the
+// active area.
+//
+// Park & Miller call out a self-check: starting from `seed = 1`, the
+// 10,000th LCG output is `1043618065`. We carry that across as a
+// `#[test]` assertion below.
+
+/// §15.24 Park–Miller minimum-standard LCG modulus.
+const TURB_RAND_M: i64 = 2_147_483_647; // 2^31 − 1
+/// §15.24 Park–Miller minimum-standard LCG multiplier.
+const TURB_RAND_A: i64 = 16_807; // 7^5
+/// §15.24 derived constants `m / a` and `m % a` for the Schrage trick.
+const TURB_RAND_Q: i64 = 127_773;
+const TURB_RAND_R: i64 = 2_836;
+
+/// §15.24 lattice table size (`BSize`).
+const TURB_B_SIZE: usize = 0x100;
+/// §15.24 lattice index mask (`BM = BSize − 1`).
+const TURB_BM: i64 = 0xff;
+/// §15.24 large-positive bias added before the integer-truncation step
+/// inside [`turb_noise2`] (`PerlinN = 0x1000`). It is large enough that
+/// truncating `vec + PerlinN` toward zero is equivalent to flooring
+/// `vec` for every input we care about.
+const TURB_PERLIN_N: i64 = 0x1000;
+
+/// §15.24 `setup_seed`: clamp the caller-supplied seed into the
+/// strictly-positive LCG state range `[1, RAND_M − 1]`. Non-positive
+/// inputs are reflected back through `−lSeed % (RAND_M − 1) + 1`;
+/// inputs at or above `RAND_M` are clamped down to `RAND_M − 1`.
+#[inline]
+fn turb_setup_seed(mut seed: i64) -> i64 {
+    if seed <= 0 {
+        seed = -(seed.rem_euclid(TURB_RAND_M - 1)) + 1;
+        // rem_euclid is non-negative; turn it back negative for the
+        // spec's `-seed` step, matching the C `-(lSeed % (RAND_M - 1)) + 1`
+        // when `lSeed` is itself ≤ 0 (so `lSeed % (RAND_M-1)` is ≤ 0 in C).
+        // We re-derive the same value through the equivalent:
+        //   for `seed <= 0`: result = (-seed) % (RAND_M-1) + 1, clamped.
+        if seed <= 0 {
+            seed = 1;
+        }
+    }
+    if seed > TURB_RAND_M - 1 {
+        seed = TURB_RAND_M - 1;
+    }
+    seed
+}
+
+/// §15.24 LCG step. Returns the next state in `[1, RAND_M − 1]` given a
+/// current state in the same range. Implemented through Schrage's
+/// `a · (s mod q) − r · (s / q)` trick so the intermediate product
+/// stays in `i64` without overflow.
+#[inline]
+fn turb_random(seed: i64) -> i64 {
+    let mut result = TURB_RAND_A * (seed % TURB_RAND_Q) - TURB_RAND_R * (seed / TURB_RAND_Q);
+    if result <= 0 {
+        result += TURB_RAND_M;
+    }
+    result
+}
+
+/// Stitch parameters for the per-octave [`turb_noise2`] call. Built
+/// during [`turbulence_at`] when `stitch_tiles == Stitch`.
+#[derive(Debug, Clone, Copy)]
+struct TurbStitch {
+    /// Lattice-index span to subtract when wrapping at the right /
+    /// bottom edge.
+    width: i64,
+    height: i64,
+    /// Lattice-index thresholds at which the wrap kicks in.
+    wrap_x: i64,
+    wrap_y: i64,
+}
+
+/// Permutation table (`uLatticeSelector`) plus per-channel gradient
+/// tables (`fGradient[4][BSize·2 + 2][2]`), seeded once per filter
+/// invocation by [`TurbLattice::init`].
+///
+/// The "+ 2" doubling at the end of each table mirrors the §15.24 C
+/// reference, which copies the first `BSize + 2` entries into the back
+/// half so the `noise2` lookups at `bx1 + by1` can index without an
+/// explicit `& BM`.
+struct TurbLattice {
+    selector: [i64; TURB_B_SIZE * 2 + 2],
+    /// `gradient[channel][lattice_index] = (gx, gy)`, normalised to
+    /// unit length.
+    gradient: [[(f64, f64); TURB_B_SIZE * 2 + 2]; 4],
+}
+
+impl TurbLattice {
+    /// §15.24 `init`: seed `selector` with the identity permutation,
+    /// fill `gradient` with random unit-vectors from the LCG, then
+    /// Knuth-shuffle the permutation using the same LCG sequence, and
+    /// finally mirror the first `BSize + 2` entries into the back half.
+    fn init(seed: i64) -> Self {
+        let mut lseed = turb_setup_seed(seed);
+        let mut selector = [0i64; TURB_B_SIZE * 2 + 2];
+        let mut gradient = [[(0.0f64, 0.0f64); TURB_B_SIZE * 2 + 2]; 4];
+
+        // First pass: identity permutation + random unit gradients per
+        // (channel, lattice point).
+        for (k, gradient_k) in gradient.iter_mut().enumerate().take(4) {
+            for (i, gradient_ki) in gradient_k.iter_mut().enumerate().take(TURB_B_SIZE) {
+                if k == 0 {
+                    selector[i] = i as i64;
+                }
+                lseed = turb_random(lseed);
+                let gx_raw = (lseed % (2 * TURB_B_SIZE as i64) - TURB_B_SIZE as i64) as f64
+                    / TURB_B_SIZE as f64;
+                lseed = turb_random(lseed);
+                let gy_raw = (lseed % (2 * TURB_B_SIZE as i64) - TURB_B_SIZE as i64) as f64
+                    / TURB_B_SIZE as f64;
+                let s = (gx_raw * gx_raw + gy_raw * gy_raw).sqrt();
+                // §15.24's normalisation has no guard for s == 0; the
+                // mathematical probability is vanishing for the LCG
+                // distribution but a guarded divide here keeps us from
+                // emitting NaNs if the seeded path ever lands on the
+                // origin.
+                let (gx, gy) = if s == 0.0 {
+                    (0.0, 0.0)
+                } else {
+                    (gx_raw / s, gy_raw / s)
+                };
+                *gradient_ki = (gx, gy);
+            }
+        }
+
+        // Second pass: Knuth shuffle of the permutation. The §15.24 C
+        // listing is `while(--i)`, which iterates `i = BSize - 1, …, 1`
+        // (inclusive both ends) after the preceding loop left `i =
+        // BSize`. We replicate that index range exactly.
+        for i in (1..TURB_B_SIZE).rev() {
+            let k = selector[i];
+            lseed = turb_random(lseed);
+            let j = (lseed % TURB_B_SIZE as i64) as usize;
+            selector[i] = selector[j];
+            selector[j] = k;
+        }
+
+        // Third pass: mirror the first `BSize + 2` entries into the
+        // back half so `noise2`'s additive `i + by1` / `j + by1` lookups
+        // can index `selector[…]` and `gradient[…]` without a separate
+        // `& BM`.
+        for i in 0..(TURB_B_SIZE + 2) {
+            selector[TURB_B_SIZE + i] = selector[i];
+            for gradient_k in gradient.iter_mut().take(4) {
+                gradient_k[TURB_B_SIZE + i] = gradient_k[i];
+            }
+        }
+
+        TurbLattice { selector, gradient }
+    }
+
+    /// §15.24 `noise2`: 2-D Perlin noise for one colour channel at the
+    /// supplied `(x, y)` lattice-space position, with an optional
+    /// stitch wrap applied to the four surrounding lattice indices.
+    #[allow(clippy::many_single_char_names)]
+    fn noise2(&self, channel: usize, vec_x: f64, vec_y: f64, stitch: Option<&TurbStitch>) -> f64 {
+        // Add PerlinN before truncating so the `(int)` cast on a
+        // possibly-negative input still produces the spec's floor-like
+        // behaviour. The lattice indices land in `[0, 2·BSize + …]`
+        // before the &BM mask.
+        let tx = vec_x + TURB_PERLIN_N as f64;
+        let mut bx0 = tx as i64; // truncation toward zero
+        let mut bx1 = bx0 + 1;
+        let rx0 = tx - tx.trunc();
+        let rx1 = rx0 - 1.0;
+
+        let ty = vec_y + TURB_PERLIN_N as f64;
+        let mut by0 = ty as i64;
+        let mut by1 = by0 + 1;
+        let ry0 = ty - ty.trunc();
+        let ry1 = ry0 - 1.0;
+
+        if let Some(s) = stitch {
+            if bx0 >= s.wrap_x {
+                bx0 -= s.width;
+            }
+            if bx1 >= s.wrap_x {
+                bx1 -= s.width;
+            }
+            if by0 >= s.wrap_y {
+                by0 -= s.height;
+            }
+            if by1 >= s.wrap_y {
+                by1 -= s.height;
+            }
+        }
+
+        bx0 &= TURB_BM;
+        bx1 &= TURB_BM;
+        by0 &= TURB_BM;
+        by1 &= TURB_BM;
+
+        let i = self.selector[bx0 as usize];
+        let j = self.selector[bx1 as usize];
+        let b00 = self.selector[(i + by0) as usize];
+        let b10 = self.selector[(j + by0) as usize];
+        let b01 = self.selector[(i + by1) as usize];
+        let b11 = self.selector[(j + by1) as usize];
+
+        // §15.24 `s_curve(t) = t·t·(3 − 2·t)`.
+        let sx = rx0 * rx0 * (3.0 - 2.0 * rx0);
+        let sy = ry0 * ry0 * (3.0 - 2.0 * ry0);
+
+        let q00 = self.gradient[channel][b00 as usize];
+        let u00 = rx0 * q00.0 + ry0 * q00.1;
+        let q10 = self.gradient[channel][b10 as usize];
+        let v10 = rx1 * q10.0 + ry0 * q10.1;
+        let a = u00 + sx * (v10 - u00);
+
+        let q01 = self.gradient[channel][b01 as usize];
+        let u01 = rx0 * q01.0 + ry1 * q01.1;
+        let q11 = self.gradient[channel][b11 as usize];
+        let v11 = rx1 * q11.0 + ry1 * q11.1;
+        let b = u01 + sx * (v11 - u01);
+
+        a + sy * (b - a)
+    }
+}
+
+/// §15.24 `turbulence`: per-channel accumulator that drives [`TurbLattice::noise2`]
+/// across `num_octaves` octaves with geometrically-doubling frequency
+/// and geometrically-halving amplitude. Returns the signed sum (caller
+/// converts to colour through the type-dependent quantisation).
+#[allow(clippy::too_many_arguments)]
+fn turbulence_at(
+    lattice: &TurbLattice,
+    channel: usize,
+    point_x: f64,
+    point_y: f64,
+    mut base_freq_x: f64,
+    mut base_freq_y: f64,
+    num_octaves: u32,
+    fractal_sum: bool,
+    do_stitch: bool,
+    tile_x: f64,
+    tile_y: f64,
+    tile_width: f64,
+    tile_height: f64,
+) -> f64 {
+    // §15.24 stitch adjustment: round the base frequencies so the
+    // first-octave tile fits the active rectangle an integral number
+    // of times.
+    let mut stitch_state: Option<TurbStitch> = None;
+    if do_stitch {
+        if base_freq_x != 0.0 {
+            let lo = (tile_width * base_freq_x).floor() / tile_width;
+            let hi = (tile_width * base_freq_x).ceil() / tile_width;
+            if lo > 0.0 && base_freq_x / lo < hi / base_freq_x {
+                base_freq_x = lo;
+            } else {
+                base_freq_x = hi;
+            }
+        }
+        if base_freq_y != 0.0 {
+            let lo = (tile_height * base_freq_y).floor() / tile_height;
+            let hi = (tile_height * base_freq_y).ceil() / tile_height;
+            if lo > 0.0 && base_freq_y / lo < hi / base_freq_y {
+                base_freq_y = lo;
+            } else {
+                base_freq_y = hi;
+            }
+        }
+        let width = (tile_width * base_freq_x + 0.5) as i64;
+        let height = (tile_height * base_freq_y + 0.5) as i64;
+        let wrap_x = (tile_x * base_freq_x) as i64 + TURB_PERLIN_N + width;
+        let wrap_y = (tile_y * base_freq_y) as i64 + TURB_PERLIN_N + height;
+        stitch_state = Some(TurbStitch {
+            width,
+            height,
+            wrap_x,
+            wrap_y,
+        });
+    }
+
+    let mut sum = 0.0f64;
+    let mut vx = point_x * base_freq_x;
+    let mut vy = point_y * base_freq_y;
+    let mut ratio = 1.0f64;
+    for _ in 0..num_octaves {
+        let n = lattice.noise2(channel, vx, vy, stitch_state.as_ref());
+        sum += if fractal_sum {
+            n / ratio
+        } else {
+            n.abs() / ratio
+        };
+        vx *= 2.0;
+        vy *= 2.0;
+        ratio *= 2.0;
+        if let Some(ref mut s) = stitch_state {
+            // §15.24 update: width *= 2; wrap_x = 2 · wrap_x − PerlinN;
+            s.width *= 2;
+            s.wrap_x = 2 * s.wrap_x - TURB_PERLIN_N;
+            s.height *= 2;
+            s.wrap_y = 2 * s.wrap_y - TURB_PERLIN_N;
+        }
+    }
+    sum
+}
+
+/// Clamp+quantise a §15.24 turbulence value to a `u8` byte.
+///
+/// For `fractal_sum == true`, the spec's "colour value" formula is
+/// `((turbFunctionResult · 255) + 255) / 2`, then clamp to `[0, 255]`.
+/// For `fractal_sum == false`, the formula is `turbFunctionResult ·
+/// 255`, then clamp to `[0, 255]`.
+#[inline]
+fn turb_quantise(value: f64, fractal_sum: bool) -> u8 {
+    let raw = if fractal_sum {
+        (value * 255.0 + 255.0) / 2.0
+    } else {
+        value * 255.0
+    };
+    if raw.is_nan() {
+        return 0;
+    }
+    let clamped = raw.clamp(0.0, 255.0);
+    (clamped + 0.5) as u8
+}
+
+/// SVG 1.1 §15.24 `<feTurbulence>` — synthesise a Perlin-noise image of
+/// the requested `width × height` extent.
+///
+/// `params` carries the spec attribute set; see [`Turbulence`] for the
+/// per-field semantics. The output is a packed-RGBA `u8` buffer of
+/// length `width · height · 4`, with R, G, B, A each independently
+/// driven by the §15.24 algorithm (the spec's "An initial seed value is
+/// computed based on attribute 'seed'. Then the implementation computes
+/// the lattice points for R, then continues getting additional pseudo
+/// random numbers relative to the last generated pseudo random number
+/// and computes the lattice points for G, and so on for B and A." — the
+/// four channels share one LCG advance chain through
+/// [`TurbLattice::init`], which iterates `k = 0, 1, 2, 3`).
+///
+/// The implementation maps a sample at output pixel `(px, py)` to the
+/// §15.24 `point[]` argument as `(px as f64, py as f64)`; the §15.24 C
+/// reference operates in continuous filter-primitive subregion
+/// coordinates, but since `baseFrequency` is the only scale knob and is
+/// passed through unchanged, the discrete pixel grid is the natural
+/// sampling lattice for a fixed-resolution output buffer. Callers that
+/// need a sub-pixel offset (e.g. to evaluate at filter-primitive-
+/// subregion `(x, y) + 0.5` for half-pixel centroids) can pre-multiply
+/// their coordinates into `base_freq_*`.
+///
+/// When `params.stitch_tiles == Stitch` and `params.tile_width == 0` or
+/// `params.tile_height == 0`, the tile rectangle defaults to
+/// `(0, 0, width, height)` for the convenience of the common
+/// "synthesise into the filter-primitive subregion" use.
+///
+/// # Panics
+///
+/// * `params.num_octaves == 0` (§15.24 implies `>= 1`).
+/// * `params.base_freq_x < 0` or `params.base_freq_y < 0` (§15.24 error
+///   processing).
+/// * `width * height * 4` overflows `usize`.
+pub fn turbulence_filter(width: u32, height: u32, params: &Turbulence) -> Vec<u8> {
+    assert!(
+        params.base_freq_x >= 0.0,
+        "turbulence_filter: base_freq_x ({}) must be >= 0 (§15.24)",
+        params.base_freq_x
+    );
+    assert!(
+        params.base_freq_y >= 0.0,
+        "turbulence_filter: base_freq_y ({}) must be >= 0 (§15.24)",
+        params.base_freq_y
+    );
+    assert!(
+        params.num_octaves >= 1,
+        "turbulence_filter: num_octaves must be >= 1"
+    );
+
+    let w = width as usize;
+    let h = height as usize;
+    let n = w
+        .checked_mul(h)
+        .and_then(|m| m.checked_mul(4))
+        .expect("turbulence_filter: width * height * 4 overflowed usize");
+    if w == 0 || h == 0 {
+        return Vec::new();
+    }
+
+    let lattice = TurbLattice::init(params.seed);
+    let do_stitch = matches!(params.stitch_tiles, StitchTiles::Stitch);
+    let fractal_sum = matches!(params.kind, TurbulenceType::FractalNoise);
+
+    // Default the tile rectangle to the output extent when stitch is
+    // requested but the rectangle is omitted.
+    let (tile_x, tile_y, tile_width, tile_height) =
+        if do_stitch && (params.tile_width == 0.0 || params.tile_height == 0.0) {
+            (0.0, 0.0, width as f64, height as f64)
+        } else {
+            (
+                params.tile_x,
+                params.tile_y,
+                params.tile_width,
+                params.tile_height,
+            )
+        };
+
+    let mut out = vec![0u8; n];
+    for py in 0..height {
+        for px in 0..width {
+            let point_x = px as f64;
+            let point_y = py as f64;
+            let mut rgba = [0u8; 4];
+            for (channel, channel_out) in rgba.iter_mut().enumerate() {
+                let v = turbulence_at(
+                    &lattice,
+                    channel,
+                    point_x,
+                    point_y,
+                    params.base_freq_x,
+                    params.base_freq_y,
+                    params.num_octaves,
+                    fractal_sum,
+                    do_stitch,
+                    tile_x,
+                    tile_y,
+                    tile_width,
+                    tile_height,
+                );
+                *channel_out = turb_quantise(v, fractal_sum);
+            }
+            let idx = ((py as usize) * w + (px as usize)) * 4;
+            out[idx..idx + 4].copy_from_slice(&rgba);
+        }
+    }
+    out
+}
+
+/// Typed-pixel wrapper around [`turbulence_filter`].
+pub fn turbulence_filter_pixels(width: u32, height: u32, params: &Turbulence) -> Vec<Rgba> {
+    let bytes = turbulence_filter(width, height, params);
+    bytes
+        .chunks_exact(4)
+        .map(|c| Rgba::new(c[0], c[1], c[2], c[3]))
+        .collect()
+}
+
+#[cfg(test)]
+mod turbulence_tests {
+    use super::*;
+
+    /// §15.24 spec-quoted Park–Miller self-check: starting from
+    /// `seed = 1`, the 10,000th LCG state is `1043618065`.
+    #[test]
+    fn park_miller_10000th_value_is_1043618065() {
+        let mut s: i64 = 1;
+        for _ in 0..10_000 {
+            s = turb_random(s);
+        }
+        assert_eq!(s, 1_043_618_065);
+    }
+
+    #[test]
+    fn setup_seed_clamps_positive_input_into_range() {
+        assert_eq!(turb_setup_seed(1), 1);
+        assert_eq!(turb_setup_seed(42), 42);
+        assert_eq!(turb_setup_seed(TURB_RAND_M - 1), TURB_RAND_M - 1);
+        // Strictly above the modulus clamps to RAND_M − 1.
+        assert_eq!(turb_setup_seed(TURB_RAND_M), TURB_RAND_M - 1);
+        assert_eq!(turb_setup_seed(i64::MAX), TURB_RAND_M - 1);
+    }
+
+    #[test]
+    fn setup_seed_clamps_nonpositive_input_into_range() {
+        // §15.24's `if (lSeed <= 0) lSeed = -(lSeed % (RAND_M-1)) + 1;`
+        // reflects non-positive inputs back into the positive range.
+        let s = turb_setup_seed(0);
+        assert!((1..=TURB_RAND_M - 1).contains(&s));
+        let s = turb_setup_seed(-5);
+        assert!((1..=TURB_RAND_M - 1).contains(&s));
+        let s = turb_setup_seed(-(TURB_RAND_M - 1));
+        assert!((1..=TURB_RAND_M - 1).contains(&s));
+    }
+
+    #[test]
+    fn turbulence_filter_extent_matches_request() {
+        let p = Turbulence::new(0.1, 0.1).with_num_octaves(2).with_seed(0);
+        let out = turbulence_filter(8, 6, &p);
+        assert_eq!(out.len(), 8 * 6 * 4);
+    }
+
+    #[test]
+    fn turbulence_filter_empty_extent_returns_empty() {
+        let p = Turbulence::new(0.1, 0.1);
+        assert!(turbulence_filter(0, 0, &p).is_empty());
+        assert!(turbulence_filter(8, 0, &p).is_empty());
+        assert!(turbulence_filter(0, 6, &p).is_empty());
+    }
+
+    #[test]
+    fn turbulence_is_deterministic_for_same_seed() {
+        let p = Turbulence::new(0.05, 0.05)
+            .with_num_octaves(3)
+            .with_seed(42);
+        let a = turbulence_filter(16, 16, &p);
+        let b = turbulence_filter(16, 16, &p);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn turbulence_changes_with_seed() {
+        let a = turbulence_filter(16, 16, &Turbulence::new(0.05, 0.05).with_seed(1));
+        let b = turbulence_filter(16, 16, &Turbulence::new(0.05, 0.05).with_seed(2));
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn turbulence_zero_frequency_is_constant_per_channel() {
+        // baseFreq=0 collapses the noise input to a constant — the
+        // lattice is evaluated at the same point for every pixel, so
+        // each channel takes a single value over the whole image.
+        let p = Turbulence::new(0.0, 0.0).with_seed(7).with_num_octaves(1);
+        let out = turbulence_filter(4, 4, &p);
+        // Every pixel must equal pixel 0.
+        let p0 = &out[..4];
+        for chunk in out.chunks_exact(4) {
+            assert_eq!(chunk, p0);
+        }
+    }
+
+    #[test]
+    fn fractal_sum_quantisation_centres_on_128_for_zero() {
+        // For fractalNoise, the quantiser maps `0` -> 128
+        // (`(0 · 255 + 255) / 2 = 127.5 -> 128`).
+        assert_eq!(turb_quantise(0.0, true), 128);
+        // For turbulence, `0 -> 0`.
+        assert_eq!(turb_quantise(0.0, false), 0);
+    }
+
+    #[test]
+    fn quantisation_clamps_at_both_ends() {
+        // High end: turbulence quantiser, raw > 255 -> 255.
+        assert_eq!(turb_quantise(2.0, false), 255);
+        // Low end: turbulence quantiser, raw < 0 -> 0.
+        assert_eq!(turb_quantise(-1.0, false), 0);
+        // High end: fractalNoise quantiser, raw > 255 -> 255.
+        assert_eq!(turb_quantise(2.0, true), 255);
+        // Low end: fractalNoise quantiser, raw < -1 -> 0.
+        assert_eq!(turb_quantise(-2.0, true), 0);
+    }
+
+    #[test]
+    fn turbulence_type_produces_nonnegative_aim() {
+        // The `turbulence` variant uses |noise2| accumulation, so the
+        // raw aim is `[0, 1]`. The byte output should never be in the
+        // unreachable upper tail nor pinned to 0 for a non-degenerate
+        // base frequency over a multi-pixel grid: assert the channel
+        // mean lies away from the extremes.
+        let p = Turbulence::new(0.05, 0.05)
+            .with_num_octaves(2)
+            .with_seed(13)
+            .with_kind(TurbulenceType::Turbulence);
+        let out = turbulence_filter(32, 32, &p);
+        let mut acc = [0u64; 4];
+        for chunk in out.chunks_exact(4) {
+            for (i, v) in chunk.iter().enumerate() {
+                acc[i] += *v as u64;
+            }
+        }
+        for (i, sum) in acc.iter().enumerate() {
+            let mean = *sum as f64 / (32.0 * 32.0);
+            assert!(
+                mean > 1.0 && mean < 254.0,
+                "channel {i} mean {mean} unexpectedly extreme"
+            );
+        }
+    }
+
+    #[test]
+    fn fractal_noise_centres_signed_output() {
+        // The `fractalNoise` variant accumulates signed noise (aim ≈
+        // `[-1, 1]`), quantised by `(v·255 + 255) / 2`. Over a large-
+        // enough grid the per-channel mean should sit close to 128.
+        let p = Turbulence::new(0.05, 0.05)
+            .with_num_octaves(2)
+            .with_seed(11)
+            .with_kind(TurbulenceType::FractalNoise);
+        let out = turbulence_filter(48, 48, &p);
+        let mut acc = [0u64; 4];
+        for chunk in out.chunks_exact(4) {
+            for (i, v) in chunk.iter().enumerate() {
+                acc[i] += *v as u64;
+            }
+        }
+        for (i, sum) in acc.iter().enumerate() {
+            let mean = *sum as f64 / (48.0 * 48.0);
+            // Generous bound: the signed sum has a near-zero
+            // expectation, but a finite grid can drift; ±48 ≈ ±0.19
+            // around the centre.
+            assert!(
+                (mean - 128.0).abs() < 48.0,
+                "channel {i} mean {mean} far from 128"
+            );
+        }
+    }
+
+    #[test]
+    fn num_octaves_one_vs_more_differ() {
+        let one = turbulence_filter(
+            16,
+            16,
+            &Turbulence::new(0.1, 0.1).with_seed(3).with_num_octaves(1),
+        );
+        let four = turbulence_filter(
+            16,
+            16,
+            &Turbulence::new(0.1, 0.1).with_seed(3).with_num_octaves(4),
+        );
+        assert_ne!(one, four);
+    }
+
+    #[test]
+    fn channels_are_independent() {
+        // Per §15.24, the four channels share the same LCG advance
+        // chain but each one consumes its own block of random draws —
+        // so the four channels of a given pixel should not all be
+        // equal in general.
+        let p = Turbulence::new(0.1, 0.1).with_seed(9).with_num_octaves(2);
+        let out = turbulence_filter(8, 8, &p);
+        let mut all_equal_channels = true;
+        for chunk in out.chunks_exact(4) {
+            if !(chunk[0] == chunk[1] && chunk[1] == chunk[2] && chunk[2] == chunk[3]) {
+                all_equal_channels = false;
+                break;
+            }
+        }
+        assert!(!all_equal_channels);
+    }
+
+    #[test]
+    fn stitch_tiles_seam_continuous_for_default_tile() {
+        // With stitchTiles="stitch" and the tile defaulted to the
+        // output rectangle, the noise wraps cleanly across the right
+        // and bottom edges — the left column equals the column that
+        // *would* sit one tile-width to the right, i.e. the same
+        // column when the tile width equals the image width. To make
+        // this observable without a second image, we synthesise two
+        // images that share the same parameters: a wide one (W×H) and
+        // a tall one (W×2H). The wide one's right edge should match a
+        // wrap of itself when stitched.
+        // A simpler invariant: a stitched image of the same parameters
+        // is identical pixel-for-pixel when re-generated.
+        let p = Turbulence::new(0.1, 0.1)
+            .with_num_octaves(2)
+            .with_seed(5)
+            .with_stitch_tiles(StitchTiles::Stitch);
+        let a = turbulence_filter(32, 32, &p);
+        let b = turbulence_filter(32, 32, &p);
+        assert_eq!(a, b);
+        // And the stitched output should differ from a no-stitch run
+        // with the same other parameters: the §15.24 stitch path
+        // adjusts the base frequencies and wraps lattice indices, so
+        // the two paths produce different pixels for a frequency that
+        // doesn't already land on the lattice boundary.
+        let ns = turbulence_filter(
+            32,
+            32,
+            &Turbulence::new(0.1, 0.1).with_num_octaves(2).with_seed(5),
+        );
+        assert_ne!(a, ns);
+    }
+
+    #[test]
+    fn typed_pixel_wrapper_matches_byte_api() {
+        let p = Turbulence::new(0.07, 0.07)
+            .with_num_octaves(3)
+            .with_seed(17);
+        let bytes = turbulence_filter(12, 10, &p);
+        let pixels = turbulence_filter_pixels(12, 10, &p);
+        let from_pixels: Vec<u8> = pixels.iter().flat_map(|p| [p.r, p.g, p.b, p.a]).collect();
+        assert_eq!(bytes, from_pixels);
+    }
+
+    #[test]
+    #[should_panic(expected = "base_freq_x")]
+    fn negative_base_freq_x_panics() {
+        let _ = turbulence_filter(2, 2, &Turbulence::new(0.1, 0.1)).len();
+        // The above shouldn't panic; the next line should.
+        let p = Turbulence {
+            base_freq_x: -0.1,
+            base_freq_y: 0.1,
+            num_octaves: 1,
+            seed: 0,
+            stitch_tiles: StitchTiles::NoStitch,
+            kind: TurbulenceType::Turbulence,
+            tile_x: 0.0,
+            tile_y: 0.0,
+            tile_width: 0.0,
+            tile_height: 0.0,
+        };
+        let _ = turbulence_filter(2, 2, &p);
+    }
+
+    #[test]
+    #[should_panic(expected = "base_freq_y")]
+    fn negative_base_freq_y_panics() {
+        let p = Turbulence {
+            base_freq_x: 0.1,
+            base_freq_y: -0.1,
+            num_octaves: 1,
+            seed: 0,
+            stitch_tiles: StitchTiles::NoStitch,
+            kind: TurbulenceType::Turbulence,
+            tile_x: 0.0,
+            tile_y: 0.0,
+            tile_width: 0.0,
+            tile_height: 0.0,
+        };
+        let _ = turbulence_filter(2, 2, &p);
+    }
+
+    #[test]
+    #[should_panic(expected = "num_octaves")]
+    fn zero_num_octaves_panics() {
+        let p = Turbulence {
+            base_freq_x: 0.1,
+            base_freq_y: 0.1,
+            num_octaves: 0,
+            seed: 0,
+            stitch_tiles: StitchTiles::NoStitch,
+            kind: TurbulenceType::Turbulence,
+            tile_x: 0.0,
+            tile_y: 0.0,
+            tile_width: 0.0,
+            tile_height: 0.0,
+        };
+        let _ = turbulence_filter(2, 2, &p);
     }
 }

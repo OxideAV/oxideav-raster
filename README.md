@@ -42,7 +42,8 @@ produces a packed `Rgba` `VideoFrame`.
 | `feComponentTransfer` 5-mode per-channel (§15.11)| done (round 14)|
 | `feComposite` Porter-Duff + arithmetic (§15.12)| done (round 188) |
 | `feConvolveMatrix` arbitrary 2-D convolution (§15.13)| done (round 206) |
-| Filters (drop-shadow, feTurbulence, lighting, …)| partial (morphology + color-matrix + Gaussian blur + component-transfer + composite + convolve-matrix) |
+| `feTurbulence` Perlin noise / fractalNoise (§15.24)| done (round 212) |
+| Filters (drop-shadow, lighting, …)         | partial (morphology + color-matrix + Gaussian blur + component-transfer + composite + convolve-matrix + turbulence) |
 | `<pattern>` paint                         | pending              |
 | Full ICC color-managed pipeline           | pending              |
 
