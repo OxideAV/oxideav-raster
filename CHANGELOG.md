@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.3](https://github.com/OxideAV/oxideav-raster/compare/v0.1.2...v0.1.3) - 2026-06-03
+
+### Other
+
+- feTile periodic reference-tile fill (SVG 1.1 §15.23)
+- feFlood / feOffset / feMerge (SVG 1.1 §15.16 / §15.21 / §15.19)
+- feTurbulence Perlin / fractalNoise (SVG 1.1 §15.24)
+- move feConvolveMatrix out of the # Deferred header
+- feConvolveMatrix general 2-D convolution (SVG 1.1 §15.13)
+
 ### Added
 
 - `feTile` filter primitive (SVG 1.1 §15.23) — replicate a
