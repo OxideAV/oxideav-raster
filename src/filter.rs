@@ -95,10 +95,41 @@
 //!   area. The §15.24 self-check value (`seed = 1`, 10000th LCG state
 //!   = `1043618065`) is asserted in the test suite.
 //!
+//! * **Flood** — `feFlood` from SVG 1.1 §15.16. A synthetic source
+//!   primitive: emit a `width × height` packed-RGBA buffer entirely
+//!   filled with `(r, g, b)` modulated by `flood_opacity`. The
+//!   filter primitive subregion (the `x` / `y` / `width` / `height`
+//!   attributes on `<feFlood>`) is resolved by the caller — the
+//!   function only fills the rectangle it is given.
+//!
+//! * **Offset** — `feOffset` from SVG 1.1 §15.21. Translate the
+//!   packed-RGBA source by `(dx, dy)`. The output pixel at `(x, y)`
+//!   is sourced from `(x − dx, y − dy)` per §15.21 ("offsets the
+//!   input image relative to its current position … by the
+//!   specified vector"); positions that fall outside the source
+//!   extent emit transparent black `(0, 0, 0, 0)` per the §15.7.3
+//!   "undefined pixels are set to transparent black" rule. Two
+//!   sampling policies are wired in: integer-rounded
+//!   nearest-pixel (the default — matches the §15.21 example
+//!   `dx="4" dy="4"` for the common case of untransformed shifts)
+//!   and bilinear reconstruction for fractional shifts (the
+//!   §15.21 "high quality viewer should make use of appropriate
+//!   interpolation techniques, for example bilinear or bicubic"
+//!   route).
+//!
+//! * **Merge** — `feMerge` from SVG 1.1 §15.19. Composite N input
+//!   layers bottom-to-top using the §14.2 simple-alpha-compositing
+//!   `over` operator (Input1 on the bottom, InputN on top). With
+//!   zero layers the result is transparent black (the
+//!   filter-effects-region initial value per §15.1). The N-layer
+//!   case is implemented as a fold so the spec's "n-1 Composite
+//!   filters" form is recovered transparently.
+//!
 //! # Deferred
 //!
 //! Drop shadow (`feDropShadow`), `feDisplacementMap`,
-//! `feSpecularLighting`, `feDiffuseLighting`.
+//! `feSpecularLighting`, `feDiffuseLighting`, `feTile`, `feImage`,
+//! `feBlend`.
 //!
 //! # Wall provenance
 //!
@@ -124,9 +155,24 @@
 //! reproduced verbatim, the 180° kernel rotation called out
 //! explicitly, the three `edgeMode` policies — `duplicate` /
 //! `wrap` / `none` — and the `preserveAlpha = true` "convolve RGB
-//! only, pass alpha through" rule). No `image` / `imageproc` /
-//! `opencv` / `cairo` / `skia` / `resvg` / `librsvg` source
-//! consulted.
+//! only, pass alpha through" rule). §15.16 for `feFlood` (the
+//! property pair `flood-color` / `flood-opacity` resolves to a
+//! single straight-alpha pixel that fills the filter primitive
+//! subregion). §15.21 for `feOffset` (the offset vector `(dx, dy)`
+//! shifts the source image; §15.7.3 fixes the "undefined pixels are
+//! set to transparent black" rule for samples that fall outside
+//! the source extent; the bilinear-resampling sampling option
+//! follows the §15.21 note that "a high quality viewer should make
+//! use of appropriate interpolation techniques, for example
+//! bilinear or bicubic"). §15.19 for `feMerge` ("composites input
+//! image layers on top of each other using the over operator with
+//! Input1 (corresponding to the first `feMergeNode` child element)
+//! on the bottom and the last specified input, InputN
+//! (corresponding to the last `feMergeNode` child element), on
+//! top") wired through the §14.2 simple-alpha-compositing `over`
+//! algebra `αo = αs + αd · (1 − αs)`, `co = (cs · αs + cd · αd · (1
+//! − αs)) / αo`. No `image` / `imageproc` / `opencv` / `cairo` /
+//! `skia` / `resvg` / `librsvg` source consulted.
 
 use oxideav_core::Rgba;
 
@@ -4924,5 +4970,711 @@ mod turbulence_tests {
             tile_height: 0.0,
         };
         let _ = turbulence_filter(2, 2, &p);
+    }
+}
+
+// ----------------------------------------------------------------------
+// SVG 1.1 §15.16 `<feFlood>` — solid-colour source primitive.
+// ----------------------------------------------------------------------
+
+/// SVG 1.1 §15.16 `<feFlood>` — emit a `width × height` packed-RGBA
+/// buffer entirely filled with `(r, g, b)` modulated by `flood_opacity`.
+///
+/// `flood_opacity` is a normalised straight-alpha value in `[0, 1]`; the
+/// spec's `flood-color` property carries the RGB triple (with `currentColor`
+/// already resolved by the consumer) and `flood-opacity` carries the
+/// independent opacity multiplier. The two combine into one straight-alpha
+/// output pixel `(r, g, b, round(flood_opacity · 255))`, which is what every
+/// pixel of the returned buffer holds.
+///
+/// The filter primitive subregion (the `x` / `y` / `width` / `height`
+/// attributes on `<feFlood>`) is resolved by the caller before invoking
+/// this function — the function only fills the rectangle it is given.
+///
+/// # Panics
+///
+/// * If `flood_opacity` is NaN.
+/// * If `width as usize * height as usize * 4` overflows `usize`.
+///
+/// # Returns
+///
+/// A packed-RGBA `Vec<u8>` of length `width · height · 4`, every pixel
+/// equal to `(r, g, b, round(clamp(flood_opacity, 0, 1) · 255))`. If
+/// either `width` or `height` is zero, an empty vector is returned.
+pub fn flood(width: u32, height: u32, r: u8, g: u8, b: u8, flood_opacity: f32) -> Vec<u8> {
+    assert!(!flood_opacity.is_nan(), "flood: flood_opacity is NaN");
+    let w = width as usize;
+    let h = height as usize;
+    let n = w
+        .checked_mul(h)
+        .and_then(|n| n.checked_mul(4))
+        .expect("flood: width * height * 4 overflowed usize");
+    if width == 0 || height == 0 {
+        return Vec::new();
+    }
+    let a = quantise_unit(flood_opacity);
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..(w * h) {
+        out.extend_from_slice(&[r, g, b, a]);
+    }
+    out
+}
+
+/// Typed-pixel wrapper around [`flood`]. Returns a `Vec<Rgba>` of length
+/// `width · height`, every entry equal to the resolved flood pixel.
+pub fn flood_pixels(width: u32, height: u32, r: u8, g: u8, b: u8, flood_opacity: f32) -> Vec<Rgba> {
+    assert!(
+        !flood_opacity.is_nan(),
+        "flood_pixels: flood_opacity is NaN"
+    );
+    let w = width as usize;
+    let h = height as usize;
+    let n = w
+        .checked_mul(h)
+        .expect("flood_pixels: width * height overflowed usize");
+    if width == 0 || height == 0 {
+        return Vec::new();
+    }
+    let a = quantise_unit(flood_opacity);
+    vec![Rgba::new(r, g, b, a); n]
+}
+
+// ----------------------------------------------------------------------
+// SVG 1.1 §15.21 `<feOffset>` — translate the input image by (dx, dy).
+// ----------------------------------------------------------------------
+
+/// Sample reconstruction policy for [`offset`], mirroring the §15.21
+/// note that "the destination location may be offset by a fraction of
+/// a pixel in device space. In this case a high quality viewer should
+/// make use of appropriate interpolation techniques, for example
+/// bilinear or bicubic."
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OffsetSampling {
+    /// Round `(dx, dy)` to the nearest integer pixel shift and copy
+    /// source pixels into the output verbatim. The default — matches
+    /// the §15.7.3 "undefined pixels are set to transparent black"
+    /// rule directly and is exact for the common case of integer
+    /// shifts produced by user-space `dx` / `dy` attributes on an
+    /// untransformed primitive.
+    #[default]
+    Nearest,
+    /// Resample with bilinear interpolation for fractional `(dx, dy)`.
+    /// Pixels whose 2×2 bilinear footprint falls partially outside the
+    /// source contribute the §15.7.3 transparent-black value (`(0, 0,
+    /// 0, 0)`) on the out-of-bounds samples, which naturally fades
+    /// the offset image at the edges.
+    Bilinear,
+}
+
+/// SVG 1.1 §15.21 `<feOffset>` — translate the packed-RGBA source by
+/// `(dx, dy)` (in source-pixel units) and emit a buffer of the same
+/// dimensions.
+///
+/// The output pixel `(x, y)` is sourced from `(x − dx, y − dy)` per
+/// §15.21 ("offsets the input image relative to its current position …
+/// by the specified vector"); positions that fall outside the source
+/// extent emit transparent black `(0, 0, 0, 0)` per §15.7.3 ("undefined
+/// pixels are set to transparent black"). The `sampling` parameter
+/// selects between integer-rounded nearest-pixel sampling
+/// ([`OffsetSampling::Nearest`], the default) and bilinear
+/// reconstruction for fractional shifts ([`OffsetSampling::Bilinear`],
+/// the §15.21 "high quality viewer" route).
+///
+/// `src` must be exactly `width · height · 4` bytes in row-major
+/// straight-alpha RGBA order.
+///
+/// # Panics
+///
+/// * If `src.len() != width as usize * height as usize * 4`.
+/// * If `dx` or `dy` is NaN.
+///
+/// # Returns
+///
+/// A new packed-RGBA `Vec<u8>` of the same dimensions as the source.
+pub fn offset(
+    src: &[u8],
+    width: u32,
+    height: u32,
+    dx: f32,
+    dy: f32,
+    sampling: OffsetSampling,
+) -> Vec<u8> {
+    assert!(!dx.is_nan(), "offset: dx is NaN");
+    assert!(!dy.is_nan(), "offset: dy is NaN");
+    let w = width as usize;
+    let h = height as usize;
+    let expected = w
+        .checked_mul(h)
+        .and_then(|n| n.checked_mul(4))
+        .expect("offset: width * height * 4 overflowed usize");
+    assert_eq!(
+        src.len(),
+        expected,
+        "offset: src.len() == {} but width*height*4 == {expected}",
+        src.len()
+    );
+    if width == 0 || height == 0 {
+        return Vec::new();
+    }
+
+    match sampling {
+        OffsetSampling::Nearest => offset_nearest(src, width, height, dx, dy),
+        OffsetSampling::Bilinear => offset_bilinear(src, width, height, dx, dy),
+    }
+}
+
+/// Typed-pixel wrapper around [`offset`]. Returns a `Vec<Rgba>` of the
+/// same length as `src`.
+pub fn offset_pixels(
+    src: &[Rgba],
+    width: u32,
+    height: u32,
+    dx: f32,
+    dy: f32,
+    sampling: OffsetSampling,
+) -> Vec<Rgba> {
+    let n = width as usize * height as usize;
+    assert_eq!(
+        src.len(),
+        n,
+        "offset_pixels: src.len() == {} but width*height == {n}",
+        src.len()
+    );
+    let mut b = Vec::with_capacity(n * 4);
+    for p in src {
+        b.extend_from_slice(&[p.r, p.g, p.b, p.a]);
+    }
+    let out = offset(&b, width, height, dx, dy, sampling);
+    out.chunks_exact(4)
+        .map(|c| Rgba::new(c[0], c[1], c[2], c[3]))
+        .collect()
+}
+
+/// Integer-rounded source sampling. `(dx, dy)` are rounded
+/// half-to-even (the default `f32::round_ties_even` semantics) before
+/// being applied; out-of-bounds positions emit transparent black.
+fn offset_nearest(src: &[u8], width: u32, height: u32, dx: f32, dy: f32) -> Vec<u8> {
+    let w = width as i64;
+    let h = height as i64;
+    // Round-half-away-from-zero, matching the standard `f32::round()`
+    // rule the spec's example (`dx="4" dy="4"`) implicitly relies on
+    // for integer shifts. Saturating cast clamps shifts that would
+    // overflow `i64` to extremes that fall outside the bounds check
+    // below, producing transparent black for every output pixel — the
+    // same behaviour as a finite shift that exceeds the source extent.
+    let idx = dx.round() as i64;
+    let idy = dy.round() as i64;
+
+    let mut out = vec![0u8; (w * h * 4) as usize];
+    for y in 0..h {
+        let sy = y - idy;
+        if !(0..h).contains(&sy) {
+            continue;
+        }
+        for x in 0..w {
+            let sx = x - idx;
+            if !(0..w).contains(&sx) {
+                continue;
+            }
+            let s = ((sy * w + sx) * 4) as usize;
+            let d = ((y * w + x) * 4) as usize;
+            out[d..d + 4].copy_from_slice(&src[s..s + 4]);
+        }
+    }
+    out
+}
+
+/// Bilinear sampling of the shifted source. The shift is applied in
+/// floating-point and the four neighbouring source pixels are blended
+/// per-channel; samples outside the source extent contribute
+/// transparent black, naturally fading the offset image at the edges.
+fn offset_bilinear(src: &[u8], width: u32, height: u32, dx: f32, dy: f32) -> Vec<u8> {
+    let w = width as i64;
+    let h = height as i64;
+
+    let fetch = |sx: i64, sy: i64| -> [f32; 4] {
+        if !(0..w).contains(&sx) || !(0..h).contains(&sy) {
+            return [0.0; 4];
+        }
+        let p = ((sy * w + sx) * 4) as usize;
+        [
+            src[p] as f32,
+            src[p + 1] as f32,
+            src[p + 2] as f32,
+            src[p + 3] as f32,
+        ]
+    };
+
+    let mut out = Vec::with_capacity((w * h * 4) as usize);
+    for y in 0..h {
+        for x in 0..w {
+            // Source coordinate: subtracting the shift moves the
+            // image by (+dx, +dy) in output space.
+            let fx = x as f32 - dx;
+            let fy = y as f32 - dy;
+            let x0 = fx.floor() as i64;
+            let y0 = fy.floor() as i64;
+            let tx = fx - x0 as f32;
+            let ty = fy - y0 as f32;
+            let c00 = fetch(x0, y0);
+            let c10 = fetch(x0 + 1, y0);
+            let c01 = fetch(x0, y0 + 1);
+            let c11 = fetch(x0 + 1, y0 + 1);
+            for c in 0..4 {
+                let top = c00[c] + (c10[c] - c00[c]) * tx;
+                let bot = c01[c] + (c11[c] - c01[c]) * tx;
+                let v = top + (bot - top) * ty;
+                out.push(v.clamp(0.0, 255.0).round() as u8);
+            }
+        }
+    }
+    out
+}
+
+// ----------------------------------------------------------------------
+// SVG 1.1 §15.19 `<feMerge>` — composite layers with `over`.
+// ----------------------------------------------------------------------
+
+/// SVG 1.1 §15.19 `<feMerge>` — composite `layers` bottom-to-top using
+/// the §14.2 simple-alpha-compositing `over` operator (the spec's
+/// "Input1 (corresponding to the first `feMergeNode` child element) on
+/// the bottom and the last specified input, InputN (corresponding to
+/// the last `feMergeNode` child element), on top").
+///
+/// Every layer must be a `width × height` packed-RGBA `u8` buffer in
+/// straight-alpha row-major order. The output is a new buffer of the
+/// same dimensions, in straight-alpha form, holding the cumulative
+/// `over` composite.
+///
+/// Returning a transparent-black buffer is the documented zero-layer
+/// result: the §15.19 algorithm composites N inputs onto a backdrop
+/// that starts at the initial filter-effects-region value, which §15.1
+/// defines as transparent black (`(0, 0, 0, 0)`).
+///
+/// # Panics
+///
+/// * If any layer's length is not `width as usize * height as usize * 4`.
+///
+/// # Returns
+///
+/// A packed-RGBA `Vec<u8>` of length `width · height · 4`.
+pub fn merge(width: u32, height: u32, layers: &[&[u8]]) -> Vec<u8> {
+    let w = width as usize;
+    let h = height as usize;
+    let expected = w
+        .checked_mul(h)
+        .and_then(|n| n.checked_mul(4))
+        .expect("merge: width * height * 4 overflowed usize");
+    if width == 0 || height == 0 {
+        for (i, l) in layers.iter().enumerate() {
+            assert_eq!(
+                l.len(),
+                0,
+                "merge: layer {i} len {} on a {}×{} extent (expected 0)",
+                l.len(),
+                width,
+                height
+            );
+        }
+        return Vec::new();
+    }
+    for (i, l) in layers.iter().enumerate() {
+        assert_eq!(
+            l.len(),
+            expected,
+            "merge: layer {i} len {} but width*height*4 == {expected}",
+            l.len(),
+        );
+    }
+
+    if layers.is_empty() {
+        // Initial-region transparent black.
+        return vec![0u8; expected];
+    }
+
+    // Composite bottom-to-top. `dst` carries the accumulating result.
+    // The first layer is copied verbatim (the §14.2 `over` of any
+    // pixel onto fully transparent backdrop equals that pixel).
+    let mut dst: Vec<u8> = layers[0].to_vec();
+    for layer in &layers[1..] {
+        for (d, s) in dst.chunks_exact_mut(4).zip(layer.chunks_exact(4)) {
+            let sa = s[3] as f32 / 255.0;
+            let da = d[3] as f32 / 255.0;
+            // §14.2 simple-alpha-compositing `over`, expressed
+            // straight-alpha:
+            //   αo = αs + αd · (1 − αs)
+            //   co = (cs · αs + cd · αd · (1 − αs)) / αo
+            let one_minus_sa = 1.0 - sa;
+            let ao = sa + da * one_minus_sa;
+            if ao <= 0.0 {
+                d[0] = 0;
+                d[1] = 0;
+                d[2] = 0;
+                d[3] = 0;
+                continue;
+            }
+            for c in 0..3 {
+                let cs = s[c] as f32 / 255.0;
+                let cd = d[c] as f32 / 255.0;
+                let co = (cs * sa + cd * da * one_minus_sa) / ao;
+                d[c] = quantise_unit(co);
+            }
+            d[3] = quantise_unit(ao);
+        }
+    }
+    dst
+}
+
+/// Typed-pixel wrapper around [`merge`]. Each entry of `layers` is a
+/// `Vec<Rgba>` of length `width · height`.
+pub fn merge_pixels(width: u32, height: u32, layers: &[&[Rgba]]) -> Vec<Rgba> {
+    let n = width as usize * height as usize;
+    for (i, l) in layers.iter().enumerate() {
+        assert_eq!(
+            l.len(),
+            n,
+            "merge_pixels: layer {i} len {} but width*height == {n}",
+            l.len()
+        );
+    }
+    // Convert each Rgba layer to a byte buffer, then build &[u8] views.
+    let bytes: Vec<Vec<u8>> = layers
+        .iter()
+        .map(|l| {
+            let mut b = Vec::with_capacity(n * 4);
+            for p in *l {
+                b.extend_from_slice(&[p.r, p.g, p.b, p.a]);
+            }
+            b
+        })
+        .collect();
+    let byte_refs: Vec<&[u8]> = bytes.iter().map(|b| b.as_slice()).collect();
+    let out = merge(width, height, &byte_refs);
+    out.chunks_exact(4)
+        .map(|c| Rgba::new(c[0], c[1], c[2], c[3]))
+        .collect()
+}
+
+#[cfg(test)]
+mod flood_offset_merge_tests {
+    use super::*;
+
+    // -------------------- flood --------------------
+
+    #[test]
+    fn flood_fills_every_pixel_with_resolved_rgba() {
+        let out = flood(3, 2, 200, 100, 50, 0.5);
+        assert_eq!(out.len(), 3 * 2 * 4);
+        // round(0.5 · 255 + 0.5) = 128
+        for px in out.chunks_exact(4) {
+            assert_eq!(px, [200, 100, 50, 128]);
+        }
+    }
+
+    #[test]
+    fn flood_opacity_one_is_fully_opaque() {
+        let out = flood(1, 1, 10, 20, 30, 1.0);
+        assert_eq!(out, [10, 20, 30, 255]);
+    }
+
+    #[test]
+    fn flood_opacity_zero_is_fully_transparent() {
+        let out = flood(2, 1, 99, 99, 99, 0.0);
+        // Note: the §15.16 spec keeps the RGB triple regardless of
+        // flood-opacity (it is the straight-alpha form, not the
+        // premultiplied form). We emit straight-alpha.
+        assert_eq!(out, [99, 99, 99, 0, 99, 99, 99, 0]);
+    }
+
+    #[test]
+    fn flood_opacity_outside_unit_range_clamps() {
+        // Both negative and >1 inputs clamp into [0, 255].
+        let a = flood(1, 1, 0, 0, 0, -0.5);
+        let b = flood(1, 1, 0, 0, 0, 1.5);
+        assert_eq!(a[3], 0);
+        assert_eq!(b[3], 255);
+    }
+
+    #[test]
+    fn flood_empty_extent_returns_empty() {
+        assert!(flood(0, 5, 0, 0, 0, 1.0).is_empty());
+        assert!(flood(5, 0, 0, 0, 0, 1.0).is_empty());
+        assert!(flood(0, 0, 0, 0, 0, 1.0).is_empty());
+    }
+
+    #[test]
+    fn flood_pixels_matches_byte_path() {
+        let bytes = flood(4, 3, 70, 80, 90, 0.75);
+        let typed = flood_pixels(4, 3, 70, 80, 90, 0.75);
+        let from_typed: Vec<u8> = typed.iter().flat_map(|p| [p.r, p.g, p.b, p.a]).collect();
+        assert_eq!(bytes, from_typed);
+    }
+
+    #[test]
+    #[should_panic(expected = "flood_opacity is NaN")]
+    fn flood_nan_opacity_panics() {
+        let _ = flood(1, 1, 0, 0, 0, f32::NAN);
+    }
+
+    // -------------------- offset --------------------
+
+    /// Make a tiny "stamp" buffer: opaque red dot at the centre of a
+    /// 5×5 transparent-black canvas.
+    fn red_dot_5x5() -> Vec<u8> {
+        let mut v = vec![0u8; 5 * 5 * 4];
+        let centre = ((2 * 5 + 2) * 4) as usize;
+        v[centre] = 255;
+        v[centre + 3] = 255;
+        v
+    }
+
+    #[test]
+    fn offset_nearest_integer_shift_moves_the_dot() {
+        let src = red_dot_5x5();
+        // Shift the dot one pixel right (dx = 1) and zero pixels down.
+        let out = offset(&src, 5, 5, 1.0, 0.0, OffsetSampling::Nearest);
+        // The dot should now sit at (3, 2).
+        for y in 0..5 {
+            for x in 0..5 {
+                let p = ((y * 5 + x) * 4) as usize;
+                if (x, y) == (3, 2) {
+                    assert_eq!(&out[p..p + 4], &[255, 0, 0, 255]);
+                } else {
+                    assert_eq!(&out[p..p + 4], &[0, 0, 0, 0]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn offset_nearest_negative_shift_moves_the_dot_left_and_up() {
+        let src = red_dot_5x5();
+        let out = offset(&src, 5, 5, -1.0, -1.0, OffsetSampling::Nearest);
+        // Dot should now be at (1, 1).
+        let p = ((5 + 1) * 4) as usize;
+        assert_eq!(&out[p..p + 4], &[255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn offset_nearest_undefined_pixels_are_transparent_black() {
+        // Shift far enough to push the entire source out of frame —
+        // §15.7.3 says every output pixel should be transparent black.
+        let src = red_dot_5x5();
+        let out = offset(&src, 5, 5, 100.0, 100.0, OffsetSampling::Nearest);
+        assert!(out.iter().all(|b| *b == 0));
+    }
+
+    #[test]
+    fn offset_zero_is_identity() {
+        // Random-looking buffer.
+        let mut src = vec![0u8; 4 * 3 * 4];
+        for (i, b) in src.iter_mut().enumerate() {
+            *b = (i * 17 + 3) as u8;
+        }
+        let out = offset(&src, 4, 3, 0.0, 0.0, OffsetSampling::Nearest);
+        assert_eq!(out, src);
+    }
+
+    #[test]
+    fn offset_rounds_dx_dy_to_nearest_pixel_for_nearest_sampling() {
+        // dx = 0.4 rounds to 0 → no shift.
+        let src = red_dot_5x5();
+        let out = offset(&src, 5, 5, 0.4, 0.0, OffsetSampling::Nearest);
+        assert_eq!(out, src);
+        // dx = 0.6 rounds to 1 → one-pixel shift right.
+        let out = offset(&src, 5, 5, 0.6, 0.0, OffsetSampling::Nearest);
+        let p = ((2 * 5 + 3) * 4) as usize;
+        assert_eq!(&out[p..p + 4], &[255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn offset_bilinear_half_pixel_splits_value_evenly() {
+        // 2×1 source: opaque red at x=0, transparent at x=1.
+        // dx = 0.5 → output[0] reads source(-0.5) = halfway between
+        // source(-1)=oob (transparent black) and source(0)=red. Output
+        // should be premultiplied-equivalent half-red, half-alpha.
+        let src: Vec<u8> = vec![255, 0, 0, 255, 0, 0, 0, 0];
+        let out = offset(&src, 2, 1, 0.5, 0.0, OffsetSampling::Bilinear);
+        // output[0] reads (oob @ x=-1) and source(0)=red, blended 50/50:
+        // r=128, a=128 approximately.
+        assert!((out[0] as i32 - 128).abs() <= 1, "r {}", out[0]);
+        assert_eq!(out[1], 0);
+        assert_eq!(out[2], 0);
+        assert!((out[3] as i32 - 128).abs() <= 1, "a {}", out[3]);
+        // output[1] reads source(0)=red and source(1)=transparent,
+        // blended 50/50: r=128, a=128.
+        assert!((out[4] as i32 - 128).abs() <= 1, "r {}", out[4]);
+        assert!((out[7] as i32 - 128).abs() <= 1, "a {}", out[7]);
+    }
+
+    #[test]
+    fn offset_bilinear_integer_shift_matches_nearest() {
+        // For integer dx/dy bilinear must coincide with nearest.
+        let mut src = vec![0u8; 6 * 4 * 4];
+        for (i, b) in src.iter_mut().enumerate() {
+            *b = (i as u32 * 13 % 251) as u8;
+        }
+        let n = offset(&src, 6, 4, 1.0, -2.0, OffsetSampling::Nearest);
+        let b = offset(&src, 6, 4, 1.0, -2.0, OffsetSampling::Bilinear);
+        assert_eq!(n, b);
+    }
+
+    #[test]
+    fn offset_typed_wrapper_agrees_with_byte_path() {
+        let mut src = vec![0u8; 5 * 5 * 4];
+        for (i, b) in src.iter_mut().enumerate() {
+            *b = (i * 9 % 241) as u8;
+        }
+        let typed: Vec<Rgba> = src
+            .chunks_exact(4)
+            .map(|c| Rgba::new(c[0], c[1], c[2], c[3]))
+            .collect();
+        let bytes_out = offset(&src, 5, 5, 2.0, -1.0, OffsetSampling::Nearest);
+        let typed_out = offset_pixels(&typed, 5, 5, 2.0, -1.0, OffsetSampling::Nearest);
+        let from_typed: Vec<u8> = typed_out
+            .iter()
+            .flat_map(|p| [p.r, p.g, p.b, p.a])
+            .collect();
+        assert_eq!(bytes_out, from_typed);
+    }
+
+    #[test]
+    #[should_panic(expected = "src.len()")]
+    fn offset_wrong_length_panics() {
+        let src = vec![0u8; 8];
+        let _ = offset(&src, 4, 4, 0.0, 0.0, OffsetSampling::Nearest);
+    }
+
+    #[test]
+    #[should_panic(expected = "dx is NaN")]
+    fn offset_nan_dx_panics() {
+        let src = vec![0u8; 4];
+        let _ = offset(&src, 1, 1, f32::NAN, 0.0, OffsetSampling::Nearest);
+    }
+
+    #[test]
+    fn offset_empty_extent_returns_empty() {
+        let src: Vec<u8> = Vec::new();
+        let out = offset(&src, 0, 5, 1.0, 1.0, OffsetSampling::Nearest);
+        assert!(out.is_empty());
+    }
+
+    // -------------------- merge --------------------
+
+    fn solid_layer(w: u32, h: u32, c: Rgba) -> Vec<u8> {
+        let mut v = Vec::with_capacity((w * h * 4) as usize);
+        for _ in 0..(w * h) {
+            v.extend_from_slice(&[c.r, c.g, c.b, c.a]);
+        }
+        v
+    }
+
+    #[test]
+    fn merge_no_layers_is_transparent_black() {
+        let out = merge(2, 3, &[]);
+        assert_eq!(out.len(), 2 * 3 * 4);
+        assert!(out.iter().all(|b| *b == 0));
+    }
+
+    #[test]
+    fn merge_single_layer_is_identity() {
+        let a = solid_layer(2, 2, Rgba::new(10, 20, 30, 200));
+        let out = merge(2, 2, &[&a]);
+        assert_eq!(out, a);
+    }
+
+    #[test]
+    fn merge_opaque_top_layer_replaces_lower() {
+        let lower = solid_layer(1, 1, Rgba::new(255, 0, 0, 255));
+        let upper = solid_layer(1, 1, Rgba::new(0, 255, 0, 255));
+        let out = merge(1, 1, &[&lower, &upper]);
+        // §14.2 `over`: αo = 1 + 1·0 = 1, so output is the upper layer.
+        assert_eq!(out, [0, 255, 0, 255]);
+    }
+
+    #[test]
+    fn merge_transparent_top_layer_keeps_lower() {
+        let lower = solid_layer(1, 1, Rgba::new(123, 45, 67, 255));
+        let upper = solid_layer(1, 1, Rgba::new(99, 99, 99, 0));
+        let out = merge(1, 1, &[&lower, &upper]);
+        assert_eq!(out, [123, 45, 67, 255]);
+    }
+
+    #[test]
+    fn merge_half_alpha_top_over_opaque_bottom_averages() {
+        // §14.2 over: αs=0.5, αd=1 ⇒ αo = 0.5 + 0.5 = 1; the colour
+        // is the per-channel 50/50 average of the two RGB triples.
+        let lower = solid_layer(1, 1, Rgba::new(200, 0, 0, 255));
+        let upper = solid_layer(1, 1, Rgba::new(0, 0, 200, 128));
+        let out = merge(1, 1, &[&lower, &upper]);
+        // αs in float = 128/255 ≈ 0.5019; expected r = 200 · (1 − αs)
+        // ≈ 99.6, b = 200 · αs ≈ 100.4. Allow ±2.
+        assert!((out[0] as i32 - 100).abs() <= 2, "r {}", out[0]);
+        assert_eq!(out[1], 0);
+        assert!((out[2] as i32 - 100).abs() <= 2, "b {}", out[2]);
+        assert_eq!(out[3], 255);
+    }
+
+    #[test]
+    fn merge_three_layers_associativity_holds() {
+        // ((a over b) over c) and merge([a, b, c]) should agree, since
+        // §14.2 over composition with no group isolation is associative.
+        let a = solid_layer(2, 2, Rgba::new(255, 0, 0, 128));
+        let b = solid_layer(2, 2, Rgba::new(0, 255, 0, 128));
+        let c = solid_layer(2, 2, Rgba::new(0, 0, 255, 128));
+        let pair = merge(2, 2, &[&a, &b]);
+        let stepped = merge(2, 2, &[&pair, &c]);
+        let direct = merge(2, 2, &[&a, &b, &c]);
+        for px in 0..4 {
+            for ch in 0..4 {
+                let i = px * 4 + ch;
+                // Quantisation noise allowance: composited over three
+                // half-opaque layers, the worst-case discrepancy from
+                // intermediate u8 rounding is bounded by ±2.
+                assert!(
+                    (stepped[i] as i32 - direct[i] as i32).abs() <= 2,
+                    "px {px} ch {ch}: stepped {} direct {}",
+                    stepped[i],
+                    direct[i]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn merge_typed_wrapper_agrees_with_byte_path() {
+        let a_b = solid_layer(3, 2, Rgba::new(40, 50, 60, 200));
+        let b_b = solid_layer(3, 2, Rgba::new(160, 170, 180, 96));
+        let a_p: Vec<Rgba> = a_b
+            .chunks_exact(4)
+            .map(|c| Rgba::new(c[0], c[1], c[2], c[3]))
+            .collect();
+        let b_p: Vec<Rgba> = b_b
+            .chunks_exact(4)
+            .map(|c| Rgba::new(c[0], c[1], c[2], c[3]))
+            .collect();
+        let bytes_out = merge(3, 2, &[&a_b, &b_b]);
+        let typed_out = merge_pixels(3, 2, &[&a_p, &b_p]);
+        let from_typed: Vec<u8> = typed_out
+            .iter()
+            .flat_map(|p| [p.r, p.g, p.b, p.a])
+            .collect();
+        assert_eq!(bytes_out, from_typed);
+    }
+
+    #[test]
+    fn merge_empty_extent_returns_empty() {
+        let out = merge(0, 5, &[]);
+        assert!(out.is_empty());
+        let out = merge(5, 0, &[]);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "layer 1 len")]
+    fn merge_mismatched_layer_length_panics() {
+        let a = vec![0u8; 4 * 4];
+        let b = vec![0u8; 4 * 5];
+        let _ = merge(2, 2, &[&a, &b]);
     }
 }

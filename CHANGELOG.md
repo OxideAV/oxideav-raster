@@ -9,6 +9,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `feFlood` / `feOffset` / `feMerge` filter primitives (SVG 1.1
+  §15.16 / §15.21 / §15.19) — the three "drop-shadow building
+  blocks" that compose into the §15.2 example pipeline.
+  - `flood(width, height, r, g, b, flood_opacity) -> Vec<u8>` plus
+    the typed-pixel wrapper `flood_pixels(...) -> Vec<Rgba>`. Emits
+    a `width × height` packed-RGBA buffer in which every pixel
+    carries the resolved `flood-color` triple modulated by
+    `flood-opacity` (straight-alpha form, with `flood_opacity`
+    clamped to `[0, 1]` and quantised half-up to `u8`).
+  - `offset(src, width, height, dx, dy, sampling) -> Vec<u8>` plus
+    the typed-pixel wrapper `offset_pixels(...) -> Vec<Rgba>`.
+    Translates the packed-RGBA source by `(dx, dy)`; output pixels
+    whose source position falls outside the input extent are set to
+    transparent black per the §15.7.3 "undefined pixels are set to
+    transparent black" rule. Two `OffsetSampling` policies are
+    wired in: `Nearest` (rounds `(dx, dy)` to the nearest integer
+    via `f32::round` and copies source pixels verbatim — the
+    default, exact for the common case of integer shifts produced
+    by user-space `dx` / `dy` attributes on an untransformed
+    primitive) and `Bilinear` (resamples the four-pixel
+    neighbourhood for fractional shifts — the §15.21 "high quality
+    viewer should make use of appropriate interpolation techniques,
+    for example bilinear or bicubic" route; out-of-bounds samples
+    contribute transparent black, naturally fading the offset
+    image at the edges). The bilinear path coincides exactly with
+    the nearest path for integer `(dx, dy)`.
+  - `merge(width, height, &[&[u8]]) -> Vec<u8>` plus the
+    typed-pixel wrapper `merge_pixels(width, height, &[&[Rgba]])
+    -> Vec<Rgba>`. Composites N input layers bottom-to-top using
+    the §14.2 simple-alpha-compositing `over` algebra
+    `αo = αs + αd · (1 − αs)`,
+    `co = (cs · αs + cd · αd · (1 − αs)) / αo`. With zero layers
+    the result is transparent black (the filter-effects-region
+    initial value per §15.1). With a single layer the result is
+    that layer verbatim. With N ≥ 2 layers the canonical n − 1
+    `feComposite` reduction is recovered transparently, matching
+    `((L0 over L1) … over LN)` composition.
+  - 31 new tests across `src/filter.rs::flood_offset_merge_tests`
+    and `tests/filter_flood_offset_merge.rs` covering: flood
+    extent / opacity quantisation / range clamping / NaN-panic
+    guard / empty-extent shortcut; offset integer shift in both
+    directions / undefined-pixel transparent-black rule / zero
+    identity / nearest rounding / bilinear half-pixel split /
+    bilinear-integer-equals-nearest identity / NaN-panic guard /
+    length mismatch panic; merge zero-layer transparent-black
+    canvas / single-layer identity / opaque-over-anything /
+    transparent-over-anything / half-alpha 50/50 average /
+    three-layer associativity / typed wrapper round-trip /
+    extent mismatch panic. The end-to-end §15.2 drop-shadow
+    pipeline shape (`SourceAlpha → feGaussianBlur → feOffset →
+    feMerge(shadow, source)`) is exercised, including the
+    `feFlood + feComposite-In` shadow-tint variant.
 - `feTurbulence` filter primitive (SVG 1.1 §15.24) — Perlin-noise
   source primitive, exposed as
   `pub fn turbulence_filter(width, height, &params) -> Vec<u8>` plus

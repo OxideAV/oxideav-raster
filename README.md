@@ -43,7 +43,10 @@ produces a packed `Rgba` `VideoFrame`.
 | `feComposite` Porter-Duff + arithmetic (§15.12)| done (round 188) |
 | `feConvolveMatrix` arbitrary 2-D convolution (§15.13)| done (round 206) |
 | `feTurbulence` Perlin noise / fractalNoise (§15.24)| done (round 212) |
-| Filters (drop-shadow, lighting, …)         | partial (morphology + color-matrix + Gaussian blur + component-transfer + composite + convolve-matrix + turbulence) |
+| `feFlood` solid-colour source primitive (§15.16)| done (round 217) |
+| `feOffset` integer + bilinear-fractional shift (§15.21)| done (round 217) |
+| `feMerge` N-layer `over` composite (§15.19)| done (round 217) |
+| Filters (drop-shadow, lighting, …)         | partial (morphology + color-matrix + Gaussian blur + component-transfer + composite + convolve-matrix + turbulence + flood + offset + merge) |
 | `<pattern>` paint                         | pending              |
 | Full ICC color-managed pipeline           | pending              |
 
