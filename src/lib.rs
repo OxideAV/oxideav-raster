@@ -167,10 +167,10 @@ pub use filter::{
     color_matrix, color_matrix_op, color_matrix_pixels, component_transfer,
     component_transfer_pixels, composite_filter, composite_filter_pixels, convolve_matrix,
     convolve_matrix_pixels, flood, flood_pixels, gaussian_blur, gaussian_blur_pixels, merge,
-    merge_pixels, morphology, morphology_pixels, offset, offset_pixels, turbulence_filter,
-    turbulence_filter_pixels, ColorMatrix, ColorMatrixOp, ComponentTransfer, CompositeOp,
-    ConvolveEdgeMode, ConvolveMatrix, MorphologyOp, OffsetSampling, StitchTiles, TransferFunc,
-    Turbulence, TurbulenceType, GAUSSIAN_BLUR_BOX_THRESHOLD,
+    merge_pixels, morphology, morphology_pixels, offset, offset_pixels, tile, tile_pixels,
+    turbulence_filter, turbulence_filter_pixels, ColorMatrix, ColorMatrixOp, ComponentTransfer,
+    CompositeOp, ConvolveEdgeMode, ConvolveMatrix, MorphologyOp, OffsetSampling, StitchTiles,
+    TransferFunc, Turbulence, TurbulenceType, GAUSSIAN_BLUR_BOX_THRESHOLD,
 };
 pub use flatten::{flatten_arc_to_cubics, flatten_path, FlatContour};
 pub use gradient::{

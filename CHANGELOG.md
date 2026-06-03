@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `feTile` filter primitive (SVG 1.1 §15.23) — periodic replication of
+  a reference tile across a target rectangle.
+  - `tile(src, src_width, src_height, out_width, out_height) -> Vec<u8>`
+    plus the typed-pixel wrapper `tile_pixels(...) -> Vec<Rgba>`. The
+    §15.23 statement "i and j can be any integer value" reduces, per
+    output pixel `(ox, oy)`, to the Euclidean remainder lookup
+    `(ox mod src_width, oy mod src_height)` into the source — the
+    analytical form of the integer-shift family applied at every
+    output sample. Source and target rectangles are aligned at the
+    origin (the i = 0, j = 0 copy of the tile lands with its top-left
+    at the target top-left); callers that need a different alignment
+    shift the input through `offset` before tiling.
+  - 15 new tests across `src/filter.rs::tile_tests` and
+    `tests/filter_tile.rs` covering: identity when extents match;
+    4×4 from 2×2 verbatim replication; 3×2 partial-period truncation
+    on the trailing column; 1×1 constant-fill degenerate case; 2×2
+    crop from a 4×4 reference; zero-extent target shortcut; 9×9
+    triple replication of a 3×3 reference; typed-wrapper round-trip
+    parity; wrong-source-length panic; empty-source-with-non-empty-
+    target panic; empty-source-with-empty-target shortcut; integration
+    tests for 64×64 tiling of an 8×8 gradient, 20×13 from a 7×5
+    non-multiple source, alpha preservation, 1×4 strip extension, and
+    the "shift-then-tile is tile" invariant.
 - `feFlood` / `feOffset` / `feMerge` filter primitives (SVG 1.1
   §15.16 / §15.21 / §15.19) — the three "drop-shadow building
   blocks" that compose into the §15.2 example pipeline.
