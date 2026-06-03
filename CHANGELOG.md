@@ -9,6 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `feTile` filter primitive (SVG 1.1 §15.23) — replicate a
+  `src_w × src_h` reference tile in both X and Y to completely fill a
+  `tgt_w × tgt_h` target rectangle.
+  - `tile(src, src_w, src_h, tile_x, tile_y, tgt_w, tgt_h) -> Vec<u8>`
+    plus the typed-pixel wrapper
+    `tile_pixels(src, src_w, src_h, tile_x, tile_y, tgt_w, tgt_h) -> Vec<Rgba>`.
+    Implements the §15.23 placement rule "the top/left corner of each
+    given tile is at location `(x + i·width, y + j·height)`, where
+    `(x, y)` represents the top/left of the input image's filter
+    primitive subregion … and `i` and `j` can be any integer value"
+    by inverting it per output pixel into a source coordinate via
+    Euclidean remainder on `src_w` / `src_h`. The Euclidean form
+    handles negative `(tile_x, tile_y)` shifts without a separate
+    code path — `(-3).rem_euclid(2) == 1` covers the §15.23 "any
+    integer value" range for `i`, `j` uniformly.
+  - Empty reference tiles (`src_w == 0` or `src_h == 0`) and empty
+    target rectangles (`tgt_w == 0` or `tgt_h == 0`) both return an
+    empty vector; `src` length is asserted equal to
+    `src_w · src_h · 4`.
+  - 18 new tests across `src/filter.rs::tile_tests` and
+    `tests/filter_tile.rs` covering: identity (target == source),
+    1×1 reference tile, 2×2 checker tile filling an 8×8 target,
+    integer-shift `tile_x` / `tile_y` phase, negative-shift
+    congruence with the equivalent positive shift modulo `src_w`,
+    periodicity across multiple tile widths and heights, the
+    §15.23 default origin (target smaller than source crops the
+    top-left), `tile_pixels` parity with the byte path, alpha-channel
+    preservation, the `tile → offset` composite pipeline, and the
+    panic on a source buffer whose length disagrees with
+    `src_w · src_h · 4`.
+
 - `feFlood` / `feOffset` / `feMerge` filter primitives (SVG 1.1
   §15.16 / §15.21 / §15.19) — the three "drop-shadow building
   blocks" that compose into the §15.2 example pipeline.

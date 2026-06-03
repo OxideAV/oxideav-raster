@@ -132,11 +132,19 @@
 //!   bottom-to-top using the §14.2 simple-alpha-compositing `over`
 //!   operator. Exposed as [`merge`] (with the typed-pixel wrapper
 //!   [`merge_pixels`]).
+//! * `<feTile>` (SVG 1.1 §15.23) replicates a `src_w × src_h`
+//!   reference tile in both X and Y to completely fill a
+//!   `tgt_w × tgt_h` target rectangle. The §15.23 placement rule
+//!   (`(x + i·width, y + j·height)` for any integer `i`, `j`) is
+//!   recovered through Euclidean-remainder source-coordinate
+//!   inversion, so a `(tile_x, tile_y)` shift of any sign is handled
+//!   without a separate branch. Exposed as [`tile`] (with the
+//!   typed-pixel wrapper [`tile_pixels`]).
 //!
 //! Deferred to a later round:
 //!
 //! * remaining filters (drop shadow, feDisplacementMap, lighting,
-//!   feTile, feImage, feBlend),
+//!   feImage, feBlend),
 //! * `<pattern>` paints,
 //! * full ICC-tagged color-managed pipeline (the `linearRGB`
 //!   interpolation space is implemented; per-channel ICC profile
@@ -167,10 +175,10 @@ pub use filter::{
     color_matrix, color_matrix_op, color_matrix_pixels, component_transfer,
     component_transfer_pixels, composite_filter, composite_filter_pixels, convolve_matrix,
     convolve_matrix_pixels, flood, flood_pixels, gaussian_blur, gaussian_blur_pixels, merge,
-    merge_pixels, morphology, morphology_pixels, offset, offset_pixels, turbulence_filter,
-    turbulence_filter_pixels, ColorMatrix, ColorMatrixOp, ComponentTransfer, CompositeOp,
-    ConvolveEdgeMode, ConvolveMatrix, MorphologyOp, OffsetSampling, StitchTiles, TransferFunc,
-    Turbulence, TurbulenceType, GAUSSIAN_BLUR_BOX_THRESHOLD,
+    merge_pixels, morphology, morphology_pixels, offset, offset_pixels, tile, tile_pixels,
+    turbulence_filter, turbulence_filter_pixels, ColorMatrix, ColorMatrixOp, ComponentTransfer,
+    CompositeOp, ConvolveEdgeMode, ConvolveMatrix, MorphologyOp, OffsetSampling, StitchTiles,
+    TransferFunc, Turbulence, TurbulenceType, GAUSSIAN_BLUR_BOX_THRESHOLD,
 };
 pub use flatten::{flatten_arc_to_cubics, flatten_path, FlatContour};
 pub use gradient::{

@@ -46,7 +46,8 @@ produces a packed `Rgba` `VideoFrame`.
 | `feFlood` solid-colour source primitive (§15.16)| done (round 217) |
 | `feOffset` integer + bilinear-fractional shift (§15.21)| done (round 217) |
 | `feMerge` N-layer `over` composite (§15.19)| done (round 217) |
-| Filters (drop-shadow, lighting, …)         | partial (morphology + color-matrix + Gaussian blur + component-transfer + composite + convolve-matrix + turbulence + flood + offset + merge) |
+| `feTile` periodic reference-tile fill (§15.23)| done (round 224) |
+| Filters (drop-shadow, lighting, …)         | partial (morphology + color-matrix + Gaussian blur + component-transfer + composite + convolve-matrix + turbulence + flood + offset + merge + tile) |
 | `<pattern>` paint                         | pending              |
 | Full ICC color-managed pipeline           | pending              |
 

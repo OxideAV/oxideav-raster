@@ -125,10 +125,23 @@
 //!   case is implemented as a fold so the spec's "n-1 Composite
 //!   filters" form is recovered transparently.
 //!
+//! * **Tile** — `feTile` from SVG 1.1 §15.23. Replicate a source
+//!   tile in both X and Y to completely fill a target rectangle. The
+//!   §15.23 placement rule "the top/left corner of each given tile is
+//!   at location `(x + i·width, y + j·height)`" is realised through
+//!   the per-output-pixel index `(x', y') = (((x − tile_x) mod
+//!   src_w) + src_w) mod src_w, …` (Euclidean remainder), so the
+//!   tile origin `(tile_x, tile_y)` can sit at any integer offset
+//!   from the target origin without forcing a different code path
+//!   for negative shifts. An empty `src_w × src_h` tile or an empty
+//!   target rectangle produces an empty output (the §15.23 algorithm
+//!   is undefined on a degenerate reference tile and we return early
+//!   rather than divide by zero).
+//!
 //! # Deferred
 //!
 //! Drop shadow (`feDropShadow`), `feDisplacementMap`,
-//! `feSpecularLighting`, `feDiffuseLighting`, `feTile`, `feImage`,
+//! `feSpecularLighting`, `feDiffuseLighting`, `feImage`,
 //! `feBlend`.
 //!
 //! # Wall provenance
@@ -171,8 +184,15 @@
 //! (corresponding to the last `feMergeNode` child element), on
 //! top") wired through the §14.2 simple-alpha-compositing `over`
 //! algebra `αo = αs + αd · (1 − αs)`, `co = (cs · αs + cd · αd · (1
-//! − αs)) / αo`. No `image` / `imageproc` / `opencv` / `cairo` /
-//! `skia` / `resvg` / `librsvg` source consulted.
+//! − αs)) / αo`. §15.23 for `feTile` ("the top/left corner of each
+//! given tile is at location `(x+i*width, y+j*height)`, where (x,y)
+//! represents the top/left of the input image's filter primitive
+//! subregion … and i and j can be any integer value"); the periodic
+//! sampler is recovered from that placement rule by inverting it
+//! for a given output `(x, y)` into a source `(x', y')` via
+//! Euclidean remainder on `src_w` / `src_h`. No `image` / `imageproc`
+//! / `opencv` / `cairo` / `skia` / `resvg` / `librsvg` source
+//! consulted.
 
 use oxideav_core::Rgba;
 
@@ -5676,5 +5696,293 @@ mod flood_offset_merge_tests {
         let a = vec![0u8; 4 * 4];
         let b = vec![0u8; 4 * 5];
         let _ = merge(2, 2, &[&a, &b]);
+    }
+}
+
+// ----------------------------------------------------------------------
+// SVG 1.1 §15.23 `<feTile>` — replicate a reference tile to fill a
+// target rectangle.
+// ----------------------------------------------------------------------
+
+/// SVG 1.1 §15.23 `<feTile>` — replicate the `src_w × src_h`
+/// reference tile in both X and Y to completely fill the
+/// `tgt_w × tgt_h` target rectangle.
+///
+/// The §15.23 placement rule "the top/left corner of each given tile
+/// is at location `(x + i·width, y + j·height)`, where `(x, y)`
+/// represents the top/left of the input image's filter primitive
+/// subregion … and `i` and `j` can be any integer value" describes a
+/// periodic tiling whose source-coordinate inverse (for a given
+/// output pixel `(out_x, out_y)`) is the Euclidean remainder
+/// `(out_x − tile_x).rem_euclid(src_w as i64)` /
+/// `(out_y − tile_y).rem_euclid(src_h as i64)`. That formulation
+/// covers `tile_x` / `tile_y` of any sign without a separate negative
+/// branch, since `rem_euclid` always returns a non-negative result in
+/// `[0, src_w)` / `[0, src_h)`.
+///
+/// * `src` is the reference tile, `src_w · src_h · 4` bytes in
+///   row-major straight-alpha RGBA order.
+/// * `tile_x`, `tile_y` are the top-left of the reference tile in the
+///   target rectangle's coordinate system (the §15.23 `(x, y)`
+///   attributes on the input filter primitive). A pair of `0` lines
+///   the tile up with the target origin.
+/// * `tgt_w`, `tgt_h` are the target rectangle's dimensions (the
+///   §15.23 `feTile` subregion).
+///
+/// # Panics
+///
+/// * If `src.len() != src_w as usize * src_h as usize * 4`.
+///
+/// # Returns
+///
+/// A packed-RGBA `Vec<u8>` of length `tgt_w · tgt_h · 4`. If either
+/// `src_w` or `src_h` is zero (degenerate reference tile) or either
+/// `tgt_w` or `tgt_h` is zero (degenerate target rectangle), an
+/// empty vector is returned.
+pub fn tile(
+    src: &[u8],
+    src_w: u32,
+    src_h: u32,
+    tile_x: i32,
+    tile_y: i32,
+    tgt_w: u32,
+    tgt_h: u32,
+) -> Vec<u8> {
+    let sw = src_w as usize;
+    let sh = src_h as usize;
+    let expected_src = sw
+        .checked_mul(sh)
+        .and_then(|n| n.checked_mul(4))
+        .expect("tile: src_w * src_h * 4 overflowed usize");
+    assert_eq!(
+        src.len(),
+        expected_src,
+        "tile: src.len() == {} but src_w*src_h*4 == {expected_src}",
+        src.len()
+    );
+
+    if src_w == 0 || src_h == 0 || tgt_w == 0 || tgt_h == 0 {
+        return Vec::new();
+    }
+
+    let tw = tgt_w as usize;
+    let th = tgt_h as usize;
+    let n = tw
+        .checked_mul(th)
+        .and_then(|n| n.checked_mul(4))
+        .expect("tile: tgt_w * tgt_h * 4 overflowed usize");
+    let mut out = Vec::with_capacity(n);
+
+    let src_w_i = src_w as i64;
+    let src_h_i = src_h as i64;
+    let tile_x_i = tile_x as i64;
+    let tile_y_i = tile_y as i64;
+
+    for y in 0..th {
+        let sy = ((y as i64) - tile_y_i).rem_euclid(src_h_i) as usize;
+        let row_start = sy * sw * 4;
+        for x in 0..tw {
+            let sx = ((x as i64) - tile_x_i).rem_euclid(src_w_i) as usize;
+            let p = row_start + sx * 4;
+            out.extend_from_slice(&src[p..p + 4]);
+        }
+    }
+    out
+}
+
+/// Typed-pixel wrapper around [`tile`]. Returns a `Vec<Rgba>` of
+/// length `tgt_w · tgt_h`.
+pub fn tile_pixels(
+    src: &[Rgba],
+    src_w: u32,
+    src_h: u32,
+    tile_x: i32,
+    tile_y: i32,
+    tgt_w: u32,
+    tgt_h: u32,
+) -> Vec<Rgba> {
+    let sn = src_w as usize * src_h as usize;
+    assert_eq!(
+        src.len(),
+        sn,
+        "tile_pixels: src.len() == {} but src_w*src_h == {sn}",
+        src.len()
+    );
+    let mut b = Vec::with_capacity(sn * 4);
+    for p in src {
+        b.extend_from_slice(&[p.r, p.g, p.b, p.a]);
+    }
+    let out = tile(&b, src_w, src_h, tile_x, tile_y, tgt_w, tgt_h);
+    out.chunks_exact(4)
+        .map(|c| Rgba::new(c[0], c[1], c[2], c[3]))
+        .collect()
+}
+
+#[cfg(test)]
+mod tile_tests {
+    use super::*;
+
+    /// A 2×2 reference tile coloured (R, G, B, opaque-grey) in
+    /// row-major order:
+    ///   ( R     | G     )
+    ///   ( B     | grey  )
+    fn rgby_2x2() -> Vec<u8> {
+        vec![
+            255, 0, 0, 255, // (0,0) red
+            0, 255, 0, 255, // (1,0) green
+            0, 0, 255, 255, // (0,1) blue
+            128, 128, 128, 255, // (1,1) grey
+        ]
+    }
+
+    #[test]
+    fn tile_replicates_2x2_into_4x4_with_origin_at_zero() {
+        let src = rgby_2x2();
+        let out = tile(&src, 2, 2, 0, 0, 4, 4);
+        assert_eq!(out.len(), 4 * 4 * 4);
+        // The target should be the 2×2 tile repeated 2×2 times in
+        // both axes. Spot-check a few pixels using the §15.23
+        // periodic rule: out(x, y) = src(x mod 2, y mod 2).
+        let at = |buf: &[u8], x: usize, y: usize| -> [u8; 4] {
+            let p = (y * 4 + x) * 4;
+            [buf[p], buf[p + 1], buf[p + 2], buf[p + 3]]
+        };
+        assert_eq!(at(&out, 0, 0), [255, 0, 0, 255]); // red
+        assert_eq!(at(&out, 1, 0), [0, 255, 0, 255]); // green
+        assert_eq!(at(&out, 2, 0), [255, 0, 0, 255]); // red (wrap)
+        assert_eq!(at(&out, 3, 0), [0, 255, 0, 255]); // green (wrap)
+        assert_eq!(at(&out, 0, 1), [0, 0, 255, 255]); // blue
+        assert_eq!(at(&out, 1, 1), [128, 128, 128, 255]); // grey
+        assert_eq!(at(&out, 2, 2), [255, 0, 0, 255]); // red (wrap)
+        assert_eq!(at(&out, 3, 3), [128, 128, 128, 255]); // grey (wrap)
+    }
+
+    #[test]
+    fn tile_with_tile_origin_shifts_phase() {
+        // tile_x = 1 lines src(0, *) up with target column 1.
+        let src = rgby_2x2();
+        let out = tile(&src, 2, 2, 1, 0, 4, 2);
+        // Target column 0 reads src(-1 mod 2) = src(1, *):
+        //   row 0 column 0 = green;
+        //   row 1 column 0 = grey.
+        let at = |buf: &[u8], x: usize, y: usize| -> [u8; 4] {
+            let p = (y * 4 + x) * 4;
+            [buf[p], buf[p + 1], buf[p + 2], buf[p + 3]]
+        };
+        assert_eq!(at(&out, 0, 0), [0, 255, 0, 255]); // green
+        assert_eq!(at(&out, 1, 0), [255, 0, 0, 255]); // red
+        assert_eq!(at(&out, 0, 1), [128, 128, 128, 255]); // grey
+        assert_eq!(at(&out, 1, 1), [0, 0, 255, 255]); // blue
+    }
+
+    #[test]
+    fn tile_with_negative_tile_origin_matches_modular_arithmetic() {
+        // tile_x = -3 should be congruent with tile_x = +1 modulo
+        // src_w = 2 (since -3 ≡ 1 (mod 2)).
+        let src = rgby_2x2();
+        let a = tile(&src, 2, 2, -3, 0, 6, 2);
+        let b = tile(&src, 2, 2, 1, 0, 6, 2);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn tile_target_smaller_than_source_crops() {
+        // A 5×5 source tiled into a 3×3 target returns the top-left
+        // 3×3 of the source (origin (0, 0) lines the tile up with
+        // the target origin, the §15.23 default).
+        let mut src = vec![0u8; 5 * 5 * 4];
+        for (i, b) in src.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        let out = tile(&src, 5, 5, 0, 0, 3, 3);
+        for y in 0..3 {
+            for x in 0..3 {
+                let dst = (y * 3 + x) * 4;
+                let s = (y * 5 + x) * 4;
+                assert_eq!(&out[dst..dst + 4], &src[s..s + 4]);
+            }
+        }
+    }
+
+    #[test]
+    fn tile_target_equal_to_source_is_identity() {
+        let src = rgby_2x2();
+        let out = tile(&src, 2, 2, 0, 0, 2, 2);
+        assert_eq!(out, src);
+    }
+
+    #[test]
+    fn tile_1x1_source_paints_constant_target() {
+        // The §15.23 case where the reference tile is one pixel:
+        // every target pixel is that one pixel.
+        let src = vec![10, 20, 30, 255];
+        let out = tile(&src, 1, 1, 0, 0, 5, 4);
+        assert_eq!(out.len(), 5 * 4 * 4);
+        for px in out.chunks_exact(4) {
+            assert_eq!(px, [10, 20, 30, 255]);
+        }
+    }
+
+    #[test]
+    fn tile_empty_source_returns_empty() {
+        let out = tile(&[], 0, 5, 0, 0, 4, 4);
+        assert!(out.is_empty());
+        let out = tile(&[], 5, 0, 0, 0, 4, 4);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn tile_empty_target_returns_empty() {
+        let src = rgby_2x2();
+        let out = tile(&src, 2, 2, 0, 0, 0, 4);
+        assert!(out.is_empty());
+        let out = tile(&src, 2, 2, 0, 0, 4, 0);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn tile_periodicity_holds_for_arbitrary_target() {
+        // For any output `(x, y)` the §15.23 placement rule says
+        // out(x, y) == out(x + k·src_w, y + l·src_h) for any integer
+        // (k, l), as long as both pixels land in the target.
+        let mut src = vec![0u8; 3 * 3 * 4];
+        for (i, b) in src.iter_mut().enumerate() {
+            *b = (i * 7 % 251) as u8;
+        }
+        let w = 9; // 3 tile widths
+        let h = 6; // 2 tile heights
+        let out = tile(&src, 3, 3, 0, 0, w, h);
+        for y in 0..3 {
+            for x in 0..3 {
+                let a = (y * w as usize + x) * 4;
+                let b = (y * w as usize + (x + 3)) * 4;
+                let c = ((y + 3) * w as usize + x) * 4;
+                assert_eq!(&out[a..a + 4], &out[b..b + 4]);
+                assert_eq!(&out[a..a + 4], &out[c..c + 4]);
+            }
+        }
+    }
+
+    #[test]
+    fn tile_pixels_matches_byte_path() {
+        let src = rgby_2x2();
+        let src_p: Vec<Rgba> = src
+            .chunks_exact(4)
+            .map(|c| Rgba::new(c[0], c[1], c[2], c[3]))
+            .collect();
+        let bytes_out = tile(&src, 2, 2, 1, -1, 6, 5);
+        let typed_out = tile_pixels(&src_p, 2, 2, 1, -1, 6, 5);
+        let from_typed: Vec<u8> = typed_out
+            .iter()
+            .flat_map(|p| [p.r, p.g, p.b, p.a])
+            .collect();
+        assert_eq!(bytes_out, from_typed);
+    }
+
+    #[test]
+    #[should_panic(expected = "src.len()")]
+    fn tile_wrong_source_length_panics() {
+        let src = vec![0u8; 8];
+        let _ = tile(&src, 4, 4, 0, 0, 2, 2);
     }
 }
