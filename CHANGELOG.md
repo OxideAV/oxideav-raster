@@ -9,6 +9,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `feBlend` filter primitive (SVG 1.1 §15.9) — per-pixel combination of
+  two equally-sized inputs through one of five spec-listed modes.
+  - `blend_filter(in1, in2, width, height, mode) -> Vec<u8>` plus the
+    typed-pixel wrapper `blend_filter_pixels(...) -> Vec<Rgba>`. The
+    `mode` argument takes a `BlendFilterMode` (`Normal | Multiply |
+    Screen | Darken | Lighten`); the §15.9 attribute table lists
+    `Normal` as the default (`BlendFilterMode::default()` returns it).
+  - Result alpha follows the §15.9 mode-independent rule
+    `qr = 1 − (1 − qa) · (1 − qb)` — evaluated once per pixel and
+    shared across the three colour channels.
+  - The five per-mode colour formulas operate on premultiplied RGB,
+    matching the §15.9 statement that the `ca` / `cb` quantities are
+    "premultiplied" in the formula table:
+    `normal: cr = (1 − qa) · cb + ca`;
+    `multiply: cr = (1 − qa) · cb + (1 − qb) · ca + ca · cb`;
+    `screen: cr = cb + ca − ca · cb`;
+    `darken: cr = Min((1 − qa) · cb + ca, (1 − qb) · ca + cb)`;
+    `lighten: cr = Max((1 − qa) · cb + ca, (1 − qb) · ca + cb)`.
+    The straight-alpha `u8` inputs are converted to premultiplied
+    `[0, 1]` floats at the buffer boundary and the premultiplied
+    result is converted back to straight-alpha bytes for output —
+    the convention used elsewhere in the filter module
+    (`composite_filter`, `merge`).
+  - When `qr <= 0` (both operands fully transparent) the §15.7.3
+    transparent-black value `(0, 0, 0, 0)` is emitted directly to
+    avoid the undefined `0 / 0` un-premultiply division. The
+    `cr / qr` colour division is otherwise clamped to `[0, 1]`
+    before quantisation to absorb floating-point drift on the
+    `screen` and `lighten` paths.
+  - Per the §15.9 note, `normal` mode is the pixel-wise equivalent
+    of `feComposite` operator `"over"`; the integration suite
+    cross-checks the two routines on opaque pairs and confirms
+    bit-exact agreement.
+  - 22 new tests across `src/filter.rs::blend_filter_tests` and
+    `tests/filter_blend.rs` covering: default mode is `Normal`;
+    transparent-top yields bottom under `Normal`; opaque-top yields
+    top under `Normal`; `Normal` opaque-pair matches `composite_filter`
+    `Over`; `Multiply` opaque-pair is the component-wise product;
+    `Screen` opaque-pair follows the `ca + cb − ca·cb` formula;
+    `Darken` / `Lighten` opaque-pair reduce to component-wise min /
+    max; result-alpha invariance across all five modes; typed-pixel
+    wrapper byte-equivalence; full-transparent collapse to
+    transparent black across modes; modes diverge on a general
+    mixed-alpha pair (no enum-arm aliasing); empty-extent
+    short-circuit; length-mismatch panics on `in1`, `in2`.
 - `feDisplacementMap` filter primitive (SVG 1.1 §15.15) — per-pixel
   channel-driven warp of `in1` by the §15.15 algorithm
   `P'(x, y) = P(x + scale · (XC(x, y) − 0.5),

@@ -175,14 +175,15 @@ pub use cache::{CacheStats, RasterizedSubtree};
 pub use composite::{composite_rgba_premultiplied, composite_rgba_premultiplied_blend};
 pub use fill::{rasterize_fill, AlphaMask};
 pub use filter::{
-    color_matrix, color_matrix_op, color_matrix_pixels, component_transfer,
-    component_transfer_pixels, composite_filter, composite_filter_pixels, convolve_matrix,
-    convolve_matrix_pixels, displacement_map, displacement_map_pixels, flood, flood_pixels,
-    gaussian_blur, gaussian_blur_pixels, merge, merge_pixels, morphology, morphology_pixels,
-    offset, offset_pixels, tile, tile_pixels, turbulence_filter, turbulence_filter_pixels,
-    ColorMatrix, ColorMatrixOp, ComponentTransfer, CompositeOp, ConvolveEdgeMode, ConvolveMatrix,
-    DisplacementChannel, DisplacementSampling, MorphologyOp, OffsetSampling, StitchTiles,
-    TransferFunc, Turbulence, TurbulenceType, GAUSSIAN_BLUR_BOX_THRESHOLD,
+    blend_filter, blend_filter_pixels, color_matrix, color_matrix_op, color_matrix_pixels,
+    component_transfer, component_transfer_pixels, composite_filter, composite_filter_pixels,
+    convolve_matrix, convolve_matrix_pixels, displacement_map, displacement_map_pixels, flood,
+    flood_pixels, gaussian_blur, gaussian_blur_pixels, merge, merge_pixels, morphology,
+    morphology_pixels, offset, offset_pixels, tile, tile_pixels, turbulence_filter,
+    turbulence_filter_pixels, BlendFilterMode, ColorMatrix, ColorMatrixOp, ComponentTransfer,
+    CompositeOp, ConvolveEdgeMode, ConvolveMatrix, DisplacementChannel, DisplacementSampling,
+    MorphologyOp, OffsetSampling, StitchTiles, TransferFunc, Turbulence, TurbulenceType,
+    GAUSSIAN_BLUR_BOX_THRESHOLD,
 };
 pub use flatten::{flatten_arc_to_cubics, flatten_path, FlatContour};
 pub use gradient::{

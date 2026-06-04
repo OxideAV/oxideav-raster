@@ -135,11 +135,26 @@
 //!   its top-left at the target top-left); callers that need a
 //!   different alignment shift the input through [`offset`] first.
 //!
+//! * **Displacement map** — `feDisplacementMap` from SVG 1.1
+//!   §15.15. Per-pixel inverse-mapping warp that resamples `in1`
+//!   at `(x + scale·(XC − 0.5), y + scale·(YC − 0.5))`, where the
+//!   `XC` / `YC` channels are selected out of `in2` by the caller.
+//!   Out-of-bounds samples emit the §15.7.3 transparent-black
+//!   value; integer-nearest and bilinear reconstruction are both
+//!   available.
+//!
+//! * **Blend** — `feBlend` from SVG 1.1 §15.9. Per-pixel
+//!   combination of two equally-sized inputs through one of five
+//!   spec-listed modes (`normal` / `multiply` / `screen` /
+//!   `darken` / `lighten`). Result alpha is the shared
+//!   `qr = 1 − (1 − qa)·(1 − qb)` formula; the mode-specific
+//!   colour formulas operate on the premultiplied colour pair
+//!   `(ca, cb)` per the §15.9 table.
+//!
 //! # Deferred
 //!
-//! Drop shadow (`feDropShadow`), `feDisplacementMap`,
-//! `feSpecularLighting`, `feDiffuseLighting`, `feImage`,
-//! `feBlend`.
+//! Drop shadow (`feDropShadow`), `feSpecularLighting`,
+//! `feDiffuseLighting`, `feImage`.
 //!
 //! # Wall provenance
 //!
@@ -184,7 +199,13 @@
 //! − αs)) / αo`. §15.23 for `feTile` ("the top/left corner of each
 //! given tile is at location (x+i*width, y+j*height) … i and j can be
 //! any integer value") collapsed to the per-pixel Euclidean remainder
-//! `(ox mod src_w, oy mod src_h)`.
+//! `(ox mod src_w, oy mod src_h)`. §15.9 for `feBlend` (the result-
+//! alpha formula `qr = 1 − (1 − qa)·(1 − qb)` shared by all five
+//! modes; the five per-mode colour formulas reproduced verbatim:
+//! `normal: cr = (1 − qa)·cb + ca`, `multiply: cr = (1 − qa)·cb +
+//! (1 − qb)·ca + ca·cb`, `screen: cr = cb + ca − ca·cb`,
+//! `darken: cr = Min((1 − qa)·cb + ca, (1 − qb)·ca + cb)`,
+//! `lighten: cr = Max((1 − qa)·cb + ca, (1 − qb)·ca + cb)`).
 
 use oxideav_core::Rgba;
 
@@ -6756,5 +6777,462 @@ mod displacement_map_tests {
         let d = 2 * w as usize * 4;
         let s = 0usize;
         assert_eq!(&gr[d..d + 4], &in1[s..s + 4]);
+    }
+}
+
+// ----------------------------------------------------------------------
+// SVG 1.1 §15.9 `<feBlend>` — five-mode pixel-wise blend of two inputs.
+// ----------------------------------------------------------------------
+
+/// Mode selector for [`blend_filter`], mirroring the `mode` attribute
+/// of SVG 1.1 §15.9 `<feBlend>` (`"normal" | "multiply" | "screen" |
+/// "darken" | "lighten"`). The §15.9 attribute table gives `Normal` as
+/// the default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BlendFilterMode {
+    /// `cr = (1 − qa) · cb + ca`. §15.9 notes that this is the
+    /// pixel-wise equivalent of `feComposite` operator `"over"` and
+    /// of the §14.2 simple-alpha-compositing source-over rule.
+    #[default]
+    Normal,
+    /// `cr = (1 − qa) · cb + (1 − qb) · ca + ca · cb`. Darkens both
+    /// inputs through the product term while still preserving each
+    /// operand outside the other's coverage via the
+    /// `(1 − qa) · cb + (1 − qb) · ca` extension terms.
+    Multiply,
+    /// `cr = cb + ca − ca · cb`. The classic Burt–Adelson screen
+    /// formula reproduced verbatim from the §15.9 table; brightens
+    /// where either operand has presence.
+    Screen,
+    /// `cr = Min((1 − qa) · cb + ca, (1 − qb) · ca + cb)`. Picks the
+    /// component-wise smaller of the two source-over orderings
+    /// (`a` over `b`, `b` over `a`), per the §15.9 table.
+    Darken,
+    /// `cr = Max((1 − qa) · cb + ca, (1 − qb) · ca + cb)`. Picks the
+    /// component-wise larger of the two source-over orderings, per
+    /// the §15.9 table.
+    Lighten,
+}
+
+/// SVG 1.1 §15.9 `<feBlend>` — combine two equally-sized packed-RGBA
+/// `u8` buffers pixel-wise through one of the five [`BlendFilterMode`]
+/// modes.
+///
+/// `in1` maps to the spec's `in` operand (the `a` / `qa` / `ca`
+/// quantities in the §15.9 formulas) and `in2` maps to the `in2`
+/// operand (the `b` / `qb` / `cb` quantities). Both buffers must be
+/// exactly `width * height * 4` bytes in row-major straight-alpha RGBA
+/// order and describe the same `width × height` extent.
+///
+/// **Result alpha.** §15.9 specifies that *every* mode produces the
+/// same result opacity
+///
+/// ```text
+/// qr = 1 − (1 − qa) · (1 − qb)
+/// ```
+///
+/// — i.e. the symmetric "either input is opaque ⇒ result is opaque"
+/// formula that drops out of the per-mode colour formulas when both
+/// operands are set equal. This routine evaluates `qr` once per pixel
+/// and reuses it across the colour channels.
+///
+/// **Pixel space.** The §15.9 colour formulas are stated in terms of
+/// premultiplied RGB (`ca` / `cb`). This entry point converts each
+/// straight-alpha input byte triple to premultiplied `[0, 1]` floats
+/// (`c · α`), evaluates the chosen mode's formula, and converts the
+/// premultiplied result back to straight-alpha bytes — matching the
+/// pixel-space convention used elsewhere in the module (`composite_filter`,
+/// `merge`).
+///
+/// Complexity is `O(W · H)` with a constant per-pixel cost.
+///
+/// # Panics
+///
+/// * If `in1.len() != width as usize * height as usize * 4`.
+/// * If `in2.len() != width as usize * height as usize * 4`.
+///
+/// # Returns
+///
+/// A new packed-straight-alpha-RGBA `Vec<u8>` of length
+/// `width · height · 4`. An empty extent (`width == 0` or
+/// `height == 0`) returns an empty `Vec`.
+pub fn blend_filter(
+    in1: &[u8],
+    in2: &[u8],
+    width: u32,
+    height: u32,
+    mode: BlendFilterMode,
+) -> Vec<u8> {
+    let w = width as usize;
+    let h = height as usize;
+    let expected = w
+        .checked_mul(h)
+        .and_then(|n| n.checked_mul(4))
+        .expect("blend_filter: width * height * 4 overflowed usize");
+    assert_eq!(
+        in1.len(),
+        expected,
+        "blend_filter: in1.len() == {} but width*height*4 == {expected}",
+        in1.len()
+    );
+    assert_eq!(
+        in2.len(),
+        expected,
+        "blend_filter: in2.len() == {} but width*height*4 == {expected}",
+        in2.len()
+    );
+    if width == 0 || height == 0 {
+        return Vec::new();
+    }
+
+    let mut out = Vec::with_capacity(expected);
+    for (pa, pb) in in1.chunks_exact(4).zip(in2.chunks_exact(4)) {
+        // Straight-alpha bytes → premultiplied `[0, 1]` floats. §15.9
+        // names the alpha quantities `qa` / `qb` and the colour
+        // quantities `ca` / `cb`; the latter are premultiplied so each
+        // straight-alpha byte is multiplied by its own alpha before
+        // entering a mode formula.
+        let qa = pa[3] as f32 / 255.0;
+        let qb = pb[3] as f32 / 255.0;
+        let ca = [
+            pa[0] as f32 / 255.0 * qa,
+            pa[1] as f32 / 255.0 * qa,
+            pa[2] as f32 / 255.0 * qa,
+        ];
+        let cb = [
+            pb[0] as f32 / 255.0 * qb,
+            pb[1] as f32 / 255.0 * qb,
+            pb[2] as f32 / 255.0 * qb,
+        ];
+
+        // §15.9: `qr = 1 − (1 − qa)·(1 − qb)` is shared by all five
+        // modes, so we compute it once.
+        let qr = 1.0 - (1.0 - qa) * (1.0 - qb);
+
+        let mut cr = [0.0f32; 3];
+        for c in 0..3 {
+            let a = ca[c];
+            let b = cb[c];
+            cr[c] = match mode {
+                // §15.9 table row "normal".
+                BlendFilterMode::Normal => (1.0 - qa) * b + a,
+                // §15.9 table row "multiply".
+                BlendFilterMode::Multiply => (1.0 - qa) * b + (1.0 - qb) * a + a * b,
+                // §15.9 table row "screen".
+                BlendFilterMode::Screen => b + a - a * b,
+                // §15.9 table row "darken".
+                BlendFilterMode::Darken => {
+                    let lhs = (1.0 - qa) * b + a;
+                    let rhs = (1.0 - qb) * a + b;
+                    lhs.min(rhs)
+                }
+                // §15.9 table row "lighten".
+                BlendFilterMode::Lighten => {
+                    let lhs = (1.0 - qa) * b + a;
+                    let rhs = (1.0 - qb) * a + b;
+                    lhs.max(rhs)
+                }
+            };
+        }
+
+        // Premultiplied `[0, 1]` → straight-alpha bytes. When `qr == 0`
+        // both inputs are transparent, so the §15.9 colour formulas
+        // collapse to zero and the un-premultiply division would be
+        // 0 / 0; emit the §15.7.3 transparent-black value verbatim.
+        if qr <= 0.0 {
+            out.extend_from_slice(&[0, 0, 0, 0]);
+        } else {
+            let inv = 1.0 / qr;
+            // §15.9 places no upper bound on `cr` for the `screen` and
+            // `lighten` modes — `b + a − a · b` exceeds `qr` when the
+            // premultiplied operands themselves exceed `qr` (which is
+            // impossible here because each `c ≤ q` for premultiplied
+            // straight-alpha inputs), but the clamp survives any
+            // floating-point drift that would round `c / qr` above 1.0
+            // and would otherwise wrap on the `u8` cast.
+            out.push(quantise_unit((cr[0] * inv).clamp(0.0, 1.0)));
+            out.push(quantise_unit((cr[1] * inv).clamp(0.0, 1.0)));
+            out.push(quantise_unit((cr[2] * inv).clamp(0.0, 1.0)));
+            out.push(quantise_unit(qr.clamp(0.0, 1.0)));
+        }
+    }
+    out
+}
+
+/// Typed-pixel wrapper around [`blend_filter`]. Returns a `Vec<Rgba>`
+/// of length `width · height`. Identical semantics — provided for
+/// callers that already have typed pixel buffers.
+pub fn blend_filter_pixels(
+    in1: &[Rgba],
+    in2: &[Rgba],
+    width: u32,
+    height: u32,
+    mode: BlendFilterMode,
+) -> Vec<Rgba> {
+    let n = width as usize * height as usize;
+    assert_eq!(
+        in1.len(),
+        n,
+        "blend_filter_pixels: in1.len() == {} but width*height == {n}",
+        in1.len()
+    );
+    assert_eq!(
+        in2.len(),
+        n,
+        "blend_filter_pixels: in2.len() == {} but width*height == {n}",
+        in2.len()
+    );
+    let mut b1 = Vec::with_capacity(n * 4);
+    let mut b2 = Vec::with_capacity(n * 4);
+    for p in in1 {
+        b1.extend_from_slice(&[p.r, p.g, p.b, p.a]);
+    }
+    for p in in2 {
+        b2.extend_from_slice(&[p.r, p.g, p.b, p.a]);
+    }
+    let out = blend_filter(&b1, &b2, width, height, mode);
+    out.chunks_exact(4)
+        .map(|c| Rgba::new(c[0], c[1], c[2], c[3]))
+        .collect()
+}
+
+#[cfg(test)]
+mod blend_filter_tests {
+    use super::*;
+
+    fn flat(w: u32, h: u32, r: u8, g: u8, b: u8, a: u8) -> Vec<u8> {
+        let mut v = Vec::with_capacity((w * h * 4) as usize);
+        for _ in 0..w * h {
+            v.extend_from_slice(&[r, g, b, a]);
+        }
+        v
+    }
+
+    #[test]
+    fn fully_transparent_inputs_produce_transparent_black() {
+        // `qa = qb = 0` ⇒ `qr = 0`, so the §15.7.3 transparent-black
+        // rule kicks in regardless of which mode is selected.
+        let zero = flat(3, 3, 200, 50, 100, 0);
+        for mode in [
+            BlendFilterMode::Normal,
+            BlendFilterMode::Multiply,
+            BlendFilterMode::Screen,
+            BlendFilterMode::Darken,
+            BlendFilterMode::Lighten,
+        ] {
+            let out = blend_filter(&zero, &zero, 3, 3, mode);
+            assert!(out.iter().all(|&b| b == 0), "mode {mode:?} not fully zero");
+        }
+    }
+
+    #[test]
+    fn normal_mode_over_opaque_dst_keeps_dst() {
+        // `in1` fully transparent ⇒ `qa = ca = 0`; §15.9 normal
+        // formula reduces to `cr = (1−0)·cb + 0 = cb` and `qr = qb`.
+        // Straight-alpha output therefore matches `in2` verbatim.
+        let a = flat(2, 2, 255, 0, 0, 0);
+        let b = flat(2, 2, 10, 20, 30, 255);
+        let out = blend_filter(&a, &b, 2, 2, BlendFilterMode::Normal);
+        assert_eq!(out, b);
+    }
+
+    #[test]
+    fn normal_mode_opaque_src_overrides_dst() {
+        // `in1` fully opaque ⇒ `qa = 1`, so `cr = 0·cb + ca = ca` and
+        // `qr = 1 − 0·(1 − qb) = 1`. Output equals `in1`.
+        let a = flat(2, 2, 30, 60, 90, 255);
+        let b = flat(2, 2, 200, 100, 50, 200);
+        let out = blend_filter(&a, &b, 2, 2, BlendFilterMode::Normal);
+        assert_eq!(out, a);
+    }
+
+    #[test]
+    fn normal_mode_matches_composite_over_on_opaque_pair() {
+        // §15.9 explicitly notes "normal blend mode is equivalent to
+        // operator='over' on the feComposite filter primitive". When
+        // both inputs are fully opaque, the over result is bit-exact
+        // for the colour channels.
+        let a = flat(2, 2, 200, 100, 50, 255);
+        let b = flat(2, 2, 30, 60, 90, 255);
+        let blended = blend_filter(&a, &b, 2, 2, BlendFilterMode::Normal);
+        let composed = composite_filter(&a, &b, 2, 2, CompositeOp::Over);
+        assert_eq!(blended, composed);
+    }
+
+    #[test]
+    fn screen_brightens_partial_pair() {
+        // Opaque mid-grey screened with itself: `qa = qb = 1`,
+        // `ca = cb = 0.5`. §15.9 screen formula:
+        //   cr = 0.5 + 0.5 − 0.25 = 0.75.
+        // qr = 1 − 0·0 = 1 ⇒ straight-alpha output = (0.75, 0.75,
+        // 0.75, 1) ⇒ 191 per channel after `quantise_unit`.
+        let g = flat(1, 1, 128, 128, 128, 255);
+        let out = blend_filter(&g, &g, 1, 1, BlendFilterMode::Screen);
+        // 0.5 = 128/255 ⇒ premul ca = cb ≈ 0.501961. screen ≈
+        // 0.501961·2 − 0.501961² ≈ 0.751978. straight-alpha = same.
+        // quantise = round(0.751978·255 + 0.5) = 192 (one ULP above
+        // the textbook 191 because 128/255 ≠ 0.5 exactly).
+        assert_eq!(out[3], 255);
+        assert!((out[0] as i32 - 192).abs() <= 1);
+        assert!((out[1] as i32 - 192).abs() <= 1);
+        assert!((out[2] as i32 - 192).abs() <= 1);
+    }
+
+    #[test]
+    fn multiply_darkens_partial_pair() {
+        // Same opaque mid-grey: §15.9 multiply formula reduces to
+        //   cr = 0·0.5 + 0·0.5 + 0.5·0.5 = 0.25
+        // (the two `(1−qX)·cY` extension terms vanish for opaque
+        // inputs). qr = 1, output ≈ (64, 64, 64, 255).
+        let g = flat(1, 1, 128, 128, 128, 255);
+        let out = blend_filter(&g, &g, 1, 1, BlendFilterMode::Multiply);
+        assert_eq!(out[3], 255);
+        // 0.501961² ≈ 0.251965; quantise ≈ 64.
+        assert!((out[0] as i32 - 64).abs() <= 1);
+        assert!((out[1] as i32 - 64).abs() <= 1);
+        assert!((out[2] as i32 - 64).abs() <= 1);
+    }
+
+    #[test]
+    fn darken_picks_smaller_lighten_picks_larger() {
+        // Two opaque distinct colours: for opaque pairs both branches
+        // of darken / lighten reduce to picking the smaller / larger
+        // of the two operands per channel.
+        let a = flat(2, 2, 200, 100, 50, 255);
+        let b = flat(2, 2, 30, 200, 90, 255);
+        let dk = blend_filter(&a, &b, 2, 2, BlendFilterMode::Darken);
+        let lt = blend_filter(&a, &b, 2, 2, BlendFilterMode::Lighten);
+        // Expected per channel: min(200,30)=30, min(100,200)=100,
+        // min(50,90)=50; max(200,30)=200, max(100,200)=200,
+        // max(50,90)=90. Within one ULP of the float round-trip.
+        for px in dk.chunks_exact(4) {
+            assert!((px[0] as i32 - 30).abs() <= 1);
+            assert!((px[1] as i32 - 100).abs() <= 1);
+            assert!((px[2] as i32 - 50).abs() <= 1);
+            assert_eq!(px[3], 255);
+        }
+        for px in lt.chunks_exact(4) {
+            assert!((px[0] as i32 - 200).abs() <= 1);
+            assert!((px[1] as i32 - 200).abs() <= 1);
+            assert!((px[2] as i32 - 90).abs() <= 1);
+            assert_eq!(px[3], 255);
+        }
+    }
+
+    #[test]
+    fn result_alpha_uses_symmetric_formula() {
+        // Symmetric `qa = qb = 0.5` ⇒ qr = 1 − 0.5·0.5 = 0.75.
+        // The colour values are tested above; here we only check the
+        // alpha, which is mode-independent per §15.9.
+        let a = flat(1, 1, 0, 0, 0, 128); // 128/255 ≈ 0.502
+        let b = flat(1, 1, 0, 0, 0, 128);
+        for mode in [
+            BlendFilterMode::Normal,
+            BlendFilterMode::Multiply,
+            BlendFilterMode::Screen,
+            BlendFilterMode::Darken,
+            BlendFilterMode::Lighten,
+        ] {
+            let out = blend_filter(&a, &b, 1, 1, mode);
+            // qr = 1 − (1 − 0.502)² ≈ 0.752, quantise ≈ 192.
+            assert!(
+                (out[3] as i32 - 192).abs() <= 1,
+                "mode {mode:?} produced alpha {} not ≈ 192",
+                out[3]
+            );
+        }
+    }
+
+    #[test]
+    fn empty_extent_returns_empty() {
+        let empty: Vec<u8> = Vec::new();
+        for mode in [
+            BlendFilterMode::Normal,
+            BlendFilterMode::Multiply,
+            BlendFilterMode::Screen,
+            BlendFilterMode::Darken,
+            BlendFilterMode::Lighten,
+        ] {
+            let out = blend_filter(&empty, &empty, 0, 0, mode);
+            assert!(out.is_empty(), "mode {mode:?} not empty");
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "blend_filter: in1.len()")]
+    fn wrong_in1_length_panics() {
+        let bad: Vec<u8> = vec![0; 3];
+        let in2 = flat(2, 2, 0, 0, 0, 0);
+        let _ = blend_filter(&bad, &in2, 2, 2, BlendFilterMode::Normal);
+    }
+
+    #[test]
+    #[should_panic(expected = "blend_filter: in2.len()")]
+    fn wrong_in2_length_panics() {
+        let in1 = flat(2, 2, 0, 0, 0, 0);
+        let bad: Vec<u8> = vec![0; 5];
+        let _ = blend_filter(&in1, &bad, 2, 2, BlendFilterMode::Normal);
+    }
+
+    #[test]
+    fn typed_pixel_wrapper_matches_byte_path() {
+        let w = 3u32;
+        let h = 3u32;
+        let bytes_in1 = flat(w, h, 200, 100, 50, 128);
+        let bytes_in2 = flat(w, h, 30, 200, 90, 200);
+        let pixels_in1: Vec<Rgba> = bytes_in1
+            .chunks_exact(4)
+            .map(|c| Rgba::new(c[0], c[1], c[2], c[3]))
+            .collect();
+        let pixels_in2: Vec<Rgba> = bytes_in2
+            .chunks_exact(4)
+            .map(|c| Rgba::new(c[0], c[1], c[2], c[3]))
+            .collect();
+        for mode in [
+            BlendFilterMode::Normal,
+            BlendFilterMode::Multiply,
+            BlendFilterMode::Screen,
+            BlendFilterMode::Darken,
+            BlendFilterMode::Lighten,
+        ] {
+            let bytes_out = blend_filter(&bytes_in1, &bytes_in2, w, h, mode);
+            let pixels_out = blend_filter_pixels(&pixels_in1, &pixels_in2, w, h, mode);
+            let bytes_from_typed: Vec<u8> = pixels_out
+                .iter()
+                .flat_map(|p| [p.r, p.g, p.b, p.a])
+                .collect();
+            assert_eq!(bytes_out, bytes_from_typed, "mode {mode:?} mismatch");
+        }
+    }
+
+    #[test]
+    fn modes_diverge_on_general_pair() {
+        // A partial-alpha pair where every mode produces a different
+        // result: catches accidental collapse of two arms of the
+        // enum onto the same arithmetic path.
+        let a = flat(1, 1, 200, 100, 50, 200);
+        let b = flat(1, 1, 30, 180, 90, 150);
+        let normal = blend_filter(&a, &b, 1, 1, BlendFilterMode::Normal);
+        let multiply = blend_filter(&a, &b, 1, 1, BlendFilterMode::Multiply);
+        let screen = blend_filter(&a, &b, 1, 1, BlendFilterMode::Screen);
+        let darken = blend_filter(&a, &b, 1, 1, BlendFilterMode::Darken);
+        let lighten = blend_filter(&a, &b, 1, 1, BlendFilterMode::Lighten);
+        // All five must produce distinct outputs on this input.
+        let outputs = [&normal, &multiply, &screen, &darken, &lighten];
+        for i in 0..outputs.len() {
+            for j in (i + 1)..outputs.len() {
+                assert_ne!(
+                    outputs[i], outputs[j],
+                    "outputs {i} and {j} collapsed onto the same arithmetic path"
+                );
+            }
+        }
+        // §15.9 shared-alpha invariant: every mode produces the same
+        // result alpha for the same input pair.
+        let qr = normal[3];
+        assert_eq!(multiply[3], qr);
+        assert_eq!(screen[3], qr);
+        assert_eq!(darken[3], qr);
+        assert_eq!(lighten[3], qr);
     }
 }
