@@ -5995,3 +5995,766 @@ mod tile_tests {
         assert!(out.is_empty());
     }
 }
+
+// ----------------------------------------------------------------------
+// SVG 1.1 §15.15 `<feDisplacementMap>` — pixel-channel-driven warp.
+// ----------------------------------------------------------------------
+
+/// Channel of the displacement map (`in2`) whose `[0, 1]` value drives
+/// the per-axis source offset in [`displacement_map`].
+///
+/// Mirrors the `xChannelSelector` / `yChannelSelector` attributes of the
+/// SVG 1.1 §15.15 `<feDisplacementMap>` element; both attributes default
+/// to [`DisplacementChannel::A`] per the §15.15 attribute definitions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DisplacementChannel {
+    /// Red channel of the displacement map.
+    R,
+    /// Green channel of the displacement map.
+    G,
+    /// Blue channel of the displacement map.
+    B,
+    /// Alpha channel of the displacement map. §15.15 default.
+    #[default]
+    A,
+}
+
+impl DisplacementChannel {
+    /// Index of the selected channel inside a packed-RGBA pixel
+    /// (`[R, G, B, A]` at offsets 0–3).
+    #[inline]
+    fn byte_offset(self) -> usize {
+        match self {
+            DisplacementChannel::R => 0,
+            DisplacementChannel::G => 1,
+            DisplacementChannel::B => 2,
+            DisplacementChannel::A => 3,
+        }
+    }
+}
+
+/// Sample-reconstruction policy used when [`displacement_map`] reads
+/// from `in1` at the warped source coordinate.
+///
+/// The §15.15 note "high quality viewers [should] apply an interpolent
+/// on the surrounding pixels, for example bilinear or bicubic, rather
+/// than simply selecting the nearest source pixel" is the spec's
+/// permission to choose between integer-rounded sampling and a
+/// fractional-position resampler. We expose the same two-choice axis
+/// that [`OffsetSampling`] exposes for the §15.21 primitive: a
+/// bit-exact nearest-pixel default and a bilinear-resampling
+/// alternative for the fractional-displacement case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DisplacementSampling {
+    /// Round the warped source coordinate to the nearest integer pixel
+    /// and copy the source byte triple verbatim. Out-of-bounds source
+    /// positions emit transparent black `(0, 0, 0, 0)` per the §15.7.3
+    /// "undefined pixels are set to transparent black" rule.
+    #[default]
+    Nearest,
+    /// Resample with bilinear interpolation around the fractional
+    /// source coordinate. Samples whose 2×2 footprint partially falls
+    /// outside the source contribute the transparent-black value on
+    /// the out-of-bounds neighbours, naturally fading the warped
+    /// image at the displacement-induced edges. Coincides bit-exactly
+    /// with [`DisplacementSampling::Nearest`] when the per-pixel
+    /// warped coordinate happens to be an integer.
+    Bilinear,
+}
+
+/// SVG 1.1 §15.15 `<feDisplacementMap>` — spatially displace each pixel
+/// of `in1` by an offset derived from the per-pixel channel value of
+/// `in2`.
+///
+/// The §15.15 algorithm is:
+///
+/// ```text
+/// P'(x, y) = P(x + scale · (XC(x, y) − 0.5),
+///              y + scale · (YC(x, y) − 0.5))
+/// ```
+///
+/// where `P(x, y)` is `in1`, `P'(x, y)` is the output, and
+/// `XC(x, y)` / `YC(x, y)` are the per-pixel `[0, 1]` values of the
+/// channels of `in2` selected by `x_channel` / `y_channel`. A channel
+/// value of `0.5` produces zero displacement on that axis; `0.0`
+/// shifts the source coordinate by `−0.5 · scale`; `1.0` shifts it by
+/// `+0.5 · scale`. `scale = 0` reduces the operation to a copy of
+/// `in1`; the §15.15 attribute table states this explicitly.
+///
+/// Both `in1` and `in2` are packed straight-alpha RGBA buffers of
+/// exactly `width · height · 4` bytes. The §15.15 paragraph "the
+/// calculations using the pixel values from `in2` are performed using
+/// non-premultiplied color values" matches the straight-alpha
+/// convention used throughout this module, so the selected channel
+/// byte divided by `255` is `XC` / `YC` directly. The "input image in
+/// is to remain premultiplied" sentence is the spec's compositing-
+/// model invariant; the warped source is sampled on whatever channel
+/// layout the caller passes in and emitted in the same layout, so the
+/// `in1` colour space is preserved verbatim.
+///
+/// Source positions outside the `[0, width) × [0, height)` extent emit
+/// the §15.7.3 transparent-black value `(0, 0, 0, 0)`. With
+/// [`DisplacementSampling::Bilinear`], out-of-bounds members of the
+/// 2×2 sampling footprint contribute transparent black, which makes
+/// the displaced image fade smoothly at the edges as the warp pulls
+/// samples beyond the source extent.
+///
+/// # Panics
+///
+/// * If `in1.len() != width as usize * height as usize * 4`.
+/// * If `in2.len() != width as usize * height as usize * 4`.
+/// * If `scale` is NaN. (A NaN `scale` would propagate to every
+///   per-pixel coordinate and emit transparent black everywhere — but
+///   it is almost certainly a caller bug, so we surface it loudly
+///   instead of silently producing a blank canvas.)
+///
+/// # Returns
+///
+/// A packed-RGBA `Vec<u8>` of length `width · height · 4` carrying
+/// the warped source. An empty extent (`width == 0` or `height == 0`)
+/// returns an empty `Vec`.
+pub fn displacement_map(
+    in1: &[u8],
+    in2: &[u8],
+    width: u32,
+    height: u32,
+    scale: f32,
+    x_channel: DisplacementChannel,
+    y_channel: DisplacementChannel,
+    sampling: DisplacementSampling,
+) -> Vec<u8> {
+    assert!(!scale.is_nan(), "displacement_map: scale is NaN");
+    let w = width as usize;
+    let h = height as usize;
+    let expected = w
+        .checked_mul(h)
+        .and_then(|n| n.checked_mul(4))
+        .expect("displacement_map: width * height * 4 overflowed usize");
+    assert_eq!(
+        in1.len(),
+        expected,
+        "displacement_map: in1.len() == {} but width*height*4 == {expected}",
+        in1.len()
+    );
+    assert_eq!(
+        in2.len(),
+        expected,
+        "displacement_map: in2.len() == {} but width*height*4 == {expected}",
+        in2.len()
+    );
+    if width == 0 || height == 0 {
+        return Vec::new();
+    }
+
+    let xc_off = x_channel.byte_offset();
+    let yc_off = y_channel.byte_offset();
+    let wi = width as i64;
+    let hi = height as i64;
+
+    let mut out = vec![0u8; expected];
+    let row_stride = w * 4;
+    for y in 0..hi {
+        let dst_row = (y as usize) * row_stride;
+        let map_row = (y as usize) * row_stride;
+        for x in 0..wi {
+            let map_off = map_row + (x as usize) * 4;
+            // §15.15: XC / YC are the §15.15 "values of the channel
+            // designated by xChannelSelector / yChannelSelector" — the
+            // straight-alpha byte / 255 in the spec's [0, 1] range.
+            let xc = in2[map_off + xc_off] as f32 / 255.0;
+            let yc = in2[map_off + yc_off] as f32 / 255.0;
+            // §15.15 inverse-mapping form, evaluated per output pixel:
+            // sample `in1` at the displaced source coordinate.
+            let sx = x as f32 + scale * (xc - 0.5);
+            let sy = y as f32 + scale * (yc - 0.5);
+            let dst = dst_row + (x as usize) * 4;
+            match sampling {
+                DisplacementSampling::Nearest => {
+                    // Round-half-away-from-zero, matching the
+                    // §15.21 / `offset_nearest` convention so the
+                    // two integer-rounding policies stay consistent
+                    // across the filter module.
+                    let isx = sx.round() as i64;
+                    let isy = sy.round() as i64;
+                    if (0..wi).contains(&isx) && (0..hi).contains(&isy) {
+                        let s = ((isy * wi + isx) as usize) * 4;
+                        out[dst..dst + 4].copy_from_slice(&in1[s..s + 4]);
+                    } // else: transparent black (already zeroed).
+                }
+                DisplacementSampling::Bilinear => {
+                    let x0 = sx.floor() as i64;
+                    let y0 = sy.floor() as i64;
+                    let tx = sx - x0 as f32;
+                    let ty = sy - y0 as f32;
+                    let fetch = |fx: i64, fy: i64| -> [f32; 4] {
+                        if !(0..wi).contains(&fx) || !(0..hi).contains(&fy) {
+                            return [0.0; 4];
+                        }
+                        let p = ((fy * wi + fx) as usize) * 4;
+                        [
+                            in1[p] as f32,
+                            in1[p + 1] as f32,
+                            in1[p + 2] as f32,
+                            in1[p + 3] as f32,
+                        ]
+                    };
+                    let c00 = fetch(x0, y0);
+                    let c10 = fetch(x0 + 1, y0);
+                    let c01 = fetch(x0, y0 + 1);
+                    let c11 = fetch(x0 + 1, y0 + 1);
+                    for c in 0..4 {
+                        let top = c00[c] + (c10[c] - c00[c]) * tx;
+                        let bot = c01[c] + (c11[c] - c01[c]) * tx;
+                        let v = top + (bot - top) * ty;
+                        out[dst + c] = v.clamp(0.0, 255.0).round() as u8;
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Typed-pixel wrapper around [`displacement_map`]. Returns a
+/// `Vec<Rgba>` of length `width · height`.
+#[allow(clippy::too_many_arguments)]
+pub fn displacement_map_pixels(
+    in1: &[Rgba],
+    in2: &[Rgba],
+    width: u32,
+    height: u32,
+    scale: f32,
+    x_channel: DisplacementChannel,
+    y_channel: DisplacementChannel,
+    sampling: DisplacementSampling,
+) -> Vec<Rgba> {
+    let n = width as usize * height as usize;
+    assert_eq!(
+        in1.len(),
+        n,
+        "displacement_map_pixels: in1.len() == {} but width*height == {n}",
+        in1.len()
+    );
+    assert_eq!(
+        in2.len(),
+        n,
+        "displacement_map_pixels: in2.len() == {} but width*height == {n}",
+        in2.len()
+    );
+    let mut b1 = Vec::with_capacity(n * 4);
+    let mut b2 = Vec::with_capacity(n * 4);
+    for p in in1 {
+        b1.extend_from_slice(&[p.r, p.g, p.b, p.a]);
+    }
+    for p in in2 {
+        b2.extend_from_slice(&[p.r, p.g, p.b, p.a]);
+    }
+    let out = displacement_map(
+        &b1, &b2, width, height, scale, x_channel, y_channel, sampling,
+    );
+    out.chunks_exact(4)
+        .map(|c| Rgba::new(c[0], c[1], c[2], c[3]))
+        .collect()
+}
+
+#[cfg(test)]
+mod displacement_map_tests {
+    use super::*;
+
+    /// Build a flat-colour `width × height` map whose XC channel is
+    /// `xc_byte` everywhere and YC channel is `yc_byte` everywhere; the
+    /// other two channels are zeroed so accidental selector mistakes
+    /// produce zero-displacement instead of confusing partial warps.
+    fn flat_map(width: u32, height: u32, xc_byte: u8, yc_byte: u8) -> Vec<u8> {
+        // We pack R = xc_byte, G = yc_byte, B = 0, A = 255 (full opaque
+        // so an alpha selector won't accidentally drive a different
+        // displacement than R / G).
+        let n = (width * height) as usize;
+        let mut v = Vec::with_capacity(n * 4);
+        for _ in 0..n {
+            v.extend_from_slice(&[xc_byte, yc_byte, 0, 255]);
+        }
+        v
+    }
+
+    /// Single-coloured opaque source — every pixel equals `(r, g, b, a)`.
+    fn flat_src(width: u32, height: u32, r: u8, g: u8, b: u8, a: u8) -> Vec<u8> {
+        let n = (width * height) as usize;
+        let mut v = Vec::with_capacity(n * 4);
+        for _ in 0..n {
+            v.extend_from_slice(&[r, g, b, a]);
+        }
+        v
+    }
+
+    #[test]
+    fn scale_zero_is_a_copy_of_in1() {
+        // §15.15: "When the value of this attribute is 0, this
+        // operation has no effect on the source image."
+        let in1: Vec<u8> = (0..4 * 4 * 4).map(|i| (i & 0xff) as u8).collect();
+        let in2 = flat_map(4, 4, 128, 128);
+        let out = displacement_map(
+            &in1,
+            &in2,
+            4,
+            4,
+            0.0,
+            DisplacementChannel::R,
+            DisplacementChannel::G,
+            DisplacementSampling::Nearest,
+        );
+        assert_eq!(out, in1);
+    }
+
+    #[test]
+    fn half_grey_displacement_is_zero_shift_regardless_of_scale() {
+        // §15.15: P' = P(x + s·(XC − 0.5), y + s·(YC − 0.5)). When XC =
+        // YC = 0.5, both shift terms are zero regardless of `scale`,
+        // so the output equals `in1`.
+        let in1: Vec<u8> = (0..3 * 3 * 4).map(|i| (i as u8).wrapping_mul(7)).collect();
+        // 128/255 = 0.5019…; we also exercise exact-0.5 by picking a
+        // float-equivalent unsigned byte — `(0.5 * 255).round()` is
+        // 128 with f32 rounding (half-to-even on 127.5? no, 0.5·255 =
+        // 127.5; the nearest is 128 under round-half-away-from-zero,
+        // which is what `f32::round` does).
+        // 128/255 = 0.50196… → shift = 100·(0.00196) = 0.196, rounded
+        // to 0 by nearest sampling. So this case is "approximately
+        // half" not "exactly half"; we use scale = 0 below to assert
+        // the exact-half claim independently. See the next test.
+        let in2 = flat_map(3, 3, 128, 128);
+        let out = displacement_map(
+            &in1,
+            &in2,
+            3,
+            3,
+            100.0,
+            DisplacementChannel::R,
+            DisplacementChannel::G,
+            DisplacementSampling::Nearest,
+        );
+        // Tiny |shift| < 0.5 rounds to 0 under round-to-nearest, so
+        // this is equivalent to a no-op copy under Nearest sampling.
+        assert_eq!(out, in1);
+    }
+
+    #[test]
+    fn full_red_full_x_shift_pulls_from_minus_half_scale() {
+        // §15.15: XC = 1.0 → x-shift = +0.5 · scale. With scale = 10,
+        // every output pixel samples from `(x + 5, y)`. Output column
+        // `x` is therefore in1's column `x + 5` when in bounds, and
+        // transparent-black otherwise.
+        let w = 8u32;
+        let h = 1u32;
+        // Distinct-per-pixel source: each column carries its own red.
+        let mut in1 = Vec::with_capacity((w * h * 4) as usize);
+        for x in 0..w {
+            in1.extend_from_slice(&[(x * 32) as u8, 0, 0, 255]);
+        }
+        // XC = 1.0 (R = 255) everywhere, YC = 0.5 (B = 128) everywhere.
+        let mut in2 = Vec::with_capacity((w * h * 4) as usize);
+        for _ in 0..w {
+            in2.extend_from_slice(&[255, 0, 128, 255]);
+        }
+        let out = displacement_map(
+            &in1,
+            &in2,
+            w,
+            h,
+            10.0,
+            DisplacementChannel::R,
+            DisplacementChannel::B,
+            DisplacementSampling::Nearest,
+        );
+        // shift_x = 10 · (1.0 − 0.5) = 5
+        for x in 0..w {
+            let src_x = x as i64 + 5;
+            let dst = (x as usize) * 4;
+            if src_x < w as i64 {
+                let s = (src_x as usize) * 4;
+                assert_eq!(
+                    &out[dst..dst + 4],
+                    &in1[s..s + 4],
+                    "x = {x}: expected column {src_x} from in1"
+                );
+            } else {
+                assert_eq!(
+                    &out[dst..dst + 4],
+                    &[0, 0, 0, 0],
+                    "x = {x}: expected §15.7.3 transparent black"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn zero_channel_full_negative_x_shift_pulls_from_plus_half_scale() {
+        // XC = 0.0 → x-shift = −0.5 · scale (P samples from x − 5).
+        let w = 8u32;
+        let h = 1u32;
+        let mut in1 = Vec::with_capacity((w * h * 4) as usize);
+        for x in 0..w {
+            in1.extend_from_slice(&[(x * 32) as u8, 0, 0, 255]);
+        }
+        // R = 0 (XC = 0.0), G = 128 (YC = 0.5, zero y-shift).
+        let mut in2 = Vec::with_capacity((w * h * 4) as usize);
+        for _ in 0..w {
+            in2.extend_from_slice(&[0, 128, 0, 255]);
+        }
+        let out = displacement_map(
+            &in1,
+            &in2,
+            w,
+            h,
+            10.0,
+            DisplacementChannel::R,
+            DisplacementChannel::G,
+            DisplacementSampling::Nearest,
+        );
+        // shift_x = 10 · (0.0 − 0.5) = −5
+        for x in 0..w {
+            let src_x = x as i64 - 5;
+            let dst = (x as usize) * 4;
+            if src_x >= 0 {
+                let s = (src_x as usize) * 4;
+                assert_eq!(&out[dst..dst + 4], &in1[s..s + 4]);
+            } else {
+                assert_eq!(&out[dst..dst + 4], &[0, 0, 0, 0]);
+            }
+        }
+    }
+
+    #[test]
+    fn alpha_default_selector_drives_displacement() {
+        // §15.15: "If attribute xChannelSelector is not specified, then
+        // the effect is as if a value of A were specified." Test that
+        // the `DisplacementChannel::A` default does in fact source
+        // displacement from the map's alpha channel.
+        let w = 6u32;
+        let h = 1u32;
+        let mut in1 = Vec::with_capacity((w * h * 4) as usize);
+        for x in 0..w {
+            in1.extend_from_slice(&[(x * 40) as u8, 1, 2, 255]);
+        }
+        // R / G / B = 0 (any non-A selector would ⇒ −0.5·scale shift),
+        // A = 255 (XC via A selector = 1.0 ⇒ +0.5·scale shift).
+        let mut in2 = Vec::with_capacity((w * h * 4) as usize);
+        for _ in 0..w {
+            in2.extend_from_slice(&[0, 0, 0, 255]);
+        }
+        let out = displacement_map(
+            &in1,
+            &in2,
+            w,
+            h,
+            4.0,
+            DisplacementChannel::default(),
+            DisplacementChannel::default(),
+            DisplacementSampling::Nearest,
+        );
+        // Default = A; A = 255 ⇒ XC = YC = 1.0 ⇒ shift = (+2, +2).
+        // h = 1, so any y-shift > 0.5 is out of bounds ⇒ transparent.
+        for x in 0..w {
+            let dst = (x as usize) * 4;
+            assert_eq!(&out[dst..dst + 4], &[0, 0, 0, 0]);
+        }
+    }
+
+    #[test]
+    fn out_of_bounds_displacement_emits_transparent_black() {
+        // Every output pixel demands a source coordinate strictly
+        // outside `[0, w) × [0, h)` ⇒ the entire result is
+        // transparent black per §15.7.3.
+        let w = 4u32;
+        let h = 4u32;
+        let in1 = flat_src(w, h, 100, 150, 200, 255);
+        // XC = 255 (1.0) and YC = 255 (1.0); scale = 10 ⇒ shift =
+        // (+5, +5). Every output pixel samples from outside the source.
+        let in2 = flat_map(w, h, 255, 255);
+        let out = displacement_map(
+            &in1,
+            &in2,
+            w,
+            h,
+            10.0,
+            DisplacementChannel::R,
+            DisplacementChannel::G,
+            DisplacementSampling::Nearest,
+        );
+        assert_eq!(out.len(), (w * h * 4) as usize);
+        for chunk in out.chunks_exact(4) {
+            assert_eq!(chunk, [0, 0, 0, 0]);
+        }
+    }
+
+    #[test]
+    fn empty_extent_returns_empty() {
+        // 0×N and N×0 short-circuit to an empty Vec — no buffer
+        // length to check, no per-pixel work to perform.
+        assert!(displacement_map(
+            &[],
+            &[],
+            0,
+            5,
+            10.0,
+            DisplacementChannel::R,
+            DisplacementChannel::G,
+            DisplacementSampling::Nearest,
+        )
+        .is_empty());
+        assert!(displacement_map(
+            &[],
+            &[],
+            5,
+            0,
+            10.0,
+            DisplacementChannel::R,
+            DisplacementChannel::G,
+            DisplacementSampling::Bilinear,
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn bilinear_at_integer_shift_matches_nearest() {
+        // §15.15 sampling-policy note: "high quality viewers apply an
+        // interpolent" kicks in only at non-integer source coordinates.
+        // Build a case where BOTH per-pixel shifts collapse to exact
+        // integers: XC = R = 1.0, YC = B = 0.0, scale = 2 ⇒
+        // shift_x = +1, shift_y = −1. Pad with a multi-row source so
+        // the bilinear ty-blend stays inside the canvas everywhere
+        // shift_y lands a sample.
+        let w = 4u32;
+        let h = 3u32;
+        let mut in1 = Vec::with_capacity((w * h * 4) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                in1.extend_from_slice(&[(x * 50) as u8, (y * 60) as u8, 9, 255]);
+            }
+        }
+        let mut in2 = Vec::with_capacity((w * h * 4) as usize);
+        for _y in 0..h {
+            for _x in 0..w {
+                // XC = R = 255/255 = 1.0; YC = B = 0/255 = 0.0
+                in2.extend_from_slice(&[255, 128, 0, 255]);
+            }
+        }
+        let nearest = displacement_map(
+            &in1,
+            &in2,
+            w,
+            h,
+            2.0,
+            DisplacementChannel::R, // shift_x = +1 exact
+            DisplacementChannel::B, // shift_y = −1 exact
+            DisplacementSampling::Nearest,
+        );
+        let bilinear = displacement_map(
+            &in1,
+            &in2,
+            w,
+            h,
+            2.0,
+            DisplacementChannel::R,
+            DisplacementChannel::B,
+            DisplacementSampling::Bilinear,
+        );
+        assert_eq!(nearest, bilinear);
+    }
+
+    #[test]
+    fn bilinear_fractional_shift_blends_neighbours() {
+        // Two-column horizontal ramp: column 0 is (0, 0, 0, 255),
+        // column 1 is (200, 0, 0, 255). XC = 191/255 ≈ 0.749; scale =
+        // 2 ⇒ shift_x = 2·(0.749 − 0.5) ≈ +0.498. We sample at output
+        // `x = 0` ⇒ source `≈ 0.498`. Bilinear: `tx ≈ 0.498`,
+        // blend ≈ 0 + 200 · 0.498 ≈ 99.6 ⇒ 100 under round-half-away.
+        let w = 2u32;
+        let h = 1u32;
+        let in1: Vec<u8> = vec![0, 0, 0, 255, 200, 0, 0, 255];
+        let in2: Vec<u8> = vec![
+            191, 128, 0, 255, // XC ≈ 0.749, YC = 0.5019
+            191, 128, 0, 255,
+        ];
+        let out = displacement_map(
+            &in1,
+            &in2,
+            w,
+            h,
+            2.0,
+            DisplacementChannel::R,
+            DisplacementChannel::G,
+            DisplacementSampling::Bilinear,
+        );
+        // At output x = 0: src_x ≈ 0.498, R blends 0 → 200 by ~0.498.
+        // Allowing one byte of rounding slack against the spec form
+        // because both 191/255 and 128/255 are slightly off from the
+        // 0.749 / 0.5019 floats.
+        let r0 = out[0];
+        assert!(
+            (95..=105).contains(&r0),
+            "x=0 R = {r0}; want ≈ 100 from the half-pixel bilinear blend"
+        );
+        // y-shift ≈ 2·(0.5019 − 0.5) ≈ +0.004 — within nearest
+        // tolerance; the bilinear ty < 0.01 so the row blend is
+        // effectively row 0 only.
+        // At output x = 1: src_x ≈ 1.498, neighbour at x = 2 is OOB
+        // ⇒ contributes (0, 0, 0, 0). Result ≈ 200 · 0.502 + 0 · 0.498
+        // ≈ 100.4 ⇒ 100. The alpha collapse is the headline:
+        // alpha ≈ 255 · 0.502 + 0 · 0.498 ≈ 128.
+        let a1 = out[7];
+        assert!(
+            (120..=135).contains(&a1),
+            "x=1 A = {a1}; want ≈ 128 from the §15.7.3 OOB fade-out"
+        );
+    }
+
+    #[test]
+    fn typed_pixel_wrapper_matches_byte_path() {
+        let w = 3u32;
+        let h = 3u32;
+        let bytes_in1 = flat_src(w, h, 30, 60, 90, 220);
+        let bytes_in2 = flat_map(w, h, 200, 80);
+        let pixels_in1: Vec<Rgba> = bytes_in1
+            .chunks_exact(4)
+            .map(|c| Rgba::new(c[0], c[1], c[2], c[3]))
+            .collect();
+        let pixels_in2: Vec<Rgba> = bytes_in2
+            .chunks_exact(4)
+            .map(|c| Rgba::new(c[0], c[1], c[2], c[3]))
+            .collect();
+        let bytes_out = displacement_map(
+            &bytes_in1,
+            &bytes_in2,
+            w,
+            h,
+            6.0,
+            DisplacementChannel::R,
+            DisplacementChannel::G,
+            DisplacementSampling::Nearest,
+        );
+        let pixels_out = displacement_map_pixels(
+            &pixels_in1,
+            &pixels_in2,
+            w,
+            h,
+            6.0,
+            DisplacementChannel::R,
+            DisplacementChannel::G,
+            DisplacementSampling::Nearest,
+        );
+        let bytes_from_typed: Vec<u8> = pixels_out
+            .iter()
+            .flat_map(|p| [p.r, p.g, p.b, p.a])
+            .collect();
+        assert_eq!(bytes_out, bytes_from_typed);
+    }
+
+    #[test]
+    #[should_panic(expected = "displacement_map: in1.len()")]
+    fn wrong_in1_length_panics() {
+        let bad: Vec<u8> = vec![0; 3];
+        let in2 = flat_map(2, 2, 128, 128);
+        let _ = displacement_map(
+            &bad,
+            &in2,
+            2,
+            2,
+            5.0,
+            DisplacementChannel::R,
+            DisplacementChannel::G,
+            DisplacementSampling::Nearest,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "displacement_map: in2.len()")]
+    fn wrong_in2_length_panics() {
+        let in1 = flat_src(2, 2, 0, 0, 0, 0);
+        let bad: Vec<u8> = vec![0; 5];
+        let _ = displacement_map(
+            &in1,
+            &bad,
+            2,
+            2,
+            5.0,
+            DisplacementChannel::R,
+            DisplacementChannel::G,
+            DisplacementSampling::Nearest,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "displacement_map: scale is NaN")]
+    fn nan_scale_panics() {
+        let in1 = flat_src(1, 1, 0, 0, 0, 0);
+        let in2 = flat_map(1, 1, 128, 128);
+        let _ = displacement_map(
+            &in1,
+            &in2,
+            1,
+            1,
+            f32::NAN,
+            DisplacementChannel::R,
+            DisplacementChannel::G,
+            DisplacementSampling::Nearest,
+        );
+    }
+
+    #[test]
+    fn x_channel_and_y_channel_are_independent() {
+        // Build a map where R varies horizontally and G is constant ⇒
+        // selecting R for x and G for y should give a per-column
+        // horizontal shift with no vertical motion. Selecting G for x
+        // and R for y should swap them ⇒ per-column vertical shift
+        // with no horizontal motion.
+        let w = 4u32;
+        let h = 4u32;
+        let mut in1 = Vec::with_capacity((w * h * 4) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                in1.extend_from_slice(&[(x * 60) as u8, (y * 60) as u8, 100, 255]);
+            }
+        }
+        // R varies across columns 0..255, G = 128 (≈ 0.5 ⇒ no shift).
+        let mut in2 = Vec::with_capacity((w * h * 4) as usize);
+        for _y in 0..h {
+            for x in 0..w {
+                let r = (x * 80).min(255) as u8;
+                in2.extend_from_slice(&[r, 128, 0, 255]);
+            }
+        }
+        let rg = displacement_map(
+            &in1,
+            &in2,
+            w,
+            h,
+            4.0,
+            DisplacementChannel::R, // varies ⇒ x-shift varies
+            DisplacementChannel::G, // ≈ 0.5 everywhere ⇒ ~no y-shift
+            DisplacementSampling::Nearest,
+        );
+        let gr = displacement_map(
+            &in1,
+            &in2,
+            w,
+            h,
+            4.0,
+            DisplacementChannel::G, // ≈ 0.5 ⇒ no x-shift
+            DisplacementChannel::R, // varies ⇒ y-shift varies
+            DisplacementSampling::Nearest,
+        );
+        // Two warps must differ — proves the selectors are
+        // independently wired and not aliased.
+        assert_ne!(rg, gr);
+        // And the "G for x" warp must agree with in1 on every column
+        // where the y-shift would land in-bounds and the x-shift is
+        // zero: column x, row y ⇒ samples (x, y + Δy(x)).
+        // Pick the leftmost column where R = 0 ⇒ Δy = 4·(0 − 0.5) = −2,
+        // so output (0, 2) samples in1 (0, 0).
+        // (column 0, row 2) ⇒ output offset = 2·w·4; in1 (0, 0) ⇒ src
+        // offset = 0.
+        let d = 2 * w as usize * 4;
+        let s = 0usize;
+        assert_eq!(&gr[d..d + 4], &in1[s..s + 4]);
+    }
+}

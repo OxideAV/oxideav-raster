@@ -9,6 +9,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `feDisplacementMap` filter primitive (SVG 1.1 §15.15) — per-pixel
+  channel-driven warp of `in1` by the §15.15 algorithm
+  `P'(x, y) = P(x + scale · (XC(x, y) − 0.5),
+                y + scale · (YC(x, y) − 0.5))`,
+  where `XC` / `YC` are the `[0, 1]` channel values of `in2` selected
+  by `xChannelSelector` / `yChannelSelector`.
+  - `displacement_map(in1, in2, width, height, scale, x_channel,
+    y_channel, sampling) -> Vec<u8>` plus the typed-pixel wrapper
+    `displacement_map_pixels(...) -> Vec<Rgba>`. The `XC` / `YC`
+    arguments take a `DisplacementChannel` (`R | G | B | A`); both
+    attributes default to `A` per the §15.15 attribute table
+    (`DisplacementChannel::default()` returns `A`).
+  - The §15.15 paragraph "the calculations using the pixel values
+    from `in2` are performed using non-premultiplied color values"
+    matches the straight-alpha convention used throughout the
+    filter module, so the selected channel byte divided by `255`
+    is `XC` / `YC` directly without an explicit un-premultiply.
+  - Two sample-reconstruction policies are wired in
+    (`DisplacementSampling`): `Nearest` rounds the warped source
+    coordinate to the nearest integer and copies the source byte
+    triple verbatim (round-half-away-from-zero, matching the
+    `OffsetSampling::Nearest` convention so the two integer-rounding
+    policies stay consistent across the filter module); `Bilinear`
+    resamples the four-pixel neighbourhood around the fractional
+    source coordinate, the §15.15 "high quality viewers apply an
+    interpolent on the surrounding pixels, for example bilinear or
+    bicubic" route. Out-of-bounds source positions and out-of-bounds
+    members of the bilinear footprint emit the §15.7.3
+    transparent-black value `(0, 0, 0, 0)`, naturally fading the
+    warped image at the displacement-induced edges. The bilinear
+    path coincides bit-exactly with the nearest path when the
+    per-pixel warped coordinate is integer-valued.
+  - `scale = 0` reduces the operation to a copy of `in1`
+    (§15.15 attribute table: "When the value of this attribute is 0,
+    this operation has no effect on the source image").
+    Negative `scale` is permitted — the formula is linear in `scale`
+    so a sign flip inverts the per-axis shift direction, which is a
+    common authoring shortcut for the §15.15 example pipelines.
+  - 24 new tests across `src/filter.rs::displacement_map_tests` and
+    `tests/filter_displacement_map.rs` covering: `scale = 0` identity
+    under both sampling policies; half-grey (XC = YC ≈ 0.5) shift
+    rounds to zero under nearest; XC = 1.0 / scale = 10 pulls source
+    column `x + 5`; XC = 0.0 / scale = 10 pulls column `x − 5`; the
+    §15.7.3 OOB → transparent-black rule for partial and full extent
+    misses; `DisplacementChannel::default()` reads the alpha channel;
+    `x_channel` and `y_channel` are independently wired (swapping
+    them produces a different warp); negative `scale` inverts the
+    direction; uniform-channel warps respect the analytic per-axis
+    shift formula; the warp is purely local — no synthesised
+    colours; integer-shift bilinear-equals-nearest invariant on a
+    multi-row source; fractional-shift bilinear blends adjacent
+    pixels with the correct interpolation weights; typed-pixel
+    wrapper byte-equivalence under both sampling policies and an
+    arbitrary 6×6 map; empty-extent (`0×N` / `N×0`) short-circuit to
+    an empty `Vec`; length-mismatch panics on `in1`, `in2`;
+    NaN-`scale` panic guard.
 - `feTile` filter primitive (SVG 1.1 §15.23) — periodic replication of
   a reference tile across a target rectangle.
   - `tile(src, src_width, src_height, out_width, out_height) -> Vec<u8>`

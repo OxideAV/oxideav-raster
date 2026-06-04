@@ -132,11 +132,22 @@
 //!   bottom-to-top using the §14.2 simple-alpha-compositing `over`
 //!   operator. Exposed as [`merge`] (with the typed-pixel wrapper
 //!   [`merge_pixels`]).
+//! * `<feDisplacementMap>` (SVG 1.1 §15.15) per-pixel channel-driven
+//!   warp of `in1` by the §15.15 formula
+//!   `P'(x, y) = P(x + scale · (XC − 0.5), y + scale · (YC − 0.5))`,
+//!   where `XC` / `YC` are the `[0, 1]` channel values of `in2`
+//!   selected by `xChannelSelector` / `yChannelSelector` (both default
+//!   to `A`). Two sampling policies are wired in
+//!   ([`DisplacementSampling`]): nearest-pixel sampling on the warped
+//!   coordinate (the default) and bilinear reconstruction for
+//!   fractional shifts (the §15.15 "high quality viewers apply an
+//!   interpolent" route). Out-of-bounds source positions emit
+//!   transparent black per §15.7.3. Exposed as [`displacement_map`]
+//!   (with the typed-pixel wrapper [`displacement_map_pixels`]).
 //!
 //! Deferred to a later round:
 //!
-//! * remaining filters (drop shadow, feDisplacementMap, lighting,
-//!   feTile, feImage, feBlend),
+//! * remaining filters (drop shadow, lighting, feImage, feBlend),
 //! * `<pattern>` paints,
 //! * full ICC-tagged color-managed pipeline (the `linearRGB`
 //!   interpolation space is implemented; per-channel ICC profile
@@ -166,10 +177,11 @@ pub use fill::{rasterize_fill, AlphaMask};
 pub use filter::{
     color_matrix, color_matrix_op, color_matrix_pixels, component_transfer,
     component_transfer_pixels, composite_filter, composite_filter_pixels, convolve_matrix,
-    convolve_matrix_pixels, flood, flood_pixels, gaussian_blur, gaussian_blur_pixels, merge,
-    merge_pixels, morphology, morphology_pixels, offset, offset_pixels, tile, tile_pixels,
-    turbulence_filter, turbulence_filter_pixels, ColorMatrix, ColorMatrixOp, ComponentTransfer,
-    CompositeOp, ConvolveEdgeMode, ConvolveMatrix, MorphologyOp, OffsetSampling, StitchTiles,
+    convolve_matrix_pixels, displacement_map, displacement_map_pixels, flood, flood_pixels,
+    gaussian_blur, gaussian_blur_pixels, merge, merge_pixels, morphology, morphology_pixels,
+    offset, offset_pixels, tile, tile_pixels, turbulence_filter, turbulence_filter_pixels,
+    ColorMatrix, ColorMatrixOp, ComponentTransfer, CompositeOp, ConvolveEdgeMode, ConvolveMatrix,
+    DisplacementChannel, DisplacementSampling, MorphologyOp, OffsetSampling, StitchTiles,
     TransferFunc, Turbulence, TurbulenceType, GAUSSIAN_BLUR_BOX_THRESHOLD,
 };
 pub use flatten::{flatten_arc_to_cubics, flatten_path, FlatContour};

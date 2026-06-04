@@ -47,7 +47,8 @@ produces a packed `Rgba` `VideoFrame`.
 | `feOffset` integer + bilinear-fractional shift (§15.21)| done (round 217) |
 | `feMerge` N-layer `over` composite (§15.19)| done (round 217) |
 | `feTile` periodic tiled-pattern (§15.23)   | done (round 224)     |
-| Filters (drop-shadow, lighting, …)         | partial (morphology + color-matrix + Gaussian blur + component-transfer + composite + convolve-matrix + turbulence + flood + offset + merge + tile) |
+| `feDisplacementMap` channel-driven warp (§15.15)| done (round 230) |
+| Filters (drop-shadow, lighting, …)         | partial (morphology + color-matrix + Gaussian blur + component-transfer + composite + convolve-matrix + turbulence + flood + offset + merge + tile + displacement-map) |
 | `<pattern>` paint                         | pending              |
 | Full ICC color-managed pipeline           | pending              |
 
