@@ -9,6 +9,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `feDiffuseLighting` filter primitive (SVG 1.1 §15.14) — Phong-diffuse
+  lighting of an image's alpha channel treated as a bump-map height
+  field `Z(x, y) = surfaceScale · I(x, y)`. Supports all three §15.8
+  light-source kinds.
+  - `diffuse_lighting(src, width, height, &params) -> Vec<u8>` plus
+    the typed-pixel wrapper `diffuse_lighting_pixels(...) -> Vec<Rgba>`.
+    Parameters are bundled in `DiffuseLighting { surface_scale,
+    diffuse_constant, kernel_unit_length, light_color, light_source }`
+    with a `Default` impl encoding the §15.14 / §15.8.2 attribute
+    defaults (`surface_scale = 1`, `diffuse_constant = 1`,
+    `kernel_unit_length = (1, 1)`, `light_color = white`, distant
+    light at `azimuth = 0`, `elevation = 0`).
+  - `LightSource` enum mirrors the three SVG 1.1 light-source
+    elements: `Distant { azimuth_deg, elevation_deg }` for §15.8.2,
+    `Point { x, y, z }` for §15.8.3, and `Spot { x, y, z,
+    points_at_x, points_at_y, points_at_z, specular_exponent,
+    limiting_cone_angle_deg }` for §15.8.4 — the cone-angle field is
+    `Option<f32>` matching §15.8.4's "if no value is supplied, there
+    is no limiting cone".
+  - Surface-normal computation follows §15.14's nine-region Sobel
+    table verbatim: one kernel variant per corner / edge / interior
+    cell, with the §15.14 `FACTORx / FACTORy` normalising constants
+    tracked per region (`2/(3·d)`, `1/(2·d)`, `1/(3·d)`, `1/(4·d)`).
+    The kernel returns `N = (Nx, Ny, 1) / Norm(Nx, Ny, 1)` per the
+    §15.14 unit-vector formula.
+  - Light-direction `L` is computed per the §15.14 closed forms: a
+    constant `(cos(az)·cos(el), sin(az)·cos(el), sin(el))` for
+    distant sources; `(light_pos − sample_pos) / Norm(…)` for point
+    and spot sources where `Z(x, y) = surfaceScale · I(x, y)` is the
+    sample's height-field value. Spot sources additionally scale the
+    inherited `lighting-color` by `pow(−L·S, specularExponent)` per
+    §15.14, where `S` is the unit vector from the spot source toward
+    its `pointsAt` target; the §15.14 cut-offs (`−L·S ≤ 0` ⇒ no
+    light; `−L·S < cos(limitingConeAngle)` ⇒ no light) zero the
+    emission outside the cone.
+  - Output formula `D = kd · max(N · L, 0) · L_color` reproduces
+    §15.14's `D = kd · (N · L) · Light` with the standard Phong
+    `max(·, 0)` clamp implied by "the standard diffuse component of
+    the Phong lighting model"; `Da = 1.0` everywhere per the §15.14
+    "alpha = 1.0 everywhere" statement.
+  - `kernel_unit_length.0 <= 0` and `kernel_unit_length.1 <= 0` panic
+    per §15.14's "A negative or zero value is an error".
+  - 22 new tests across `src/filter.rs::diffuse_lighting_tests` and
+    `tests/filter_diffuse_lighting.rs` covering: flat surface
+    overhead-distant produces the light colour; flat surface grazing
+    distant emits opaque black; `diffuse_constant = 0` collapses
+    every pixel to opaque black; distant light is position-invariant
+    on a flat surface and quantitatively matches `light_color ·
+    sin(elevation)`; a step-function bump-map lights its facing side
+    only; point light is brightest directly under the source on a
+    flat plate; spot light with 5° cone illuminates the on-axis
+    centre and dark-clamps the corners; `specular_exponent`
+    concentrates emission toward the axis; no-cone spot illuminates
+    the full hemisphere; default parameters match the §15.14 /
+    §15.8.2 attribute defaults; `light_color` and `diffuse_constant`
+    scale the output linearly; typed-pixel wrapper byte-equivalence;
+    `Da = 1.0` invariant across all three light-source kinds; empty
+    extent short-circuit; length-mismatch panic; `kernel_unit_length`
+    zero / negative panics.
 - `feBlend` filter primitive (SVG 1.1 §15.9) — per-pixel combination of
   two equally-sized inputs through one of five spec-listed modes.
   - `blend_filter(in1, in2, width, height, mode) -> Vec<u8>` plus the

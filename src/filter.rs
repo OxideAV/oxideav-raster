@@ -7236,3 +7236,968 @@ mod blend_filter_tests {
         assert_eq!(lighten[3], qr);
     }
 }
+
+// ============================================================================
+// SVG 1.1 §15.14 `<feDiffuseLighting>` — diffuse component of the
+// Phong lighting model, driven by a §15.8.2 / §15.8.3 / §15.8.4 light
+// source. The §15.14 formulas are reproduced verbatim in the routines
+// below; the algorithm is purely a per-pixel arithmetic kernel with no
+// downstream dependencies beyond `quantise_unit`.
+// ============================================================================
+
+/// Light source descriptor for [`DiffuseLighting`].
+///
+/// Mirrors the three light-source elements defined in SVG 1.1
+/// §15.8.2 / §15.8.3 / §15.8.4 — `<feDistantLight>`, `<fePointLight>`
+/// and `<feSpotLight>`. Angle attributes (`azimuth`, `elevation`,
+/// `limiting_cone_angle_deg`) are taken in degrees and converted to
+/// radians inside the lighting kernel, matching the §15.8.2 attribute
+/// definitions ("Direction angle for the light source on the XY plane
+/// (clockwise), in degrees from the x axis").
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum LightSource {
+    /// §15.8.2 `<feDistantLight>` — an infinite light source described
+    /// by direction angles only. The §15.14 unit vector becomes the
+    /// constant
+    ///
+    /// ```text
+    /// Lx = cos(azimuth) · cos(elevation)
+    /// Ly = sin(azimuth) · cos(elevation)
+    /// Lz = sin(elevation)
+    /// ```
+    ///
+    /// independent of `(x, y)`.
+    Distant {
+        /// `azimuth` attribute, in degrees clockwise from the x axis.
+        azimuth_deg: f32,
+        /// `elevation` attribute, in degrees from the XY plane towards
+        /// the positive z axis (z points towards the viewer).
+        elevation_deg: f32,
+    },
+    /// §15.8.3 `<fePointLight>` — a point light at world coordinate
+    /// `(x, y, z)`. The §15.14 unit vector is
+    /// `L = (x − px, y − py, z − Z(x, y)) / Norm(…)` evaluated per
+    /// pixel.
+    Point {
+        /// `x` attribute — X location of the light source.
+        x: f32,
+        /// `y` attribute — Y location of the light source.
+        y: f32,
+        /// `z` attribute — Z location of the light source. Positive z
+        /// points towards the viewer in §15.14's coordinate system.
+        z: f32,
+    },
+    /// §15.8.4 `<feSpotLight>` — a point-style light source whose
+    /// emission is shaped by a focal direction `(pointsAtX,
+    /// pointsAtY, pointsAtZ)`, a focus exponent
+    /// `specularExponent`, and an optional cut-off cone
+    /// `limitingConeAngle`. §15.14 evaluates the light colour
+    /// per-pixel as `Light · pow(−L·S, specularExponent)`, clamping to
+    /// zero when `−L·S ≤ 0` (the surface is behind the spot) or when
+    /// `−L·S < cos(limitingConeAngle)` (the surface is outside the
+    /// projected cone).
+    Spot {
+        /// `x` attribute — X location of the spot source.
+        x: f32,
+        /// `y` attribute — Y location of the spot source.
+        y: f32,
+        /// `z` attribute — Z location of the spot source.
+        z: f32,
+        /// `pointsAtX` — X of the point the spot focuses on.
+        points_at_x: f32,
+        /// `pointsAtY` — Y of the point the spot focuses on.
+        points_at_y: f32,
+        /// `pointsAtZ` — Z of the point the spot focuses on.
+        points_at_z: f32,
+        /// `specularExponent` — focus exponent applied to `−L·S`.
+        /// §15.8.4 defines the default as 1 when the attribute is
+        /// absent.
+        specular_exponent: f32,
+        /// `limitingConeAngle` — half-angle of the projected cone, in
+        /// degrees. `None` corresponds to the §15.8.4 case "if no value
+        /// is supplied, there is no limiting cone".
+        limiting_cone_angle_deg: Option<f32>,
+    },
+}
+
+/// Parameter block for [`diffuse_lighting`].
+///
+/// Mirrors the SVG 1.1 §15.14 `<feDiffuseLighting>` attribute set
+/// (`surfaceScale`, `diffuseConstant`, `kernelUnitLength`) plus the
+/// inherited `lighting-color` presentation property and the single
+/// light-source child.
+///
+/// `kernel_unit_length` carries the explicit-or-default §15.14
+/// `(dx, dy)` pair; the §15.14 surface-normal formulas embed those
+/// deltas in both the `I(x ± dx, y ± dy)` sample positions and in the
+/// `FACTORx / FACTORy` normalising constants. Per §15.14 the default
+/// when `kernelUnitLength` is absent is "very small deltas relative to
+/// a given (x, y) position, which might be implemented in some cases as
+/// one pixel"; this implementation therefore defaults to `(1.0, 1.0)`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DiffuseLighting {
+    /// `surfaceScale` — vertical scale of the height field
+    /// `Z(x, y) = surfaceScale · I(x, y)`. §15.14 default: 1.
+    pub surface_scale: f32,
+    /// `diffuseConstant` — the Phong `kd` term in the §15.14 colour
+    /// formula `D = kd · (N · L) · Light`. §15.14 default: 1.
+    pub diffuse_constant: f32,
+    /// `kernelUnitLength` as `(dx, dy)`. §15.14 default: `(1.0, 1.0)`
+    /// (one pixel in each axis, the only sensible interpretation of
+    /// "very small deltas relative to a given (x, y) position" once
+    /// the renderer has discretised to a pixel grid).
+    pub kernel_unit_length: (f32, f32),
+    /// Inherited `lighting-color` property as a straight-alpha sRGB
+    /// triple. Defaults to white (`(255, 255, 255)`).
+    pub light_color: [u8; 3],
+    /// Light-source descriptor selected by the §15.14 content model
+    /// "exactly one light source element".
+    pub light_source: LightSource,
+}
+
+impl Default for DiffuseLighting {
+    fn default() -> Self {
+        // Defaults per §15.14 attribute table + the §15.8.2 azimuth /
+        // elevation defaults ("if the attribute is not specified, then
+        // the effect is as if a value of 0 were specified") for the
+        // light source.
+        Self {
+            surface_scale: 1.0,
+            diffuse_constant: 1.0,
+            kernel_unit_length: (1.0, 1.0),
+            light_color: [255, 255, 255],
+            light_source: LightSource::Distant {
+                azimuth_deg: 0.0,
+                elevation_deg: 0.0,
+            },
+        }
+    }
+}
+
+/// Identifies which of the nine §15.14 Sobel-kernel regions a sample
+/// position falls into. Encoded as a 2-D enum (`row`, `col`) where each
+/// axis is `Top` / `Middle` / `Bottom` for rows and `Left` / `Middle` /
+/// `Right` for columns; "Middle" denotes the §15.14 interior row /
+/// column (every position not on the corresponding edge).
+#[derive(Debug, Clone, Copy)]
+enum DiffuseRow {
+    Top,
+    Middle,
+    Bottom,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DiffuseCol {
+    Left,
+    Middle,
+    Right,
+}
+
+/// Sample the §15.14 bump-map function `I(x, y) = alpha / 255` with
+/// edge clamping. §15.14 doesn't restate the edge policy explicitly —
+/// it instead defines nine kernel variants that already account for
+/// missing samples on each edge by zeroing the corresponding column /
+/// row coefficient. We still need to *not panic* if an interior-style
+/// access happens to drift outside; clamping reproduces the §15.14
+/// "edge" behaviour identically for the kernels that do reference the
+/// missing sample (their coefficient is zero so the read value is
+/// dropped anyway), and yields a safe well-defined value for any
+/// floating-point round-off case.
+#[inline]
+fn diffuse_sample_alpha(src: &[u8], width: u32, height: u32, x: i32, y: i32) -> f32 {
+    let xx = x.clamp(0, width as i32 - 1) as usize;
+    let yy = y.clamp(0, height as i32 - 1) as usize;
+    let idx = (yy * width as usize + xx) * 4 + 3;
+    src[idx] as f32 / 255.0
+}
+
+/// Compute the §15.14 `(Nx, Ny, Nz)` surface-normal triple for one
+/// pixel — chooses the correct kernel variant (corner / edge /
+/// interior) from the `(row, col)` region pair and applies the
+/// §15.14 formula
+/// `Ni = −surfaceScale · FACTORi · Σ K(j, i) · I(x + (j − 1) · d, y + (i − 1) · d)`.
+///
+/// The kernels and `FACTOR` constants are reproduced verbatim from
+/// §15.14's nine boxed sub-tables, indexed as `k[i][j]` with row-major
+/// order (`i` = row index 0..2, `j` = column index 0..2) so that
+/// `k[0]` is the top row of the §15.14 display, `k[2]` is the bottom
+/// row, `k[i][0]` is the leftmost column.
+#[inline]
+fn diffuse_surface_normal(
+    src: &[u8],
+    width: u32,
+    height: u32,
+    x: u32,
+    y: u32,
+    dx: f32,
+    dy: f32,
+    surface_scale: f32,
+) -> [f32; 3] {
+    let row = if y == 0 {
+        DiffuseRow::Top
+    } else if y == height - 1 {
+        DiffuseRow::Bottom
+    } else {
+        DiffuseRow::Middle
+    };
+    let col = if x == 0 {
+        DiffuseCol::Left
+    } else if x == width - 1 {
+        DiffuseCol::Right
+    } else {
+        DiffuseCol::Middle
+    };
+
+    // §15.14 Kx / Ky / FACTORx / FACTORy for each (row, col) region.
+    // `kx[i][j]` and `ky[i][j]` are reproduced verbatim from the
+    // §15.14 boxed kernel tables; `fx_num` / `fy_num` are the numerator
+    // of the FACTORx / FACTORy fractions (e.g. `2/(3·dx)` ⇒ `fx_num =
+    // 2.0` and the routine divides by `(3.0 · dx)` below). The §15.14
+    // tables encode the denominators implicitly in the `(2 / 3, 1 / 3,
+    // 1 / 2, 1 / 4)` family — track them as `(fx_num, fx_den_dx_mult)`
+    // pairs to keep the `dx` factor explicit.
+    let (kx, fx_num, fx_den_d, ky, fy_num, fy_den_d) = match (row, col) {
+        // Top-left corner — §15.14 boxed pair 1.
+        (DiffuseRow::Top, DiffuseCol::Left) => (
+            [[0.0, 0.0, 0.0], [0.0, -2.0, 2.0], [0.0, -1.0, 1.0]],
+            2.0,
+            3.0,
+            [[0.0, 0.0, 0.0], [0.0, -2.0, -1.0], [0.0, 2.0, 1.0]],
+            2.0,
+            3.0,
+        ),
+        // Top row (interior columns) — §15.14 boxed pair 2.
+        (DiffuseRow::Top, DiffuseCol::Middle) => (
+            [[0.0, 0.0, 0.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]],
+            1.0,
+            3.0,
+            [[0.0, 0.0, 0.0], [-1.0, -2.0, -1.0], [1.0, 2.0, 1.0]],
+            1.0,
+            2.0,
+        ),
+        // Top-right corner — §15.14 boxed pair 3.
+        (DiffuseRow::Top, DiffuseCol::Right) => (
+            [[0.0, 0.0, 0.0], [-2.0, 2.0, 0.0], [-1.0, 1.0, 0.0]],
+            2.0,
+            3.0,
+            [[0.0, 0.0, 0.0], [-1.0, -2.0, 0.0], [1.0, 2.0, 0.0]],
+            2.0,
+            3.0,
+        ),
+        // Left column (interior rows) — §15.14 boxed pair 4.
+        (DiffuseRow::Middle, DiffuseCol::Left) => (
+            [[0.0, -1.0, 1.0], [0.0, -2.0, 2.0], [0.0, -1.0, 1.0]],
+            1.0,
+            2.0,
+            [[0.0, -2.0, -1.0], [0.0, 0.0, 0.0], [0.0, 2.0, 1.0]],
+            1.0,
+            3.0,
+        ),
+        // Interior — §15.14 boxed pair 5 (the centre of the 3×3 grid
+        // of variants).
+        (DiffuseRow::Middle, DiffuseCol::Middle) => (
+            [[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]],
+            1.0,
+            4.0,
+            [[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]],
+            1.0,
+            4.0,
+        ),
+        // Right column (interior rows) — §15.14 boxed pair 6.
+        (DiffuseRow::Middle, DiffuseCol::Right) => (
+            [[-1.0, 1.0, 0.0], [-2.0, 2.0, 0.0], [-1.0, 1.0, 0.0]],
+            1.0,
+            2.0,
+            [[-1.0, -2.0, 0.0], [0.0, 0.0, 0.0], [1.0, 2.0, 0.0]],
+            1.0,
+            3.0,
+        ),
+        // Bottom-left corner — §15.14 boxed pair 7.
+        (DiffuseRow::Bottom, DiffuseCol::Left) => (
+            [[0.0, -1.0, 1.0], [0.0, -2.0, 2.0], [0.0, 0.0, 0.0]],
+            2.0,
+            3.0,
+            [[0.0, -2.0, -1.0], [0.0, 2.0, 1.0], [0.0, 0.0, 0.0]],
+            2.0,
+            3.0,
+        ),
+        // Bottom row (interior columns) — §15.14 boxed pair 8.
+        (DiffuseRow::Bottom, DiffuseCol::Middle) => (
+            [[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [0.0, 0.0, 0.0]],
+            1.0,
+            3.0,
+            [[-1.0, -2.0, -1.0], [1.0, 2.0, 1.0], [0.0, 0.0, 0.0]],
+            1.0,
+            2.0,
+        ),
+        // Bottom-right corner — §15.14 boxed pair 9.
+        (DiffuseRow::Bottom, DiffuseCol::Right) => (
+            [[-1.0, 1.0, 0.0], [-2.0, 2.0, 0.0], [0.0, 0.0, 0.0]],
+            2.0,
+            3.0,
+            [[-1.0, -2.0, 0.0], [1.0, 2.0, 0.0], [0.0, 0.0, 0.0]],
+            2.0,
+            3.0,
+        ),
+    };
+    let factor_x = fx_num / (fx_den_d * dx);
+    let factor_y = fy_num / (fy_den_d * dy);
+
+    // Walk the 3×3 sample window. The §15.14 displacement is `(j − 1)`
+    // columns × `dx` and `(i − 1)` rows × `dy` from the centre `(x, y)`;
+    // i.e. `j = 0` reaches one `dx` step left, `j = 2` one `dx` step
+    // right (analogously for `i` and `dy`).
+    let mut sum_x = 0.0f32;
+    let mut sum_y = 0.0f32;
+    for i in 0..3 {
+        for j in 0..3 {
+            let sx = (x as f32 + (j as f32 - 1.0) * dx).round() as i32;
+            let sy = (y as f32 + (i as f32 - 1.0) * dy).round() as i32;
+            let ival = diffuse_sample_alpha(src, width, height, sx, sy);
+            sum_x += kx[i][j] * ival;
+            sum_y += ky[i][j] * ival;
+        }
+    }
+    let nx = -surface_scale * factor_x * sum_x;
+    let ny = -surface_scale * factor_y * sum_y;
+    let nz = 1.0;
+    let inv_n = 1.0 / (nx * nx + ny * ny + nz * nz).sqrt();
+    [nx * inv_n, ny * inv_n, nz * inv_n]
+}
+
+/// Resolve the §15.14 `L` unit vector and the `(Lr, Lg, Lb)` per-pixel
+/// light-colour triple for one sample position.
+///
+/// `pixel_z` is the §15.14 height-field value `Z(x, y) = surfaceScale ·
+/// I(x, y)`; only `Point` / `Spot` sources consume it. `light_color` is
+/// the inherited `lighting-color` straight-alpha sRGB triple, scaled to
+/// `[0, 1]` in this routine.
+#[inline]
+fn diffuse_light_vector(
+    src: &LightSource,
+    px: f32,
+    py: f32,
+    pixel_z: f32,
+    light_color: [f32; 3],
+) -> ([f32; 3], [f32; 3]) {
+    match *src {
+        LightSource::Distant {
+            azimuth_deg,
+            elevation_deg,
+        } => {
+            // §15.14 / §15.8.2 distant-light unit vector. The spec
+            // states the formula directly in the source coordinate
+            // system, so `azimuth` is in degrees clockwise from the
+            // positive x axis and `elevation` rotates towards the
+            // positive z axis (towards the viewer).
+            let az = azimuth_deg.to_radians();
+            let el = elevation_deg.to_radians();
+            let l = [az.cos() * el.cos(), az.sin() * el.cos(), el.sin()];
+            (l, light_color)
+        }
+        LightSource::Point { x, y, z } => {
+            // §15.14 point-light vector from surface sample to light:
+            //   L = (Lx − x, Ly − y, Lz − Z(x, y)) / Norm(…).
+            let lx = x - px;
+            let ly = y - py;
+            let lz = z - pixel_z;
+            let n = (lx * lx + ly * ly + lz * lz).sqrt();
+            if n == 0.0 {
+                ([0.0, 0.0, 1.0], light_color)
+            } else {
+                ([lx / n, ly / n, lz / n], light_color)
+            }
+        }
+        LightSource::Spot {
+            x,
+            y,
+            z,
+            points_at_x,
+            points_at_y,
+            points_at_z,
+            specular_exponent,
+            limiting_cone_angle_deg,
+        } => {
+            // §15.14 spot-light vector. First compute `L` exactly like
+            // the point-light case, then scale `light_color` by
+            // `pow(−L · S, specularExponent)` where `S` is the unit
+            // vector from the light to its `pointsAt` target.
+            let lx = x - px;
+            let ly = y - py;
+            let lz = z - pixel_z;
+            let nl = (lx * lx + ly * ly + lz * lz).sqrt();
+            let (lhat, l_norm_ok) = if nl == 0.0 {
+                ([0.0, 0.0, 1.0], false)
+            } else {
+                ([lx / nl, ly / nl, lz / nl], true)
+            };
+            let sx = points_at_x - x;
+            let sy = points_at_y - y;
+            let sz = points_at_z - z;
+            let ns = (sx * sx + sy * sy + sz * sz).sqrt();
+            let shat = if ns == 0.0 {
+                [0.0, 0.0, -1.0]
+            } else {
+                [sx / ns, sy / ns, sz / ns]
+            };
+            // §15.14: `−L · S` is the cosine of the angle between the
+            // back-pointing-to-light direction and the spot's focus
+            // direction. Positive `L · S` (i.e. negative `−L · S`)
+            // means the surface is behind the spot and no light is
+            // present.
+            let neg_ls = -(lhat[0] * shat[0] + lhat[1] * shat[1] + lhat[2] * shat[2]);
+            let mut intensity = if neg_ls <= 0.0 || !l_norm_ok {
+                0.0
+            } else {
+                neg_ls.powf(specular_exponent)
+            };
+            if let Some(cone) = limiting_cone_angle_deg {
+                // §15.14: "If `limitingConeAngle` is specified,
+                // −L·S < cos(limitingConeAngle) also indicates that no
+                // light is present."
+                let cos_cone = cone.to_radians().cos();
+                if neg_ls < cos_cone {
+                    intensity = 0.0;
+                }
+            }
+            let lr = [
+                light_color[0] * intensity,
+                light_color[1] * intensity,
+                light_color[2] * intensity,
+            ];
+            (lhat, lr)
+        }
+    }
+}
+
+/// SVG 1.1 §15.14 `<feDiffuseLighting>` — light an image using its
+/// alpha channel as a bump map.
+///
+/// The input `src` is a packed straight-alpha RGBA buffer of
+/// `width · height · 4` bytes; only the alpha channel is consulted,
+/// matching §15.14's "lights an image using the alpha channel as a
+/// bump map". The output is a packed straight-alpha RGBA buffer of the
+/// same dimensions, with every pixel's alpha set to `255` per the
+/// §15.14 statement "the resulting image is an RGBA opaque image based
+/// on the light color with alpha = 1.0 everywhere".
+///
+/// **Algorithm.** Per §15.14:
+///
+/// 1. Read `I(x, y) = alpha / 255` from the source.
+/// 2. Pick the matching Sobel-kernel variant for the §15.14 nine-
+///    region grid (interior plus eight edge / corner cases).
+/// 3. Form `N = (Nx, Ny, 1) / Norm(Nx, Ny, 1)` from the convolution
+///    sums using the kernel's `FACTORx` / `FACTORy` constants.
+/// 4. Form `L` from the [`LightSource`] (distant: constant; point /
+///    spot: per-pixel `light − sample`).
+/// 5. Form the per-pixel `(Lr, Lg, Lb)` light colour: equal to
+///    `lighting-color` for distant and point sources; scaled by
+///    `pow(−L·S, specularExponent)` (and zeroed outside the cone) for
+///    spot sources.
+/// 6. Emit `D = kd · max(N·L, 0) · L_color` per channel, clamped to
+///    `[0, 1]`, and `Da = 1.0`.
+///
+/// The `max(N·L, 0)` clamp is implied by §15.14's Phong-diffuse
+/// formula (negative `N·L` means the surface faces away from the
+/// light) — the spec doesn't state it explicitly, but emitting
+/// negative light onto the alpha channel would produce undefined
+/// behaviour on the `u8` round-trip and the §15.14 reference to "the
+/// standard diffuse component of the Phong lighting model" pins the
+/// max-with-zero convention from the Phong original.
+///
+/// # Panics
+///
+/// * If `src.len() != width as usize * height as usize * 4`.
+/// * If either `kernel_unit_length.0` or `kernel_unit_length.1` is
+///   non-positive — §15.14 lists "A negative or zero value is an
+///   error (see Error processing)" for `kernelUnitLength`.
+///
+/// # Returns
+///
+/// A new packed straight-alpha RGBA `Vec<u8>` of length
+/// `width · height · 4`. An empty extent (`width == 0` or
+/// `height == 0`) returns an empty `Vec`.
+pub fn diffuse_lighting(src: &[u8], width: u32, height: u32, params: &DiffuseLighting) -> Vec<u8> {
+    let w = width as usize;
+    let h = height as usize;
+    let expected = w
+        .checked_mul(h)
+        .and_then(|n| n.checked_mul(4))
+        .expect("diffuse_lighting: width * height * 4 overflowed usize");
+    assert_eq!(
+        src.len(),
+        expected,
+        "diffuse_lighting: src.len() == {} but width*height*4 == {expected}",
+        src.len()
+    );
+    assert!(
+        params.kernel_unit_length.0 > 0.0,
+        "diffuse_lighting: kernel_unit_length.0 must be positive (got {})",
+        params.kernel_unit_length.0
+    );
+    assert!(
+        params.kernel_unit_length.1 > 0.0,
+        "diffuse_lighting: kernel_unit_length.1 must be positive (got {})",
+        params.kernel_unit_length.1
+    );
+    if width == 0 || height == 0 {
+        return Vec::new();
+    }
+
+    let (dx, dy) = params.kernel_unit_length;
+    let kd = params.diffuse_constant;
+    let surface_scale = params.surface_scale;
+    let light_color = [
+        params.light_color[0] as f32 / 255.0,
+        params.light_color[1] as f32 / 255.0,
+        params.light_color[2] as f32 / 255.0,
+    ];
+
+    let mut out = Vec::with_capacity(expected);
+    for y in 0..height {
+        for x in 0..width {
+            let n = diffuse_surface_normal(src, width, height, x, y, dx, dy, surface_scale);
+            // §15.14 `Z(x, y) = surfaceScale · I(x, y)` — only used by
+            // the point / spot light branches when forming `L`.
+            let centre_i = diffuse_sample_alpha(src, width, height, x as i32, y as i32);
+            let pixel_z = surface_scale * centre_i;
+            let (l, l_color) = diffuse_light_vector(
+                &params.light_source,
+                x as f32,
+                y as f32,
+                pixel_z,
+                light_color,
+            );
+            // §15.14 `D = kd · (N · L) · Light`. Phong-diffuse clamps
+            // negative `N · L` to zero (the surface faces away from
+            // the light).
+            let n_dot_l = (n[0] * l[0] + n[1] * l[1] + n[2] * l[2]).max(0.0);
+            let scale = kd * n_dot_l;
+            out.push(quantise_unit((scale * l_color[0]).clamp(0.0, 1.0)));
+            out.push(quantise_unit((scale * l_color[1]).clamp(0.0, 1.0)));
+            out.push(quantise_unit((scale * l_color[2]).clamp(0.0, 1.0)));
+            // §15.14: `Da = 1.0` everywhere.
+            out.push(255);
+        }
+    }
+    out
+}
+
+/// Typed-pixel wrapper around [`diffuse_lighting`]. Returns a
+/// `Vec<Rgba>` of length `width · height`. Identical semantics —
+/// provided for callers that already have typed pixel buffers.
+pub fn diffuse_lighting_pixels(
+    src: &[Rgba],
+    width: u32,
+    height: u32,
+    params: &DiffuseLighting,
+) -> Vec<Rgba> {
+    let n = width as usize * height as usize;
+    assert_eq!(
+        src.len(),
+        n,
+        "diffuse_lighting_pixels: src.len() == {} but width*height == {n}",
+        src.len()
+    );
+    let mut bytes = Vec::with_capacity(n * 4);
+    for p in src {
+        bytes.extend_from_slice(&[p.r, p.g, p.b, p.a]);
+    }
+    let out_bytes = diffuse_lighting(&bytes, width, height, params);
+    out_bytes
+        .chunks_exact(4)
+        .map(|c| Rgba::new(c[0], c[1], c[2], c[3]))
+        .collect()
+}
+
+#[cfg(test)]
+mod diffuse_lighting_tests {
+    use super::*;
+
+    fn flat_alpha(w: u32, h: u32, a: u8) -> Vec<u8> {
+        let mut v = Vec::with_capacity((w * h * 4) as usize);
+        for _ in 0..w * h {
+            v.extend_from_slice(&[0, 0, 0, a]);
+        }
+        v
+    }
+
+    /// §15.14: a flat alpha plane has zero surface gradient, so
+    /// `N = (0, 0, 1)`. Lighting it with a distant light pointing
+    /// straight at the viewer (`elevation = 90°`) gives
+    /// `L = (0, 0, 1)` and `N · L = 1` → emitted colour equals the
+    /// light colour scaled by `kd`. With white light and `kd = 1` the
+    /// output is fully white opaque.
+    #[test]
+    fn flat_surface_distant_overhead_emits_light_color() {
+        let src = flat_alpha(4, 4, 200); // any constant alpha works.
+        let params = DiffuseLighting {
+            surface_scale: 10.0,
+            diffuse_constant: 1.0,
+            kernel_unit_length: (1.0, 1.0),
+            light_color: [255, 255, 255],
+            light_source: LightSource::Distant {
+                azimuth_deg: 0.0,
+                elevation_deg: 90.0,
+            },
+        };
+        let out = diffuse_lighting(&src, 4, 4, &params);
+        for px in out.chunks_exact(4) {
+            assert!(
+                (px[0] as i32 - 255).abs() <= 1,
+                "interior R != 255: {}",
+                px[0]
+            );
+            assert!(
+                (px[1] as i32 - 255).abs() <= 1,
+                "interior G != 255: {}",
+                px[1]
+            );
+            assert!(
+                (px[2] as i32 - 255).abs() <= 1,
+                "interior B != 255: {}",
+                px[2]
+            );
+            assert_eq!(px[3], 255, "§15.14 demands Da = 1 everywhere");
+        }
+    }
+
+    /// §15.14: a flat plane lit edge-on (`elevation = 0°`, light along
+    /// the x axis) gives `N · L = 0` for the interior — the surface is
+    /// parallel to the light direction → emitted colour is black, but
+    /// alpha stays 1.0 ("the resulting image is an RGBA opaque image
+    /// based on the light color with alpha = 1.0 everywhere").
+    #[test]
+    fn flat_surface_distant_grazing_emits_black_opaque() {
+        let src = flat_alpha(4, 4, 200);
+        let params = DiffuseLighting {
+            surface_scale: 10.0,
+            diffuse_constant: 1.0,
+            kernel_unit_length: (1.0, 1.0),
+            light_color: [255, 255, 255],
+            light_source: LightSource::Distant {
+                azimuth_deg: 0.0,
+                elevation_deg: 0.0,
+            },
+        };
+        let out = diffuse_lighting(&src, 4, 4, &params);
+        // Check the interior pixel (1, 1) — corners use a different
+        // kernel that includes asymmetric coefficients but on a flat
+        // input even those give Nx = Ny = 0 because Σ K · constant = 0.
+        let idx = (4 + 1) * 4;
+        assert_eq!(out[idx], 0);
+        assert_eq!(out[idx + 1], 0);
+        assert_eq!(out[idx + 2], 0);
+        assert_eq!(out[idx + 3], 255);
+    }
+
+    /// §15.14: `diffuse_constant = 0` collapses `D = kd · (N·L) · L`
+    /// to zero independent of any other parameter. Alpha still = 1.0.
+    #[test]
+    fn zero_diffuse_constant_emits_black_opaque() {
+        let src = flat_alpha(3, 3, 200);
+        let params = DiffuseLighting {
+            surface_scale: 10.0,
+            diffuse_constant: 0.0,
+            kernel_unit_length: (1.0, 1.0),
+            light_color: [255, 100, 50],
+            light_source: LightSource::Distant {
+                azimuth_deg: 45.0,
+                elevation_deg: 45.0,
+            },
+        };
+        let out = diffuse_lighting(&src, 3, 3, &params);
+        for px in out.chunks_exact(4) {
+            assert_eq!(px[0], 0);
+            assert_eq!(px[1], 0);
+            assert_eq!(px[2], 0);
+            assert_eq!(px[3], 255);
+        }
+    }
+
+    /// §15.14 + §15.8.2: a constant flat alpha plane should produce
+    /// the same colour at every position when lit by a distant light
+    /// (which has no per-pixel positional component). The colour
+    /// should equal `light_color · kd · N · L` with `N = (0, 0, 1)`.
+    #[test]
+    fn distant_light_is_position_invariant_on_flat_surface() {
+        let src = flat_alpha(8, 5, 128);
+        let params = DiffuseLighting {
+            surface_scale: 4.0,
+            diffuse_constant: 1.0,
+            kernel_unit_length: (1.0, 1.0),
+            light_color: [120, 200, 80],
+            // 30° elevation; sin(30°) = 0.5. So N·L = 0.5 → emit half
+            // the light colour.
+            light_source: LightSource::Distant {
+                azimuth_deg: 0.0,
+                elevation_deg: 30.0,
+            },
+        };
+        let out = diffuse_lighting(&src, 8, 5, &params);
+        // 120 · 0.5 ≈ 60, 200 · 0.5 = 100, 80 · 0.5 = 40 — within one
+        // ULP of the quantisation round-trip.
+        for (i, px) in out.chunks_exact(4).enumerate() {
+            assert!(
+                (px[0] as i32 - 60).abs() <= 1,
+                "pixel {i} R = {} not ≈ 60",
+                px[0]
+            );
+            assert!(
+                (px[1] as i32 - 100).abs() <= 1,
+                "pixel {i} G = {} not ≈ 100",
+                px[1]
+            );
+            assert!(
+                (px[2] as i32 - 40).abs() <= 1,
+                "pixel {i} B = {} not ≈ 40",
+                px[2]
+            );
+            assert_eq!(px[3], 255);
+        }
+    }
+
+    /// §15.14: a step-function bump-map produces a non-trivial
+    /// surface normal — half the image at `alpha = 0` and half at
+    /// `alpha = 255` creates a sharp edge that the Sobel kernel
+    /// detects in the cells straddling the boundary. The lit result
+    /// should be brighter on the side facing the light. Along the
+    /// rising edge from `α = 0` (left) to `α = 1` (right), §15.14
+    /// gives `Σ Kx · I > 0`, so `Nx = −surfaceScale · FACTORx · Σ < 0`
+    /// — the normal tilts toward `−x`. For `N · L > 0` we therefore
+    /// need `L_x < 0`, which §15.8.2 gives at `azimuth = 180°`
+    /// (`L = (−1, 0, 0)`).
+    #[test]
+    fn step_bump_lights_facing_side() {
+        let w = 6u32;
+        let h = 4u32;
+        // Left half alpha = 0, right half alpha = 255.
+        let mut src = Vec::with_capacity((w * h * 4) as usize);
+        for _ in 0..h {
+            for x in 0..w {
+                let a = if x < w / 2 { 0u8 } else { 255 };
+                src.extend_from_slice(&[0, 0, 0, a]);
+            }
+        }
+        let params = DiffuseLighting {
+            surface_scale: 5.0,
+            diffuse_constant: 1.0,
+            kernel_unit_length: (1.0, 1.0),
+            light_color: [255, 255, 255],
+            light_source: LightSource::Distant {
+                // §15.8.2 azimuth 180° ⇒ `L = (cos 180°, sin 180°, 0)
+                // = (−1, 0, 0)`. Light comes from the −x side, hits
+                // the face of the rising step.
+                azimuth_deg: 180.0,
+                elevation_deg: 0.0,
+            },
+        };
+        let out = diffuse_lighting(&src, w, h, &params);
+        // The interior pixel just to the left of the step (column
+        // `w/2 − 1`) on an interior row sees the gradient and should
+        // emit a positive value. The interior pixel deep inside the
+        // flat region (column 0) should emit zero (no gradient).
+        let row = 1usize;
+        let edge_idx = (row * w as usize + (w as usize / 2 - 1)) * 4;
+        let flat_idx = (row * w as usize) * 4;
+        assert_eq!(out[flat_idx], 0, "flat region should emit black");
+        assert!(
+            out[edge_idx] > 0,
+            "edge region should emit non-zero, got {}",
+            out[edge_idx]
+        );
+        // All alphas = 255.
+        for px in out.chunks_exact(4) {
+            assert_eq!(px[3], 255);
+        }
+    }
+
+    /// §15.14 point light: when the light sits directly above the
+    /// centre of a flat surface, the per-pixel `L` points "up" most
+    /// strongly at the centre and tilts toward the edges. The centre
+    /// pixel should be the brightest.
+    #[test]
+    fn point_light_brightest_directly_below_source() {
+        let w = 9u32;
+        let h = 9u32;
+        let src = flat_alpha(w, h, 100);
+        let params = DiffuseLighting {
+            surface_scale: 1.0,
+            diffuse_constant: 1.0,
+            kernel_unit_length: (1.0, 1.0),
+            light_color: [255, 255, 255],
+            light_source: LightSource::Point {
+                x: (w as f32 - 1.0) / 2.0,
+                y: (h as f32 - 1.0) / 2.0,
+                z: 10.0,
+            },
+        };
+        let out = diffuse_lighting(&src, w, h, &params);
+        let centre_idx = ((h as usize / 2) * w as usize + w as usize / 2) * 4;
+        let corner_idx = 0usize;
+        assert!(
+            out[centre_idx] >= out[corner_idx],
+            "centre brightness {} should be ≥ corner brightness {}",
+            out[centre_idx],
+            out[corner_idx]
+        );
+    }
+
+    /// §15.8.4 / §15.14 spot light: when `−L · S` is positive (the
+    /// surface is in front of the spot) and inside the limiting
+    /// cone, the spot illuminates the surface. When it's outside,
+    /// the spot emits zero. Place the spot directly above the
+    /// origin pointing straight down with a 5° cone — the centre
+    /// pixel is inside the cone, a distant corner is outside.
+    #[test]
+    fn spot_light_cone_cutoff() {
+        let w = 11u32;
+        let h = 11u32;
+        let src = flat_alpha(w, h, 100);
+        let cx = (w as f32 - 1.0) / 2.0;
+        let cy = (h as f32 - 1.0) / 2.0;
+        let params = DiffuseLighting {
+            surface_scale: 1.0,
+            diffuse_constant: 1.0,
+            kernel_unit_length: (1.0, 1.0),
+            light_color: [255, 255, 255],
+            light_source: LightSource::Spot {
+                x: cx,
+                y: cy,
+                z: 10.0,
+                points_at_x: cx,
+                points_at_y: cy,
+                points_at_z: 0.0,
+                specular_exponent: 1.0,
+                limiting_cone_angle_deg: Some(5.0),
+            },
+        };
+        let out = diffuse_lighting(&src, w, h, &params);
+        let centre_idx = ((h as usize / 2) * w as usize + w as usize / 2) * 4;
+        let corner_idx = 0usize;
+        assert!(
+            out[centre_idx] > 0,
+            "centre should be inside the 5° cone and lit; got {}",
+            out[centre_idx]
+        );
+        assert_eq!(
+            out[corner_idx], 0,
+            "corner sits well outside the 5° cone and should be dark"
+        );
+    }
+
+    /// §15.14 + §15.8.4: `specular_exponent` raises the dependence of
+    /// the spot's emitted colour on the focus angle. With a very high
+    /// exponent and a wide cone, the centre pixel (which lies
+    /// directly on the axis, `−L·S ≈ 1`) is essentially unaffected,
+    /// while an off-axis pixel inside the cone is dimmed sharply.
+    #[test]
+    fn spot_specular_exponent_concentrates_emission() {
+        let w = 11u32;
+        let h = 11u32;
+        let src = flat_alpha(w, h, 100);
+        let cx = (w as f32 - 1.0) / 2.0;
+        let cy = (h as f32 - 1.0) / 2.0;
+        let make = |exponent: f32| DiffuseLighting {
+            surface_scale: 1.0,
+            diffuse_constant: 1.0,
+            kernel_unit_length: (1.0, 1.0),
+            light_color: [255, 255, 255],
+            light_source: LightSource::Spot {
+                x: cx,
+                y: cy,
+                z: 5.0,
+                points_at_x: cx,
+                points_at_y: cy,
+                points_at_z: 0.0,
+                specular_exponent: exponent,
+                limiting_cone_angle_deg: Some(80.0),
+            },
+        };
+        let low = diffuse_lighting(&src, w, h, &make(1.0));
+        let high = diffuse_lighting(&src, w, h, &make(50.0));
+        let centre_idx = ((h as usize / 2) * w as usize + w as usize / 2) * 4;
+        let near_idx = ((h as usize / 2) * w as usize + (w as usize / 2 + 2)) * 4;
+        // The centre is on-axis so `−L·S ≈ 1` and `1^n = 1`; both
+        // exponents produce essentially the same brightness there.
+        assert!((low[centre_idx] as i32 - high[centre_idx] as i32).abs() <= 2);
+        // Off-axis: `−L·S < 1`, so the high exponent dims the
+        // emission much more aggressively than the low one.
+        assert!(
+            high[near_idx] < low[near_idx],
+            "high-exponent off-axis brightness {} should be < low-exponent {}",
+            high[near_idx],
+            low[near_idx]
+        );
+    }
+
+    /// `kernel_unit_length = (0.0, …)` is §15.14's "negative or zero
+    /// value is an error" case and must panic. Same for the `dy`
+    /// axis.
+    #[test]
+    #[should_panic(expected = "kernel_unit_length.0 must be positive")]
+    fn zero_kernel_unit_length_x_panics() {
+        let src = flat_alpha(2, 2, 0);
+        let params = DiffuseLighting {
+            kernel_unit_length: (0.0, 1.0),
+            ..DiffuseLighting::default()
+        };
+        let _ = diffuse_lighting(&src, 2, 2, &params);
+    }
+
+    #[test]
+    #[should_panic(expected = "kernel_unit_length.1 must be positive")]
+    fn zero_kernel_unit_length_y_panics() {
+        let src = flat_alpha(2, 2, 0);
+        let params = DiffuseLighting {
+            kernel_unit_length: (1.0, -0.5),
+            ..DiffuseLighting::default()
+        };
+        let _ = diffuse_lighting(&src, 2, 2, &params);
+    }
+
+    #[test]
+    #[should_panic(expected = "diffuse_lighting: src.len()")]
+    fn wrong_src_length_panics() {
+        let bad: Vec<u8> = vec![0; 3];
+        let params = DiffuseLighting::default();
+        let _ = diffuse_lighting(&bad, 2, 2, &params);
+    }
+
+    #[test]
+    fn empty_extent_returns_empty() {
+        let empty: Vec<u8> = Vec::new();
+        let params = DiffuseLighting::default();
+        let out = diffuse_lighting(&empty, 0, 0, &params);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn typed_pixel_wrapper_matches_byte_path() {
+        let w = 5u32;
+        let h = 4u32;
+        let src_bytes = flat_alpha(w, h, 180);
+        let src_pixels: Vec<Rgba> = src_bytes
+            .chunks_exact(4)
+            .map(|c| Rgba::new(c[0], c[1], c[2], c[3]))
+            .collect();
+        let params = DiffuseLighting {
+            surface_scale: 5.0,
+            diffuse_constant: 0.8,
+            kernel_unit_length: (1.0, 1.0),
+            light_color: [200, 150, 100],
+            light_source: LightSource::Point {
+                x: 2.0,
+                y: 1.5,
+                z: 4.0,
+            },
+        };
+        let bytes_out = diffuse_lighting(&src_bytes, w, h, &params);
+        let pixels_out = diffuse_lighting_pixels(&src_pixels, w, h, &params);
+        let bytes_from_typed: Vec<u8> = pixels_out
+            .iter()
+            .flat_map(|p| [p.r, p.g, p.b, p.a])
+            .collect();
+        assert_eq!(bytes_out, bytes_from_typed);
+    }
+}

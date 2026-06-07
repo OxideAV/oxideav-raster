@@ -49,7 +49,8 @@ produces a packed `Rgba` `VideoFrame`.
 | `feTile` periodic tiled-pattern (§15.23)   | done (round 224)     |
 | `feDisplacementMap` channel-driven warp (§15.15)| done (round 230) |
 | `feBlend` 5-mode pixel-wise blend (§15.9)  | done (round 233)     |
-| Filters (drop-shadow, lighting, …)         | partial (morphology + color-matrix + Gaussian blur + component-transfer + composite + convolve-matrix + turbulence + flood + offset + merge + tile + displacement-map + blend) |
+| `feDiffuseLighting` Phong-diffuse + 3 light sources (§15.14)| done (round 247) |
+| Filters (drop-shadow, feSpecularLighting, feImage) | partial (morphology + color-matrix + Gaussian blur + component-transfer + composite + convolve-matrix + turbulence + flood + offset + merge + tile + displacement-map + blend + diffuse-lighting) |
 | `<pattern>` paint                         | pending              |
 | Full ICC color-managed pipeline           | pending              |
 

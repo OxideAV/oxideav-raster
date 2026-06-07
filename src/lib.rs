@@ -144,10 +144,32 @@
 //!   interpolent" route). Out-of-bounds source positions emit
 //!   transparent black per §15.7.3. Exposed as [`displacement_map`]
 //!   (with the typed-pixel wrapper [`displacement_map_pixels`]).
+//! * `<feBlend>` (SVG 1.1 §15.9) per-pixel five-mode blend of two
+//!   equally-sized inputs (`Normal` / `Multiply` / `Screen` / `Darken`
+//!   / `Lighten`). Result alpha follows the §15.9 mode-independent
+//!   formula `qr = 1 − (1 − qa) · (1 − qb)`. Exposed as
+//!   [`blend_filter`] (with the typed-pixel wrapper
+//!   [`blend_filter_pixels`]).
+//! * `<feDiffuseLighting>` (SVG 1.1 §15.14) Phong-diffuse lighting of
+//!   an image's alpha channel treated as a height field
+//!   `Z(x, y) = surfaceScale · I(x, y)`. The §15.14 surface normal is
+//!   formed from one of nine §15.14-tabulated Sobel-kernel variants
+//!   (one per corner / edge / interior region) and combined with the
+//!   light direction `L` via `D = kd · max(N · L, 0) · L_color`. Three
+//!   §15.8 light-source kinds are supported via [`LightSource`]:
+//!   `Distant` (§15.8.2: constant unit vector from `azimuth` /
+//!   `elevation`), `Point` (§15.8.3: per-pixel
+//!   `L = (light_pos − sample_pos) / Norm`), and `Spot` (§15.8.4:
+//!   per-pixel point-style `L` plus the §15.14 spot-emission scaling
+//!   `Light · pow(−L · S, specularExponent)` with optional
+//!   `limitingConeAngle` cut-off). Result alpha is `1.0` everywhere
+//!   per §15.14. Exposed as [`diffuse_lighting`] (with the typed-pixel
+//!   wrapper [`diffuse_lighting_pixels`]) and parameterised through
+//!   the [`DiffuseLighting`] struct.
 //!
 //! Deferred to a later round:
 //!
-//! * remaining filters (drop shadow, lighting, feImage, feBlend),
+//! * remaining filters (drop shadow, feSpecularLighting, feImage),
 //! * `<pattern>` paints,
 //! * full ICC-tagged color-managed pipeline (the `linearRGB`
 //!   interpolation space is implemented; per-channel ICC profile
@@ -177,12 +199,13 @@ pub use fill::{rasterize_fill, AlphaMask};
 pub use filter::{
     blend_filter, blend_filter_pixels, color_matrix, color_matrix_op, color_matrix_pixels,
     component_transfer, component_transfer_pixels, composite_filter, composite_filter_pixels,
-    convolve_matrix, convolve_matrix_pixels, displacement_map, displacement_map_pixels, flood,
-    flood_pixels, gaussian_blur, gaussian_blur_pixels, merge, merge_pixels, morphology,
-    morphology_pixels, offset, offset_pixels, tile, tile_pixels, turbulence_filter,
-    turbulence_filter_pixels, BlendFilterMode, ColorMatrix, ColorMatrixOp, ComponentTransfer,
-    CompositeOp, ConvolveEdgeMode, ConvolveMatrix, DisplacementChannel, DisplacementSampling,
-    MorphologyOp, OffsetSampling, StitchTiles, TransferFunc, Turbulence, TurbulenceType,
+    convolve_matrix, convolve_matrix_pixels, diffuse_lighting, diffuse_lighting_pixels,
+    displacement_map, displacement_map_pixels, flood, flood_pixels, gaussian_blur,
+    gaussian_blur_pixels, merge, merge_pixels, morphology, morphology_pixels, offset,
+    offset_pixels, tile, tile_pixels, turbulence_filter, turbulence_filter_pixels, BlendFilterMode,
+    ColorMatrix, ColorMatrixOp, ComponentTransfer, CompositeOp, ConvolveEdgeMode, ConvolveMatrix,
+    DiffuseLighting, DisplacementChannel, DisplacementSampling, LightSource, MorphologyOp,
+    OffsetSampling, StitchTiles, TransferFunc, Turbulence, TurbulenceType,
     GAUSSIAN_BLUR_BOX_THRESHOLD,
 };
 pub use flatten::{flatten_arc_to_cubics, flatten_path, FlatContour};
