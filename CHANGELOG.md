@@ -9,6 +9,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `feSpecularLighting` filter primitive (SVG 1.1 §15.22) — Phong-specular
+  reflectance computed from the same §15.14 surface-normal Sobel kernel
+  and §15.8 light-source descriptor as `feDiffuseLighting`.
+  - `specular_lighting(src, width, height, &params) -> Vec<u8>` plus
+    the typed-pixel wrapper
+    `specular_lighting_pixels(...) -> Vec<Rgba>`. Parameters bundled in
+    `SpecularLighting { surface_scale, specular_constant,
+    specular_exponent, kernel_unit_length, light_color, light_source }`
+    with a `Default` impl encoding the §15.22 attribute defaults
+    (`surface_scale = 1`, `specular_constant = 1`,
+    `specular_exponent = 1`, `kernel_unit_length = (1, 1)`,
+    `light_color = white`, distant light at
+    `azimuth = 0` / `elevation = 0`).
+  - Algorithm follows §15.22 verbatim: form
+    `H = (L + E) / Norm(L + E)` with the constant eye vector
+    `E = (0, 0, 1)`, then emit
+    `Sc = ks · pow(max(N·H, 0), specularExponent) · L_color` per RGB
+    channel with `Sa = max(Sr, Sg, Sb)` (the §15.22 "non-opaque
+    image" property distinguishing specular from diffuse, where
+    diffuse sets `Da = 1.0` everywhere). The `max(N·H, 0)` clamp
+    handles the §15.22 degenerate case `L = −E` and surfaces facing
+    away from the halfway direction.
+  - 15 unit tests covering: overhead-distant ⇒ full-white + full
+    alpha; grazing distant ⇒ half-intensity; zero
+    `specular_constant` ⇒ transparent black; coloured light ⇒
+    `Sa = max-channel` (not 255); position-invariance under distant
+    lights; back-of-surface light ⇒ zero; exponent monotonicity at a
+    grazing angle; point-light directly overhead; spot-light
+    outside the §15.8.4 limiting cone ⇒ zero; default-attribute
+    smoke test; three negative-input panic paths; typed-pixel-
+    wrapper equivalence with the byte-buffer path.
+
 - `feDiffuseLighting` filter primitive (SVG 1.1 §15.14) — Phong-diffuse
   lighting of an image's alpha channel treated as a bump-map height
   field `Z(x, y) = surfaceScale · I(x, y)`. Supports all three §15.8

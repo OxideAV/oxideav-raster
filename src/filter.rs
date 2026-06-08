@@ -151,10 +151,27 @@
 //!   colour formulas operate on the premultiplied colour pair
 //!   `(ca, cb)` per the §15.9 table.
 //!
+//! * **Diffuse lighting** — `feDiffuseLighting` from SVG 1.1
+//!   §15.14. Phong-diffuse Sobel-normal bump-map illumination
+//!   keyed off the source alpha channel. Lights a packed-RGBA
+//!   buffer through one of the three §15.8 light-source variants
+//!   (`feDistantLight` / `fePointLight` / `feSpotLight`) and emits
+//!   the §15.14 colour formula `D = kd · max(N·L, 0) · L_color`
+//!   with `Da = 1.0` everywhere.
+//!
+//! * **Specular lighting** — `feSpecularLighting` from SVG 1.1
+//!   §15.22. Phong-specular reflectance, sharing the §15.14
+//!   surface-normal kernel and §15.8 light sources with
+//!   [`diffuse_lighting`]. Per §15.22 the result is
+//!   `S = ks · pow(N·H, specularExponent) · L_color` with
+//!   `H = (L + E) / |L + E|`, `E = (0, 0, 1)`, and an alpha
+//!   channel set to the per-pixel `max(Sr, Sg, Sb)` (so the
+//!   filter produces a non-opaque image meant to be added on top
+//!   of a textured layer via `feComposite`-arithmetic).
+//!
 //! # Deferred
 //!
-//! Drop shadow (`feDropShadow`), `feSpecularLighting`,
-//! `feDiffuseLighting`, `feImage`.
+//! Drop shadow (`feDropShadow`), `feImage`.
 //!
 //! # Wall provenance
 //!
@@ -8194,6 +8211,670 @@ mod diffuse_lighting_tests {
         };
         let bytes_out = diffuse_lighting(&src_bytes, w, h, &params);
         let pixels_out = diffuse_lighting_pixels(&src_pixels, w, h, &params);
+        let bytes_from_typed: Vec<u8> = pixels_out
+            .iter()
+            .flat_map(|p| [p.r, p.g, p.b, p.a])
+            .collect();
+        assert_eq!(bytes_out, bytes_from_typed);
+    }
+}
+
+// ============================================================================
+// SVG 1.1 §15.22 `<feSpecularLighting>` — specular component of the
+// Phong lighting model. Shares the §15.14 surface-normal kernel and
+// the §15.8 light-source descriptor with `<feDiffuseLighting>`; only
+// the per-pixel illumination formula differs.
+// ============================================================================
+
+/// Parameter block for [`specular_lighting`].
+///
+/// Mirrors the SVG 1.1 §15.22 `<feSpecularLighting>` attribute set
+/// (`surfaceScale`, `specularConstant`, `specularExponent`,
+/// `kernelUnitLength`) plus the inherited `lighting-color` property
+/// and the single light-source child. The light-source descriptor is
+/// the same [`LightSource`] enum used by [`DiffuseLighting`]; the
+/// §15.22 spec defines it through "See ‘feDiffuseLighting’ for
+/// definition of N and (Lr, Lg, Lb)".
+///
+/// Per §15.22 attribute table:
+///
+/// * `surfaceScale` default 1.
+/// * `specularConstant` default 1, non-negative.
+/// * `specularExponent` default 1, range 1.0..=128.0.
+/// * `kernelUnitLength` default `(1.0, 1.0)`; a negative or zero
+///   value is an error.
+/// * `lighting-color` default white `(255, 255, 255)`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SpecularLighting {
+    /// `surfaceScale` — vertical scale of the height field
+    /// `Z(x, y) = surfaceScale · I(x, y)`. §15.22 default: 1.
+    pub surface_scale: f32,
+    /// `specularConstant` — the Phong `ks` term in the §15.22 colour
+    /// formula `S = ks · pow(N · H, specularExponent) · L_color`.
+    /// §15.22 default: 1; "this can be any non-negative number".
+    pub specular_constant: f32,
+    /// `specularExponent` — the §15.22 focus exponent applied to
+    /// `N · H`. §15.22 default: 1; spec range 1.0..=128.0. The
+    /// implementation honours the §15.22 attribute table verbatim
+    /// (no clamping) so a caller that has already validated the
+    /// presentation-attribute parse can pass any positive number.
+    pub specular_exponent: f32,
+    /// `kernelUnitLength` as `(dx, dy)`. §15.22 default: `(1.0, 1.0)`
+    /// — same convention as the §15.14 `kernelUnitLength` because
+    /// §15.22 reuses the §15.14 surface-normal definition verbatim.
+    pub kernel_unit_length: (f32, f32),
+    /// Inherited `lighting-color` property as a straight-alpha sRGB
+    /// triple. Defaults to white `(255, 255, 255)`.
+    pub light_color: [u8; 3],
+    /// Light-source descriptor selected by the §15.22 content model
+    /// ("exactly one light source element").
+    pub light_source: LightSource,
+}
+
+impl Default for SpecularLighting {
+    fn default() -> Self {
+        // Defaults per §15.22 attribute table + the §15.8.2 azimuth /
+        // elevation defaults inherited through [`LightSource`].
+        Self {
+            surface_scale: 1.0,
+            specular_constant: 1.0,
+            specular_exponent: 1.0,
+            kernel_unit_length: (1.0, 1.0),
+            light_color: [255, 255, 255],
+            light_source: LightSource::Distant {
+                azimuth_deg: 0.0,
+                elevation_deg: 0.0,
+            },
+        }
+    }
+}
+
+/// SVG 1.1 §15.22 `<feSpecularLighting>` — light an image using its
+/// alpha channel as a bump map, emitting the specular component of
+/// the Phong lighting model.
+///
+/// The input `src` is a packed straight-alpha RGBA buffer of
+/// `width · height · 4` bytes; only the alpha channel is consulted,
+/// matching §15.22's "lights a source graphic using the alpha channel
+/// as a bump map" + the §15.14 reference for `N`. The output is a
+/// packed straight-alpha RGBA buffer of the same dimensions, with
+/// per-pixel alpha set to `max(Sr, Sg, Sb)` per the §15.22
+/// "non-opaque image … Sa = max(Sr, Sg, Sb)" rule.
+///
+/// **Algorithm.** Per §15.22:
+///
+/// 1. Read `I(x, y) = alpha / 255` from the source.
+/// 2. Form the surface normal `N` via the same §15.14 nine-region
+///    Sobel kernel used by [`diffuse_lighting`] ("See
+///    ‘feDiffuseLighting’ for definition of N").
+/// 3. Form `L` from the [`LightSource`] (same §15.8 derivation as
+///    [`diffuse_lighting`]).
+/// 4. Form the §15.22 halfway unit vector
+///    `H = (L + E) / Norm(L + E)` with the spec's constant eye
+///    vector `E = (0, 0, 1)`. If `L + E` has zero length (which can
+///    only happen when `L = -E = (0, 0, -1)`, i.e. the surface is
+///    being lit from directly behind the viewer in a degenerate
+///    case), the §15.22 dot-product `N · H` is well-defined as zero
+///    via the `max(N · H, 0)` Phong-specular clamp.
+/// 5. Form the per-pixel `(Lr, Lg, Lb)` light colour: equal to
+///    `lighting-color` for distant and point sources; scaled by
+///    `pow(−L·S, specularExponent_spot)` (and zeroed outside the
+///    cone) for spot sources — same as [`diffuse_lighting`]. Note
+///    the spot's `specular_exponent` is the §15.8.4 focus exponent
+///    on the spot itself, distinct from the §15.22 outer Phong
+///    exponent applied to `N · H`.
+/// 6. Emit `Sc = ks · pow(max(N·H, 0), specularExponent) · L_color`
+///    per RGB channel, clamped to `[0, 1]`, and
+///    `Sa = max(Sr, Sg, Sb)`.
+///
+/// The `max(N · H, 0)` clamp is implied by the Phong-specular
+/// formula (negative `N · H` means the surface faces away from the
+/// halfway direction, so no specular reflection reaches the eye).
+/// §15.22 doesn't state it explicitly but `pow(negative, fractional)`
+/// is undefined on `f32` and the spec's "non-opaque image" intent
+/// requires non-negative RGB to make `Sa = max(Sr, Sg, Sb)` itself
+/// non-negative.
+///
+/// # Panics
+///
+/// * If `src.len() != width as usize * height as usize * 4`.
+/// * If either `kernel_unit_length.0` or `kernel_unit_length.1` is
+///   non-positive — §15.22 lists "A negative or zero value is an
+///   error (see Error processing)" for `kernelUnitLength`.
+///
+/// # Returns
+///
+/// A new packed straight-alpha RGBA `Vec<u8>` of length
+/// `width · height · 4`. An empty extent (`width == 0` or
+/// `height == 0`) returns an empty `Vec`.
+pub fn specular_lighting(
+    src: &[u8],
+    width: u32,
+    height: u32,
+    params: &SpecularLighting,
+) -> Vec<u8> {
+    let w = width as usize;
+    let h = height as usize;
+    let expected = w
+        .checked_mul(h)
+        .and_then(|n| n.checked_mul(4))
+        .expect("specular_lighting: width * height * 4 overflowed usize");
+    assert_eq!(
+        src.len(),
+        expected,
+        "specular_lighting: src.len() == {} but width*height*4 == {expected}",
+        src.len()
+    );
+    assert!(
+        params.kernel_unit_length.0 > 0.0,
+        "specular_lighting: kernel_unit_length.0 must be positive (got {})",
+        params.kernel_unit_length.0
+    );
+    assert!(
+        params.kernel_unit_length.1 > 0.0,
+        "specular_lighting: kernel_unit_length.1 must be positive (got {})",
+        params.kernel_unit_length.1
+    );
+    if width == 0 || height == 0 {
+        return Vec::new();
+    }
+
+    let (dx, dy) = params.kernel_unit_length;
+    let ks = params.specular_constant;
+    let exponent = params.specular_exponent;
+    let surface_scale = params.surface_scale;
+    let light_color = [
+        params.light_color[0] as f32 / 255.0,
+        params.light_color[1] as f32 / 255.0,
+        params.light_color[2] as f32 / 255.0,
+    ];
+
+    let mut out = Vec::with_capacity(expected);
+    for y in 0..height {
+        for x in 0..width {
+            // Surface normal — identical to the §15.14 derivation
+            // (§15.22 explicitly defers to §15.14 for `N`).
+            let n = diffuse_surface_normal(src, width, height, x, y, dx, dy, surface_scale);
+            // §15.22 / §15.14 height-field value `Z(x, y) =
+            // surfaceScale · I(x, y)`, consumed by Point / Spot
+            // light branches when forming `L`.
+            let centre_i = diffuse_sample_alpha(src, width, height, x as i32, y as i32);
+            let pixel_z = surface_scale * centre_i;
+            let (l, l_color) = diffuse_light_vector(
+                &params.light_source,
+                x as f32,
+                y as f32,
+                pixel_z,
+                light_color,
+            );
+            // §15.22 halfway vector `H = (L + E) / Norm(L + E)`
+            // with the spec's constant eye vector `E = (0, 0, 1)`.
+            let hx = l[0];
+            let hy = l[1];
+            let hz = l[2] + 1.0;
+            let hn2 = hx * hx + hy * hy + hz * hz;
+            let n_dot_h = if hn2 == 0.0 {
+                // Degenerate case `L = -E`. `N · H` is set to 0 so
+                // the specular term collapses to 0, consistent with
+                // the §15.22 / Phong-specular max-with-zero clamp
+                // applied below.
+                0.0
+            } else {
+                let inv_hn = 1.0 / hn2.sqrt();
+                let h_unit = [hx * inv_hn, hy * inv_hn, hz * inv_hn];
+                n[0] * h_unit[0] + n[1] * h_unit[1] + n[2] * h_unit[2]
+            };
+            // §15.22 colour formula. The `max(., 0)` guard is the
+            // Phong-specular convention — see function-level doc
+            // comment.
+            let factor = if n_dot_h <= 0.0 {
+                0.0
+            } else {
+                ks * n_dot_h.powf(exponent)
+            };
+            let sr = (factor * l_color[0]).clamp(0.0, 1.0);
+            let sg = (factor * l_color[1]).clamp(0.0, 1.0);
+            let sb = (factor * l_color[2]).clamp(0.0, 1.0);
+            // §15.22: `Sa = max(Sr, Sg, Sb)` — applied on the
+            // continuous `[0, 1]` triple before quantisation so the
+            // alpha mirrors the spec's pre-quantisation maximum
+            // exactly. Quantising first then taking the max would
+            // accumulate the per-channel rounding into the alpha.
+            let sa_unit = sr.max(sg).max(sb);
+            out.push(quantise_unit(sr));
+            out.push(quantise_unit(sg));
+            out.push(quantise_unit(sb));
+            out.push(quantise_unit(sa_unit));
+        }
+    }
+    out
+}
+
+/// Typed-pixel wrapper around [`specular_lighting`]. Returns a
+/// `Vec<Rgba>` of length `width · height`. Identical semantics —
+/// provided for callers that already have typed pixel buffers.
+pub fn specular_lighting_pixels(
+    src: &[Rgba],
+    width: u32,
+    height: u32,
+    params: &SpecularLighting,
+) -> Vec<Rgba> {
+    let n = width as usize * height as usize;
+    assert_eq!(
+        src.len(),
+        n,
+        "specular_lighting_pixels: src.len() == {} but width*height == {n}",
+        src.len()
+    );
+    let mut bytes = Vec::with_capacity(n * 4);
+    for p in src {
+        bytes.extend_from_slice(&[p.r, p.g, p.b, p.a]);
+    }
+    let out_bytes = specular_lighting(&bytes, width, height, params);
+    out_bytes
+        .chunks_exact(4)
+        .map(|c| Rgba::new(c[0], c[1], c[2], c[3]))
+        .collect()
+}
+
+#[cfg(test)]
+mod specular_lighting_tests {
+    use super::*;
+
+    fn flat_alpha(w: u32, h: u32, a: u8) -> Vec<u8> {
+        let mut v = Vec::with_capacity((w * h * 4) as usize);
+        for _ in 0..w * h {
+            v.extend_from_slice(&[0, 0, 0, a]);
+        }
+        v
+    }
+
+    /// §15.22: a flat alpha plane has zero surface gradient
+    /// (§15.14 `N = (0, 0, 1)`); lit by a distant light pointing
+    /// straight at the viewer (`elevation = 90°` ⇒ `L = (0, 0, 1)`)
+    /// the halfway vector is `H = (0, 0, 2) / 2 = (0, 0, 1)`, so
+    /// `N · H = 1` and `pow(N·H, anything) = 1`. With white light
+    /// and `ks = 1`, every pixel emits full white plus alpha 255.
+    #[test]
+    fn flat_surface_distant_overhead_emits_full_white_with_full_alpha() {
+        let src = flat_alpha(4, 4, 200);
+        let params = SpecularLighting {
+            surface_scale: 10.0,
+            specular_constant: 1.0,
+            specular_exponent: 20.0,
+            kernel_unit_length: (1.0, 1.0),
+            light_color: [255, 255, 255],
+            light_source: LightSource::Distant {
+                azimuth_deg: 0.0,
+                elevation_deg: 90.0,
+            },
+        };
+        let out = specular_lighting(&src, 4, 4, &params);
+        for (i, px) in out.chunks_exact(4).enumerate() {
+            assert!(
+                (px[0] as i32 - 255).abs() <= 1,
+                "pixel {i} R != 255: {}",
+                px[0]
+            );
+            assert!(
+                (px[1] as i32 - 255).abs() <= 1,
+                "pixel {i} G != 255: {}",
+                px[1]
+            );
+            assert!(
+                (px[2] as i32 - 255).abs() <= 1,
+                "pixel {i} B != 255: {}",
+                px[2]
+            );
+            // Sa = max(Sr, Sg, Sb) — full-white emission ⇒ full alpha.
+            assert!(
+                (px[3] as i32 - 255).abs() <= 1,
+                "pixel {i} A != 255: {}",
+                px[3]
+            );
+        }
+    }
+
+    /// §15.22: a flat plane lit edge-on (`elevation = 0°`, light
+    /// along the x axis) gives `L = (1, 0, 0)`, so
+    /// `H = (1, 0, 1) / √2`. With `N = (0, 0, 1)` (flat surface)
+    /// `N · H = 1/√2 ≈ 0.7071`. With `specularExponent = 2` and
+    /// `ks = 1` we expect `S = 0.5` ⇒ 128 on the `[0, 255]` axis.
+    /// `Sa = max(Sr, Sg, Sb) = 128`.
+    #[test]
+    fn flat_surface_distant_grazing_half_intensity() {
+        let src = flat_alpha(4, 4, 200);
+        let params = SpecularLighting {
+            surface_scale: 10.0,
+            specular_constant: 1.0,
+            specular_exponent: 2.0,
+            kernel_unit_length: (1.0, 1.0),
+            light_color: [255, 255, 255],
+            light_source: LightSource::Distant {
+                azimuth_deg: 0.0,
+                elevation_deg: 0.0,
+            },
+        };
+        let out = specular_lighting(&src, 4, 4, &params);
+        // Use the interior pixel (1, 1) to avoid any corner-kernel
+        // contributions on the flat plane — though both should be
+        // identical because `Σ K · constant = 0` for both centred
+        // and corner Sobel variants applied to a constant alpha.
+        let idx = (4 + 1) * 4;
+        // 0.5 · 255 = 127.5 → quantise to 127 or 128.
+        let r = out[idx] as i32;
+        let g = out[idx + 1] as i32;
+        let b = out[idx + 2] as i32;
+        let a = out[idx + 3] as i32;
+        assert!((r - 128).abs() <= 1, "R ≈ 128 (got {r})");
+        assert!((g - 128).abs() <= 1, "G ≈ 128 (got {g})");
+        assert!((b - 128).abs() <= 1, "B ≈ 128 (got {b})");
+        // Sa = max(Sr, Sg, Sb) — equal channels ⇒ same value.
+        assert!((a - 128).abs() <= 1, "A = max(R,G,B) ≈ 128 (got {a})");
+    }
+
+    /// §15.22: `specular_constant = 0` zeroes the entire output
+    /// formula independent of any other parameter. The alpha
+    /// channel collapses with the RGB channels because
+    /// `Sa = max(Sr, Sg, Sb) = max(0, 0, 0) = 0`. This is the
+    /// §15.22 "non-opaque image" property — unlike the §15.14
+    /// diffuse path where `Da = 1` everywhere.
+    #[test]
+    fn zero_specular_constant_emits_full_transparent_black() {
+        let src = flat_alpha(3, 3, 200);
+        let params = SpecularLighting {
+            surface_scale: 10.0,
+            specular_constant: 0.0,
+            specular_exponent: 20.0,
+            kernel_unit_length: (1.0, 1.0),
+            light_color: [255, 100, 50],
+            light_source: LightSource::Distant {
+                azimuth_deg: 45.0,
+                elevation_deg: 45.0,
+            },
+        };
+        let out = specular_lighting(&src, 3, 3, &params);
+        for px in out.chunks_exact(4) {
+            assert_eq!(px[0], 0);
+            assert_eq!(px[1], 0);
+            assert_eq!(px[2], 0);
+            assert_eq!(px[3], 0, "§15.22 Sa = max(Sr, Sg, Sb) = 0");
+        }
+    }
+
+    /// §15.22 alpha distinction: with a coloured light, the RGB
+    /// channels emit at different levels and `Sa = max(Sr, Sg, Sb)`
+    /// equals the maximum-emitting channel — NOT 255 (the §15.14
+    /// diffuse rule) and NOT the per-channel value.
+    #[test]
+    fn coloured_light_alpha_equals_max_channel() {
+        let src = flat_alpha(3, 3, 200);
+        let params = SpecularLighting {
+            surface_scale: 10.0,
+            specular_constant: 1.0,
+            specular_exponent: 1.0, // simplest: pow(N·H, 1) = N·H.
+            kernel_unit_length: (1.0, 1.0),
+            // Asymmetric light triple to make max-channel detection
+            // unambiguous.
+            light_color: [255, 100, 50],
+            light_source: LightSource::Distant {
+                azimuth_deg: 0.0,
+                elevation_deg: 90.0, // L = (0, 0, 1) ⇒ N·H = 1.
+            },
+        };
+        let out = specular_lighting(&src, 3, 3, &params);
+        for px in out.chunks_exact(4) {
+            // ks · 1 · (255, 100, 50) / 255 = (1.0, ~0.392, ~0.196)
+            // ⇒ (255, 100, 50) on quantisation.
+            assert!((px[0] as i32 - 255).abs() <= 1);
+            assert!((px[1] as i32 - 100).abs() <= 1);
+            assert!((px[2] as i32 - 50).abs() <= 1);
+            // Sa = max(R, G, B) = R = 255.
+            assert_eq!(px[3], 255);
+        }
+    }
+
+    /// §15.22: a distant light is position-invariant on a flat
+    /// surface — every pixel evaluates the same `(N, L, H)` triple
+    /// and therefore emits the same colour. This is the same
+    /// invariant tested for diffuse-lighting; here it confirms the
+    /// specular kernel has no spurious per-pixel positional coupling.
+    #[test]
+    fn distant_light_position_invariant_on_flat_surface() {
+        let src = flat_alpha(8, 5, 128);
+        let params = SpecularLighting {
+            surface_scale: 4.0,
+            specular_constant: 0.8,
+            specular_exponent: 5.0,
+            kernel_unit_length: (1.0, 1.0),
+            light_color: [120, 200, 80],
+            light_source: LightSource::Distant {
+                azimuth_deg: 30.0,
+                elevation_deg: 45.0,
+            },
+        };
+        let out = specular_lighting(&src, 8, 5, &params);
+        let first = [out[0], out[1], out[2], out[3]];
+        for (i, px) in out.chunks_exact(4).enumerate() {
+            // Allow one quantisation-rounding ULP either way.
+            assert!(
+                (px[0] as i32 - first[0] as i32).abs() <= 1,
+                "px {i} R differs: {} vs {}",
+                px[0],
+                first[0]
+            );
+            assert!((px[1] as i32 - first[1] as i32).abs() <= 1);
+            assert!((px[2] as i32 - first[2] as i32).abs() <= 1);
+            assert!((px[3] as i32 - first[3] as i32).abs() <= 1);
+        }
+    }
+
+    /// §15.22: light pointing behind the surface (`elevation = -90°`
+    /// ⇒ `L = (0, 0, -1)`) gives `L + E = (0, 0, 0)`, the §15.22
+    /// degenerate case. The implementation collapses `N · H` to 0
+    /// per the documented Phong-specular `max(., 0)` clamp; output
+    /// must be transparent black at every pixel.
+    #[test]
+    fn light_behind_surface_emits_zero() {
+        let src = flat_alpha(3, 3, 200);
+        let params = SpecularLighting {
+            surface_scale: 10.0,
+            specular_constant: 1.0,
+            specular_exponent: 2.0,
+            kernel_unit_length: (1.0, 1.0),
+            light_color: [255, 255, 255],
+            light_source: LightSource::Distant {
+                azimuth_deg: 0.0,
+                elevation_deg: -90.0,
+            },
+        };
+        let out = specular_lighting(&src, 3, 3, &params);
+        for px in out.chunks_exact(4) {
+            assert_eq!(px[0], 0);
+            assert_eq!(px[1], 0);
+            assert_eq!(px[2], 0);
+            assert_eq!(px[3], 0);
+        }
+    }
+
+    /// §15.22: `specularExponent` increases ⇒ the specular highlight
+    /// narrows. At a grazing angle (`N · H = 1/√2 ≈ 0.707`) raising
+    /// the exponent must monotonically decrease the emitted
+    /// intensity. We verify monotonicity on three exponents: 1, 5,
+    /// 50.
+    #[test]
+    fn higher_exponent_dims_grazing_intensity() {
+        let src = flat_alpha(3, 3, 200);
+        let mk = |exp: f32| {
+            let params = SpecularLighting {
+                surface_scale: 10.0,
+                specular_constant: 1.0,
+                specular_exponent: exp,
+                kernel_unit_length: (1.0, 1.0),
+                light_color: [255, 255, 255],
+                light_source: LightSource::Distant {
+                    azimuth_deg: 0.0,
+                    elevation_deg: 0.0, // L along +x ⇒ N·H = 1/√2.
+                },
+            };
+            specular_lighting(&src, 3, 3, &params)
+        };
+        let a = mk(1.0)[(3 + 1) * 4];
+        let b = mk(5.0)[(3 + 1) * 4];
+        let c = mk(50.0)[(3 + 1) * 4];
+        assert!(a > b, "exp=1 ({a}) must be brighter than exp=5 ({b})");
+        assert!(b > c, "exp=5 ({b}) must be brighter than exp=50 ({c})");
+    }
+
+    /// §15.22 + §15.8.3 point light: at a flat sample directly
+    /// underneath a point light (`L = (0, 0, 1)`) the same
+    /// `H = (0, 0, 1)` and `N · H = 1` invariants as the overhead-
+    /// distant case must hold. We place the light at `(2, 2, 10)`
+    /// over a 5×5 buffer and check the centre pixel.
+    #[test]
+    fn point_light_directly_overhead() {
+        let src = flat_alpha(5, 5, 0);
+        let params = SpecularLighting {
+            surface_scale: 0.0, // pixel_z = 0 everywhere → L is exact.
+            specular_constant: 1.0,
+            specular_exponent: 1.0,
+            kernel_unit_length: (1.0, 1.0),
+            light_color: [255, 255, 255],
+            light_source: LightSource::Point {
+                x: 2.0,
+                y: 2.0,
+                z: 10.0,
+            },
+        };
+        let out = specular_lighting(&src, 5, 5, &params);
+        let idx = (2 * 5 + 2) * 4;
+        // Allow modest tolerance because the point-light direction
+        // from (2,2,0) to (2,2,10) is exactly (0,0,1) but the §15.14
+        // Sobel kernel on a constant alpha still yields N=(0,0,1)
+        // exactly, so the result should round to 255.
+        assert!((out[idx] as i32 - 255).abs() <= 1);
+        assert!((out[idx + 1] as i32 - 255).abs() <= 1);
+        assert!((out[idx + 2] as i32 - 255).abs() <= 1);
+        assert!((out[idx + 3] as i32 - 255).abs() <= 1);
+    }
+
+    /// §15.22 + §15.8.4 spot light: the §15.8.4 cone-cutoff path
+    /// must fire when the surface sample lies outside the cone. We
+    /// place a spot at `(0, 0, 10)` aiming at `(0, 0, 0)` with a 1°
+    /// limiting cone; any sample more than `tan(1°) · 10 ≈ 0.175`
+    /// pixels away from the central column must emit zero.
+    #[test]
+    fn spot_light_outside_cone_emits_zero() {
+        let src = flat_alpha(5, 5, 0);
+        let params = SpecularLighting {
+            surface_scale: 0.0,
+            specular_constant: 1.0,
+            specular_exponent: 1.0,
+            kernel_unit_length: (1.0, 1.0),
+            light_color: [255, 255, 255],
+            light_source: LightSource::Spot {
+                x: 0.0,
+                y: 0.0,
+                z: 10.0,
+                points_at_x: 0.0,
+                points_at_y: 0.0,
+                points_at_z: 0.0,
+                specular_exponent: 1.0, // §15.8.4 focus, distinct from §15.22.
+                limiting_cone_angle_deg: Some(1.0),
+            },
+        };
+        let out = specular_lighting(&src, 5, 5, &params);
+        // Corner (4, 4) is far outside the 1° cone — must be zero
+        // on every channel (RGB + Sa).
+        let idx = (4 * 5 + 4) * 4;
+        assert_eq!(out[idx], 0);
+        assert_eq!(out[idx + 1], 0);
+        assert_eq!(out[idx + 2], 0);
+        assert_eq!(out[idx + 3], 0);
+    }
+
+    /// §15.22 default attribute set: all defaults give a smoke-test
+    /// path with no panics and a buffer of the expected length.
+    #[test]
+    fn defaults_produce_sane_output() {
+        let src = flat_alpha(2, 2, 100);
+        let params = SpecularLighting::default();
+        let out = specular_lighting(&src, 2, 2, &params);
+        assert_eq!(out.len(), 2 * 2 * 4);
+        // Sa = max(Sr, Sg, Sb) on every pixel.
+        for px in out.chunks_exact(4) {
+            let m = px[0].max(px[1]).max(px[2]);
+            // Allow ±1 ULP for the pre-quantisation max vs the
+            // post-quantisation max of the per-channel triples.
+            assert!(
+                (px[3] as i32 - m as i32).abs() <= 1,
+                "Sa={} vs max(R,G,B)={m}",
+                px[3]
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "specular_lighting: kernel_unit_length.0 must be positive")]
+    fn zero_kernel_unit_length_x_panics() {
+        let src = flat_alpha(2, 2, 100);
+        let params = SpecularLighting {
+            kernel_unit_length: (0.0, 1.0),
+            ..SpecularLighting::default()
+        };
+        let _ = specular_lighting(&src, 2, 2, &params);
+    }
+
+    #[test]
+    #[should_panic(expected = "specular_lighting: kernel_unit_length.1 must be positive")]
+    fn negative_kernel_unit_length_y_panics() {
+        let src = flat_alpha(2, 2, 100);
+        let params = SpecularLighting {
+            kernel_unit_length: (1.0, -2.0),
+            ..SpecularLighting::default()
+        };
+        let _ = specular_lighting(&src, 2, 2, &params);
+    }
+
+    #[test]
+    #[should_panic(expected = "specular_lighting: src.len()")]
+    fn wrong_src_length_panics() {
+        let bad: Vec<u8> = vec![0; 3];
+        let params = SpecularLighting::default();
+        let _ = specular_lighting(&bad, 2, 2, &params);
+    }
+
+    #[test]
+    fn empty_extent_returns_empty() {
+        let empty: Vec<u8> = Vec::new();
+        let params = SpecularLighting::default();
+        let out = specular_lighting(&empty, 0, 0, &params);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn typed_pixel_wrapper_matches_byte_path() {
+        let w = 5u32;
+        let h = 4u32;
+        let src_bytes = flat_alpha(w, h, 180);
+        let src_pixels: Vec<Rgba> = src_bytes
+            .chunks_exact(4)
+            .map(|c| Rgba::new(c[0], c[1], c[2], c[3]))
+            .collect();
+        let params = SpecularLighting {
+            surface_scale: 5.0,
+            specular_constant: 0.7,
+            specular_exponent: 8.0,
+            kernel_unit_length: (1.0, 1.0),
+            light_color: [200, 150, 100],
+            light_source: LightSource::Point {
+                x: 2.0,
+                y: 1.5,
+                z: 4.0,
+            },
+        };
+        let bytes_out = specular_lighting(&src_bytes, w, h, &params);
+        let pixels_out = specular_lighting_pixels(&src_pixels, w, h, &params);
         let bytes_from_typed: Vec<u8> = pixels_out
             .iter()
             .flat_map(|p| [p.r, p.g, p.b, p.a])

@@ -50,7 +50,8 @@ produces a packed `Rgba` `VideoFrame`.
 | `feDisplacementMap` channel-driven warp (§15.15)| done (round 230) |
 | `feBlend` 5-mode pixel-wise blend (§15.9)  | done (round 233)     |
 | `feDiffuseLighting` Phong-diffuse + 3 light sources (§15.14)| done (round 247) |
-| Filters (drop-shadow, feSpecularLighting, feImage) | partial (morphology + color-matrix + Gaussian blur + component-transfer + composite + convolve-matrix + turbulence + flood + offset + merge + tile + displacement-map + blend + diffuse-lighting) |
+| `feSpecularLighting` Phong-specular + 3 light sources (§15.22)| done (round 259) |
+| Filters (drop-shadow, feImage)            | partial (morphology + color-matrix + Gaussian blur + component-transfer + composite + convolve-matrix + turbulence + flood + offset + merge + tile + displacement-map + blend + diffuse-lighting + specular-lighting) |
 | `<pattern>` paint                         | pending              |
 | Full ICC color-managed pipeline           | pending              |
 
