@@ -9,6 +9,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `<pattern>` paint server (SVG 2 §14.3 / SVG 1.1 §13.3) — tiled
+  fill and stroke paint.
+  - New public `Pattern` type: a user-space tile rectangle
+    (`x`/`y`/`width`/`height`, `patternUnits="userSpaceOnUse"`
+    semantics), an optional `patternTransform` (post-multiplied onto
+    the user→device transform per §14.3.1), and tile content as
+    tile-origin-relative `Node`s (the §14.3.2 "new coordinate system
+    has its origin at `(x, y)`" rule). Zero / negative / non-finite
+    tile extents disable painting per §14.3.1
+    (`Pattern::is_degenerate`).
+  - New `Renderer::fill_path_with_pattern(path, fill_rule, pattern,
+    transform)` and `Renderer::stroke_path_with_pattern(path, stroke,
+    pattern, transform)` endpoints, returning a full-canvas RGBA
+    `VideoFrame` (the stroke variant takes its geometry — width, caps,
+    joins, miter limit, dashes — from the `Stroke` and ignores its
+    `paint`).
+  - Rasterisation: the tile content is rendered once into an offscreen
+    RGBA buffer at device resolution (sized from the affine's column
+    norms, capped at 4096 px per axis; the tile-sized canvas realises
+    the §14.3.2 `overflow: hidden` user-agent clip), then every
+    covered destination pixel is inverse-mapped through
+    `transform ∘ patternTransform` into pattern space and reduced
+    modulo the tile extent — the §14.3 "tiles at
+    `(x + m·width, y + n·height)` for all integers m, n" rule — so
+    rotated / skewed pattern transforms resolve exactly.
+  - Tile sampling is periodic (wrap-around): nearest-neighbour under
+    `ImageFilter::Nearest`, otherwise a seam-free torus bilinear whose
+    2×2 footprint wraps to the opposite tile edge instead of clamping
+    (premultiplied-alpha filtering, mirroring the bounded-image
+    sampler). Composite honours the renderer's `blend_mode`.
+  - Still pending: pattern `viewBox` / `preserveAspectRatio` tile
+    fitting, and a `Paint`-level pattern variant once `oxideav-core`
+    grows one (patterns currently paint through the direct `Renderer`
+    endpoints).
 - `feImage` filter primitive (SVG 1.1 §15.18) — places an
   already-decoded straight-alpha RGBA raster into the filter chain,
   fitted to the filter-primitive subregion with the full SVG 1.1 §7.8

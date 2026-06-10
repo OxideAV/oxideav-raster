@@ -15,6 +15,7 @@ use crate::fill::{rasterize_fill, AlphaMask};
 use crate::flatten::{flatten_path, FlatContour};
 use crate::gradient::InterpolationSpace;
 use crate::paint::{build_paint_lut, sample_paint_in, sample_paint_with_lut};
+use crate::pattern::{sample_tile_bilinear_wrap, sample_tile_nearest_wrap, Pattern};
 use crate::stroke::stroke_to_fill_path;
 
 /// Top-level vector→raster renderer.
@@ -627,7 +628,166 @@ impl Renderer {
             },
         );
     }
+
+    /// Fill `path` with a tiled [`Pattern`] paint server (SVG 2 §14.3),
+    /// returning a full-canvas RGBA frame with only that fill painted
+    /// onto the renderer's `background` clear.
+    ///
+    /// `transform` is the user→device transform in effect for the
+    /// element referencing the pattern; the pattern's own
+    /// `patternTransform` is post-multiplied onto it (§14.3.1). A
+    /// degenerate tile rectangle ([`Pattern::is_degenerate`]) paints
+    /// nothing.
+    ///
+    /// Tile sampling honours [`Renderer::image_filter`] in reduced
+    /// form: `Nearest` samples nearest-neighbour, every other filter
+    /// uses seam-free periodic bilinear (the higher-order kernels are
+    /// not wrap-aware).
+    pub fn fill_path_with_pattern(
+        &self,
+        path: &Path,
+        fill_rule: FillRule,
+        pattern: &Pattern,
+        transform: Transform2D,
+    ) -> VideoFrame {
+        let stride = (self.width as usize) * 4;
+        let mut buf = vec![0u8; stride * (self.height as usize)];
+        let contours = flatten_path(&path.commands, &transform);
+        let mask = rasterize_fill(
+            &contours,
+            self.width,
+            self.height,
+            fill_rule,
+            self.supersampling,
+        );
+        self.composite_with_pattern(&mut buf, stride, &mask, pattern, transform, 1.0);
+        VideoFrame {
+            pts: None,
+            planes: vec![VideoPlane { stride, data: buf }],
+        }
+    }
+
+    /// Stroke `path` with a tiled [`Pattern`] paint server (SVG 2
+    /// §14.3), returning a full-canvas RGBA frame with only that
+    /// stroke painted onto the renderer's `background` clear.
+    ///
+    /// The stroke geometry (width, caps, joins, miter limit, dashes)
+    /// comes from `stroke`; its `paint` field is ignored — the pattern
+    /// is the paint. See [`Renderer::fill_path_with_pattern`] for the
+    /// transform and filtering semantics.
+    pub fn stroke_path_with_pattern(
+        &self,
+        path: &Path,
+        stroke: &Stroke,
+        pattern: &Pattern,
+        transform: Transform2D,
+    ) -> VideoFrame {
+        let stride = (self.width as usize) * 4;
+        let mut buf = vec![0u8; stride * (self.height as usize)];
+        let geom = build_stroke_geometry(path, &transform, stroke);
+        let mask = rasterize_fill(
+            &geom,
+            self.width,
+            self.height,
+            FillRule::NonZero,
+            self.supersampling,
+        );
+        self.composite_with_pattern(&mut buf, stride, &mask, pattern, transform, 1.0);
+        VideoFrame {
+            pts: None,
+            planes: vec![VideoPlane { stride, data: buf }],
+        }
+    }
+
+    /// Composite a [`Pattern`] paint through `mask` onto `buf`.
+    ///
+    /// Pipeline (see the [`crate::pattern`] module docs): rasterise one
+    /// tile offscreen at device resolution, then for every covered
+    /// destination pixel inverse-map the pixel centre through
+    /// `transform ∘ patternTransform` into pattern space, reduce modulo
+    /// the tile extent (`(q − tile_origin) mod tile_size` — the §14.3
+    /// "tiles at `(x + m·width, y + n·height)` for all integers m, n"
+    /// rule), and sample the tile with periodic addressing.
+    fn composite_with_pattern(
+        &self,
+        buf: &mut [u8],
+        stride: usize,
+        mask: &AlphaMask,
+        pattern: &Pattern,
+        transform: Transform2D,
+        group_opacity: f32,
+    ) {
+        if mask.is_empty() || pattern.is_degenerate() {
+            return;
+        }
+        // Pattern space → device space: patternTransform is
+        // post-multiplied (inserted to the right, §14.3.1).
+        let pat_to_dev = transform.compose(&pattern.transform);
+        let inv = match invert_2d(&pat_to_dev) {
+            Some(t) => t,
+            None => return,
+        };
+        // Device-resolution tile size from the affine's column norms
+        // (the device lengths of the pattern-space unit vectors, exact
+        // under rotation).
+        let sx = (pat_to_dev.a * pat_to_dev.a + pat_to_dev.b * pat_to_dev.b).sqrt();
+        let sy = (pat_to_dev.c * pat_to_dev.c + pat_to_dev.d * pat_to_dev.d).sqrt();
+        let tw = ((pattern.width * sx).ceil() as i64).clamp(1, MAX_PATTERN_TILE_DIM) as u32;
+        let th = ((pattern.height * sy).ceil() as i64).clamp(1, MAX_PATTERN_TILE_DIM) as u32;
+        let tile = self.rasterize_pattern_tile(pattern, tw, th);
+        let (ox, oy, pw, ph) = (pattern.x, pattern.y, pattern.width, pattern.height);
+        let nearest = matches!(self.image_filter, ImageFilter::Nearest);
+        let blend = self.blend_mode;
+        composite_rgba_premultiplied_blend(
+            buf,
+            stride,
+            self.width,
+            self.height,
+            mask,
+            0,
+            0,
+            group_opacity,
+            blend,
+            move |x, y| {
+                let q = inv.apply(oxideav_core::Point::new(x as f32 + 0.5, y as f32 + 0.5));
+                // Normalised tile coordinates; the samplers wrap, so no
+                // explicit rem_euclid is needed here.
+                let u = (q.x - ox) / pw;
+                let v = (q.y - oy) / ph;
+                if nearest {
+                    sample_tile_nearest_wrap(&tile, u, v)
+                } else {
+                    sample_tile_bilinear_wrap(&tile, u, v)
+                }
+            },
+        );
+    }
+
+    /// Render one pattern tile into an offscreen `tw × th` RGBA buffer.
+    ///
+    /// Content coordinates are tile-origin-relative (§14.3.2), so the
+    /// only transform needed is the pattern-space → tile-pixel scale.
+    /// The offscreen canvas is exactly the tile rectangle, which
+    /// realises the user-agent `overflow: hidden` clip for free.
+    fn rasterize_pattern_tile(&self, pattern: &Pattern, tw: u32, th: u32) -> VideoFrame {
+        let mut tile_renderer = Renderer::with_cache_capacity(tw, th, 1);
+        tile_renderer.supersampling = self.supersampling;
+        tile_renderer.image_filter = self.image_filter;
+        tile_renderer.color_interpolation = self.color_interpolation;
+        let scale = Transform2D::scale(
+            tw as f32 / pattern.width.max(1e-9),
+            th as f32 / pattern.height.max(1e-9),
+        );
+        let group = Group::new().with_children(pattern.content.clone());
+        tile_renderer.render_node(&Node::Group(group), scale)
+    }
 }
+
+/// Largest device-pixel extent of a rasterised pattern tile. A huge
+/// pattern→device scale would otherwise ask for an unbounded offscreen
+/// allocation; past this size the tile is rendered at the cap and
+/// magnified by the per-pixel sampler.
+const MAX_PATTERN_TILE_DIM: i64 = 4096;
 
 /// Build the stroke geometry for `path` under `transform`, producing
 /// closed contours ready for a NonZero fill.

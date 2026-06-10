@@ -166,11 +166,24 @@
 //!   per §15.14. Exposed as [`diffuse_lighting`] (with the typed-pixel
 //!   wrapper [`diffuse_lighting_pixels`]) and parameterised through
 //!   the [`DiffuseLighting`] struct.
+//! * `<pattern>` paint servers (SVG 2 §14.3) — a [`Pattern`] carries a
+//!   user-space tile rectangle, an optional `patternTransform`, and
+//!   tile-origin-relative vector content; the tile is rasterised once
+//!   offscreen at device resolution and sampled with periodic
+//!   (wrap-around) addressing through the inverse pattern transform,
+//!   so rotated / skewed pattern transforms resolve exactly and seams
+//!   stay continuous under bilinear filtering. Exposed as
+//!   [`Renderer::fill_path_with_pattern`] /
+//!   [`Renderer::stroke_path_with_pattern`].
 //!
 //! Deferred to a later round:
 //!
-//! * remaining filters (drop shadow, feSpecularLighting, feImage),
-//! * `<pattern>` paints,
+//! * `feDropShadow` (the W3C Filter Effects Module Level 1 spec is not
+//!   staged under `docs/`),
+//! * pattern `viewBox` / `preserveAspectRatio` tile fitting and a
+//!   `Paint`-level pattern variant (pending an `oxideav-core` IR
+//!   addition — patterns currently paint through the direct
+//!   [`Renderer`] endpoints),
 //! * full ICC-tagged color-managed pipeline (the `linearRGB`
 //!   interpolation space is implemented; per-channel ICC profile
 //!   transforms are still TODO),
@@ -189,6 +202,7 @@ mod filter;
 mod flatten;
 mod gradient;
 mod paint;
+mod pattern;
 mod renderer;
 mod stroke;
 
@@ -215,6 +229,7 @@ pub use gradient::{
     eval_radial_gradient_in, eval_radial_gradient_lut, InterpolationSpace, StopsLut,
 };
 pub use paint::{sample_paint, sample_paint_in};
+pub use pattern::Pattern;
 pub use renderer::{rasterize, ImageFilter, Renderer, DEFAULT_CACHE_CAPACITY};
 pub use stroke::stroke_to_fill_path;
 

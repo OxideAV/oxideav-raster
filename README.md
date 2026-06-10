@@ -53,7 +53,7 @@ produces a packed `Rgba` `VideoFrame`.
 | `feSpecularLighting` Phong-specular + 3 light sources (§15.22)| done (round 259) |
 | `feImage` raster placement + §7.8 preserveAspectRatio (§15.18)| done (round 268) |
 | Filters (drop-shadow)                     | partial — all 16 SVG 1.1 §15 primitives done (morphology + color-matrix + Gaussian blur + component-transfer + composite + convolve-matrix + turbulence + flood + offset + merge + tile + displacement-map + blend + diffuse-lighting + specular-lighting + image); `feDropShadow` blocked on the W3C Filter Effects Module Level 1 not being staged under `docs/` |
-| `<pattern>` paint                         | pending              |
+| `<pattern>` tiled fill/stroke paint (SVG2 §14.3)| done (round 276) — user-space tile rect + patternTransform + wrap-around sampling; lacks pattern `viewBox` fitting + a core `Paint` variant |
 | Full ICC color-managed pipeline           | pending              |
 
 ## Usage
