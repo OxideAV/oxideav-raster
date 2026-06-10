@@ -169,9 +169,34 @@
 //!   filter produces a non-opaque image meant to be added on top
 //!   of a textured layer via `feComposite`-arithmetic).
 //!
+//! * **Image source** — `feImage` from SVG 1.1 §15.18. A source
+//!   primitive that places an already-decoded RGBA raster into the
+//!   filter chain, "loaded or rendered into an RGBA raster" per
+//!   §15.18, fitted to the target rectangle exactly as the `image`
+//!   element fits a referenced raster ("The processing of the
+//!   ‘preserveAspectRatio’ attribute on the ‘feImage’ element is
+//!   identical to that of the ‘image’ element"). The §7.8
+//!   `preserveAspectRatio` fitting algebra is implemented in full:
+//!   the `none` alignment scales each axis independently so the
+//!   source exactly fills the target; the nine uniform alignments
+//!   (`xM{in,id,ax}YM{in,id,ax}`) force a single scale factor —
+//!   the per-axis minimum under `meet` ("the entire ‘viewBox’ is
+//!   visible within the viewport … scaled up as much as possible")
+//!   or the maximum under `slice` ("the entire viewport is covered
+//!   by the ‘viewBox’ … scaled down as much as possible") — and
+//!   place the scaled image at the §7.8 min / midpoint / max
+//!   anchor on each axis. Target pixels not covered by the fitted
+//!   source emit the §15.7.3 transparent-black value. Nearest and
+//!   bilinear reconstruction are both wired in, following the
+//!   §15.18 note that "high quality viewers make use of appropriate
+//!   interpolation techniques, for example bilinear or bicubic".
+//!
 //! # Deferred
 //!
-//! Drop shadow (`feDropShadow`), `feImage`.
+//! Drop shadow (`feDropShadow`) — its normative definition lives in
+//! the W3C Filter Effects Module Level 1, which is not currently
+//! staged under `docs/image/svg/` (the staged SVG 2 CR only links
+//! out to it).
 //!
 //! # Wall provenance
 //!
@@ -223,6 +248,22 @@
 //! (1 − qb)·ca + ca·cb`, `screen: cr = cb + ca − ca·cb`,
 //! `darken: cr = Min((1 − qa)·cb + ca, (1 − qb)·ca + cb)`,
 //! `lighten: cr = Max((1 − qa)·cb + ca, (1 − qb)·ca + cb)`).
+//! §15.18 for `feImage` ("loaded or rendered into an RGBA raster
+//! and becomes the result of the filter primitive"; "the processing
+//! of the ‘preserveAspectRatio’ attribute on the ‘feImage’ element
+//! is identical to that of the ‘image’ element"; the default "as if
+//! a value of xMidYMid meet were specified"; the bilinear option
+//! follows "it is recommended that high quality viewers make use of
+//! appropriate interpolation techniques, for example bilinear or
+//! bicubic") and §7.8 for the `preserveAspectRatio` fitting rules
+//! (the ten `<align>` values with their min / midpoint / max
+//! anchor semantics quoted per variant on [`AspectRatioAlign`];
+//! `meet` = "the entire ‘viewBox’ is visible within the viewport"
+//! and "the ‘viewBox’ is scaled up as much as possible"; `slice` =
+//! "the entire viewport is covered by the ‘viewBox’" and "the
+//! ‘viewBox’ is scaled down as much as possible") and §15.7.3 for
+//! the transparent-black value of target pixels the fitted source
+//! does not cover.
 
 use oxideav_core::Rgba;
 
@@ -8880,5 +8921,597 @@ mod specular_lighting_tests {
             .flat_map(|p| [p.r, p.g, p.b, p.a])
             .collect();
         assert_eq!(bytes_out, bytes_from_typed);
+    }
+}
+
+// ----------------------------------------------------------------------
+// SVG 1.1 §15.18 `<feImage>` — external-raster source primitive.
+// ----------------------------------------------------------------------
+
+/// `<align>` parameter of the SVG 1.1 §7.8 `preserveAspectRatio`
+/// attribute.
+///
+/// §7.8: "The `<align>` parameter indicates whether to force uniform
+/// scaling and, if so, the alignment method to use in case the aspect
+/// ratio of the ‘viewBox’ doesn't match the aspect ratio of the
+/// viewport."
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AspectRatioAlign {
+    /// §7.8 `none` — "Do not force uniform scaling. Scale the graphic
+    /// content of the given element non-uniformly if necessary such
+    /// that the element's bounding box exactly matches the viewport
+    /// rectangle." The `meetOrSlice` value is ignored for this
+    /// alignment (§7.8 note).
+    None,
+    /// §7.8 `xMinYMin` — align the minimum X / minimum Y of the
+    /// source with the smallest X / Y of the viewport.
+    XMinYMin,
+    /// §7.8 `xMidYMin` — align the midpoint X with the viewport
+    /// midpoint X; minimum Y with the smallest viewport Y.
+    XMidYMin,
+    /// §7.8 `xMaxYMin` — align the maximum X with the maximum
+    /// viewport X; minimum Y with the smallest viewport Y.
+    XMaxYMin,
+    /// §7.8 `xMinYMid` — minimum X at the smallest viewport X;
+    /// midpoint Y at the viewport midpoint Y.
+    XMinYMid,
+    /// §7.8 `xMidYMid` — "(the default)" — midpoints aligned on both
+    /// axes.
+    #[default]
+    XMidYMid,
+    /// §7.8 `xMaxYMid` — maximum X at the maximum viewport X;
+    /// midpoint Y at the viewport midpoint Y.
+    XMaxYMid,
+    /// §7.8 `xMinYMax` — minimum X at the smallest viewport X;
+    /// maximum Y at the maximum viewport Y.
+    XMinYMax,
+    /// §7.8 `xMidYMax` — midpoint X at the viewport midpoint X;
+    /// maximum Y at the maximum viewport Y.
+    XMidYMax,
+    /// §7.8 `xMaxYMax` — maximum X / maximum Y aligned with the
+    /// maximum viewport X / Y.
+    XMaxYMax,
+}
+
+/// `<meetOrSlice>` parameter of the SVG 1.1 §7.8
+/// `preserveAspectRatio` attribute.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MeetOrSlice {
+    /// §7.8 `meet` ("the default") — "Scale the graphic such that:
+    /// aspect ratio is preserved; the entire ‘viewBox’ is visible
+    /// within the viewport; the ‘viewBox’ is scaled up as much as
+    /// possible, while still meeting the other criteria." Reduces to
+    /// the per-axis **minimum** scale factor.
+    #[default]
+    Meet,
+    /// §7.8 `slice` — "Scale the graphic such that: aspect ratio is
+    /// preserved; the entire viewport is covered by the ‘viewBox’;
+    /// the ‘viewBox’ is scaled down as much as possible, while still
+    /// meeting the other criteria." Reduces to the per-axis
+    /// **maximum** scale factor.
+    Slice,
+}
+
+/// Parsed value of the SVG 1.1 §7.8 `preserveAspectRatio` attribute,
+/// as consumed by [`image_source`].
+///
+/// The `defer` keyword is a reference-resolution policy ("the value
+/// of the ‘preserveAspectRatio’ attribute on the referenced content
+/// … should be used", §7.8) — by the time the caller holds a decoded
+/// raster plus a `PreserveAspectRatio` value, that resolution has
+/// already happened, so no `defer` field exists here.
+///
+/// `Default` is `xMidYMid meet` — §15.18: "If attribute
+/// ‘preserveAspectRatio’ is not specified, then the effect is as if
+/// a value of xMidYMid meet were specified."
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PreserveAspectRatio {
+    /// The `<align>` parameter.
+    pub align: AspectRatioAlign,
+    /// The `<meetOrSlice>` parameter. Ignored when `align` is
+    /// [`AspectRatioAlign::None`] (§7.8 note).
+    pub meet_or_slice: MeetOrSlice,
+}
+
+/// Reconstruction filter selector for [`image_source`].
+///
+/// §15.18: "When the referenced image must be resampled to match the
+/// device coordinate system, it is recommended that high quality
+/// viewers make use of appropriate interpolation techniques, for
+/// example bilinear or bicubic."
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ImageSourceSampling {
+    /// Round the mapped source coordinate to the nearest integer
+    /// pixel and copy it verbatim. Out-of-bounds coordinates emit
+    /// the §15.7.3 transparent-black value.
+    #[default]
+    Nearest,
+    /// Bilinear reconstruction around the fractional mapped source
+    /// coordinate (the §15.18 recommended interpolation route).
+    /// Out-of-bounds members of the 2×2 footprint contribute
+    /// transparent black, fading the fitted image at its edges.
+    Bilinear,
+}
+
+/// SVG 1.1 §15.18 `<feImage>` — place an already-decoded RGBA raster
+/// into the filter chain, fitted to the `out_width × out_height`
+/// filter-primitive subregion per §7.8 `preserveAspectRatio`.
+///
+/// §15.18: "This filter primitive refers to a graphic external to
+/// this filter element, which is loaded or rendered into an RGBA
+/// raster and becomes the result of the filter primitive." Reference
+/// resolution and decoding are the caller's job (the renderer / SVG
+/// front-end); this function receives the decoded
+/// `src_width × src_height` straight-alpha RGBA raster and performs
+/// the §15.18 placement step, which "is identical to that of the
+/// ‘image’ element" — i.e. the §7.8 fitting algebra:
+///
+/// 1. Compute the scale. `align = none` scales each axis
+///    independently (`out_width / src_width`,
+///    `out_height / src_height`) so the source exactly fills the
+///    target. Any other alignment forces uniform scaling: the
+///    minimum of the two per-axis ratios under [`MeetOrSlice::Meet`]
+///    or the maximum under [`MeetOrSlice::Slice`].
+/// 2. Compute the translation per axis from the alignment anchor:
+///    `Min` puts the scaled source's low edge at 0, `Mid` centres it
+///    (`(out − src·s) / 2`), `Max` puts its high edge at the target's
+///    high edge (`out − src·s`).
+/// 3. Inverse-map each output pixel centre into source space and
+///    reconstruct with the selected [`ImageSourceSampling`]. Output
+///    pixels whose mapped coordinate falls outside the source extent
+///    (the uncovered viewport bands of `meet`, or any anchor-induced
+///    overhang) emit transparent black per §15.7.3.
+///
+/// An empty source (`src_width == 0` or `src_height == 0`) renders
+/// nothing: the result is the fully transparent-black buffer (the
+/// filter-chain initial value, §15.7.3) rather than a panic, since a
+/// reference to a zero-extent graphic is a degenerate-but-resolvable
+/// document state, not a caller bug.
+///
+/// # Panics
+///
+/// * If `src.len() != src_width as usize * src_height as usize * 4`.
+/// * If any of `src_width · src_height · 4` /
+///   `out_width · out_height · 4` overflows `usize`.
+///
+/// # Returns
+///
+/// A packed straight-alpha RGBA `Vec<u8>` of length
+/// `out_width · out_height · 4`. An empty target extent returns an
+/// empty `Vec`.
+pub fn image_source(
+    src: &[u8],
+    src_width: u32,
+    src_height: u32,
+    out_width: u32,
+    out_height: u32,
+    par: PreserveAspectRatio,
+    sampling: ImageSourceSampling,
+) -> Vec<u8> {
+    let sw = src_width as usize;
+    let sh = src_height as usize;
+    let src_expected = sw
+        .checked_mul(sh)
+        .and_then(|n| n.checked_mul(4))
+        .expect("image_source: src_width * src_height * 4 overflowed usize");
+    assert_eq!(
+        src.len(),
+        src_expected,
+        "image_source: src.len() == {} but src_width*src_height*4 == {src_expected}",
+        src.len()
+    );
+    let ow = out_width as usize;
+    let oh = out_height as usize;
+    let out_bytes = ow
+        .checked_mul(oh)
+        .and_then(|n| n.checked_mul(4))
+        .expect("image_source: out_width * out_height * 4 overflowed usize");
+    if out_width == 0 || out_height == 0 {
+        return Vec::new();
+    }
+    // Degenerate zero-extent source: nothing to draw — the primitive
+    // result stays at the §15.7.3 transparent-black initial value.
+    if src_width == 0 || src_height == 0 {
+        return vec![0u8; out_bytes];
+    }
+
+    // §7.8 step 1 — scale factors.
+    let ratio_x = out_width as f32 / src_width as f32;
+    let ratio_y = out_height as f32 / src_height as f32;
+    let (scale_x, scale_y) = match par.align {
+        AspectRatioAlign::None => (ratio_x, ratio_y),
+        _ => {
+            let s = match par.meet_or_slice {
+                MeetOrSlice::Meet => ratio_x.min(ratio_y),
+                MeetOrSlice::Slice => ratio_x.max(ratio_y),
+            };
+            (s, s)
+        }
+    };
+
+    // §7.8 step 2 — per-axis anchor translation. The X anchor cycles
+    // Min → Mid → Max through the §7.8 table; same for Y.
+    #[derive(Clone, Copy)]
+    enum Anchor {
+        Min,
+        Mid,
+        Max,
+    }
+    let (ax, ay) = match par.align {
+        AspectRatioAlign::None => (Anchor::Min, Anchor::Min), // tx = ty = 0 either way
+        AspectRatioAlign::XMinYMin => (Anchor::Min, Anchor::Min),
+        AspectRatioAlign::XMidYMin => (Anchor::Mid, Anchor::Min),
+        AspectRatioAlign::XMaxYMin => (Anchor::Max, Anchor::Min),
+        AspectRatioAlign::XMinYMid => (Anchor::Min, Anchor::Mid),
+        AspectRatioAlign::XMidYMid => (Anchor::Mid, Anchor::Mid),
+        AspectRatioAlign::XMaxYMid => (Anchor::Max, Anchor::Mid),
+        AspectRatioAlign::XMinYMax => (Anchor::Min, Anchor::Max),
+        AspectRatioAlign::XMidYMax => (Anchor::Mid, Anchor::Max),
+        AspectRatioAlign::XMaxYMax => (Anchor::Max, Anchor::Max),
+    };
+    let anchor_offset = |anchor: Anchor, out: f32, scaled: f32| -> f32 {
+        match anchor {
+            Anchor::Min => 0.0,
+            Anchor::Mid => (out - scaled) / 2.0,
+            Anchor::Max => out - scaled,
+        }
+    };
+    let tx = anchor_offset(ax, out_width as f32, src_width as f32 * scale_x);
+    let ty = anchor_offset(ay, out_height as f32, src_height as f32 * scale_y);
+
+    // §7.8 step 3 — inverse-map output pixel centres into source
+    // space: the output pixel centre `(ox + ½, oy + ½)` corresponds
+    // to source position `((ox + ½ − tx) / scale, …)`; subtracting ½
+    // converts back from continuous position to source pixel index.
+    let wi = src_width as i64;
+    let hi = src_height as i64;
+    let mut out = vec![0u8; out_bytes];
+    let row_stride = ow * 4;
+    for oy in 0..oh {
+        let dst_row = oy * row_stride;
+        let v = (oy as f32 + 0.5 - ty) / scale_y - 0.5;
+        for ox in 0..ow {
+            let u = (ox as f32 + 0.5 - tx) / scale_x - 0.5;
+            let dst = dst_row + ox * 4;
+            match sampling {
+                ImageSourceSampling::Nearest => {
+                    // Round-half-away-from-zero — the same integer
+                    // rounding policy as `offset` (§15.21) and
+                    // `displacement_map` (§15.15), keeping the
+                    // module's nearest-sampling convention uniform.
+                    let isx = u.round() as i64;
+                    let isy = v.round() as i64;
+                    if (0..wi).contains(&isx) && (0..hi).contains(&isy) {
+                        let s = ((isy * wi + isx) as usize) * 4;
+                        out[dst..dst + 4].copy_from_slice(&src[s..s + 4]);
+                    } // else: transparent black (already zeroed).
+                }
+                ImageSourceSampling::Bilinear => {
+                    let x0 = u.floor() as i64;
+                    let y0 = v.floor() as i64;
+                    let fx = u - x0 as f32;
+                    let fy = v - y0 as f32;
+                    let fetch = |px: i64, py: i64| -> [f32; 4] {
+                        if !(0..wi).contains(&px) || !(0..hi).contains(&py) {
+                            return [0.0; 4];
+                        }
+                        let p = ((py * wi + px) as usize) * 4;
+                        [
+                            src[p] as f32,
+                            src[p + 1] as f32,
+                            src[p + 2] as f32,
+                            src[p + 3] as f32,
+                        ]
+                    };
+                    let c00 = fetch(x0, y0);
+                    let c10 = fetch(x0 + 1, y0);
+                    let c01 = fetch(x0, y0 + 1);
+                    let c11 = fetch(x0 + 1, y0 + 1);
+                    for c in 0..4 {
+                        let top = c00[c] + (c10[c] - c00[c]) * fx;
+                        let bot = c01[c] + (c11[c] - c01[c]) * fx;
+                        let val = top + (bot - top) * fy;
+                        out[dst + c] = val.clamp(0.0, 255.0).round() as u8;
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Typed-pixel wrapper around [`image_source`]. `src` has length
+/// `src_width · src_height`; the returned `Vec<Rgba>` has length
+/// `out_width · out_height`.
+pub fn image_source_pixels(
+    src: &[Rgba],
+    src_width: u32,
+    src_height: u32,
+    out_width: u32,
+    out_height: u32,
+    par: PreserveAspectRatio,
+    sampling: ImageSourceSampling,
+) -> Vec<Rgba> {
+    let n = src_width as usize * src_height as usize;
+    assert_eq!(
+        src.len(),
+        n,
+        "image_source_pixels: src.len() == {} but src_width*src_height == {n}",
+        src.len()
+    );
+    let mut bytes = Vec::with_capacity(n * 4);
+    for p in src {
+        bytes.extend_from_slice(&[p.r, p.g, p.b, p.a]);
+    }
+    let out = image_source(
+        &bytes, src_width, src_height, out_width, out_height, par, sampling,
+    );
+    out.chunks_exact(4)
+        .map(|c| Rgba::new(c[0], c[1], c[2], c[3]))
+        .collect()
+}
+
+#[cfg(test)]
+mod image_source_tests {
+    use super::*;
+
+    /// Build a packed-RGBA buffer of `w·h` pixels coloured by `f`.
+    fn build<F: FnMut(u32, u32) -> [u8; 4]>(w: u32, h: u32, mut f: F) -> Vec<u8> {
+        let mut v = Vec::with_capacity((w * h * 4) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                v.extend_from_slice(&f(x, y));
+            }
+        }
+        v
+    }
+
+    fn px(out: &[u8], w: u32, x: u32, y: u32) -> [u8; 4] {
+        let i = ((y * w + x) * 4) as usize;
+        [out[i], out[i + 1], out[i + 2], out[i + 3]]
+    }
+
+    #[test]
+    fn default_preserve_aspect_ratio_is_xmidymid_meet() {
+        // §15.18: "the effect is as if a value of xMidYMid meet were
+        // specified" when the attribute is absent.
+        let d = PreserveAspectRatio::default();
+        assert_eq!(d.align, AspectRatioAlign::XMidYMid);
+        assert_eq!(d.meet_or_slice, MeetOrSlice::Meet);
+    }
+
+    #[test]
+    fn same_extent_is_an_exact_copy_nearest_and_bilinear() {
+        let src = build(5, 4, |x, y| {
+            [(x * 50) as u8, (y * 60) as u8, ((x + y) * 25) as u8, 255]
+        });
+        for sampling in [ImageSourceSampling::Nearest, ImageSourceSampling::Bilinear] {
+            let out = image_source(&src, 5, 4, 5, 4, PreserveAspectRatio::default(), sampling);
+            assert_eq!(out, src, "identity placement must copy ({sampling:?})");
+        }
+    }
+
+    #[test]
+    fn align_none_stretches_non_uniformly() {
+        // §7.8 `none`: "Scale the graphic content … non-uniformly if
+        // necessary such that the element's bounding box exactly
+        // matches the viewport rectangle." 2×1 source → 4×1 target:
+        // each source pixel covers exactly 2 output pixels.
+        let src = build(2, 1, |x, _| {
+            if x == 0 {
+                [255, 0, 0, 255]
+            } else {
+                [0, 0, 255, 255]
+            }
+        });
+        let par = PreserveAspectRatio {
+            align: AspectRatioAlign::None,
+            meet_or_slice: MeetOrSlice::Meet,
+        };
+        let out = image_source(&src, 2, 1, 4, 1, par, ImageSourceSampling::Nearest);
+        assert_eq!(px(&out, 4, 0, 0), [255, 0, 0, 255]);
+        assert_eq!(px(&out, 4, 1, 0), [255, 0, 0, 255]);
+        assert_eq!(px(&out, 4, 2, 0), [0, 0, 255, 255]);
+        assert_eq!(px(&out, 4, 3, 0), [0, 0, 255, 255]);
+    }
+
+    #[test]
+    fn meet_uniform_upscale_fills_matching_aspect_target() {
+        // 1×1 red into 3×3: uniform scale = min(3, 3) = 3 covers the
+        // whole target — no transparent band.
+        let src = build(1, 1, |_, _| [255, 0, 0, 255]);
+        let out = image_source(
+            &src,
+            1,
+            1,
+            3,
+            3,
+            PreserveAspectRatio::default(),
+            ImageSourceSampling::Nearest,
+        );
+        for y in 0..3 {
+            for x in 0..3 {
+                assert_eq!(px(&out, 3, x, y), [255, 0, 0, 255]);
+            }
+        }
+    }
+
+    #[test]
+    fn xmidymid_meet_centres_with_transparent_bands() {
+        // 2×2 white into 6×2: ratios are (3, 1) so meet picks s = 1;
+        // the 2×2 image is centred at tx = (6 − 2)/2 = 2 → columns
+        // 2..4 carry the image, columns 0..2 and 4..6 are the
+        // §15.7.3 transparent black.
+        let src = build(2, 2, |_, _| [255, 255, 255, 255]);
+        let out = image_source(
+            &src,
+            2,
+            2,
+            6,
+            2,
+            PreserveAspectRatio::default(),
+            ImageSourceSampling::Nearest,
+        );
+        for y in 0..2 {
+            for x in 0..6u32 {
+                let expect = if (2..4).contains(&x) {
+                    [255, 255, 255, 255]
+                } else {
+                    [0, 0, 0, 0]
+                };
+                assert_eq!(px(&out, 6, x, y), expect, "({x},{y})");
+            }
+        }
+    }
+
+    #[test]
+    fn xminymin_and_xmaxymax_meet_anchor_low_and_high() {
+        let src = build(2, 2, |_, _| [10, 20, 30, 255]);
+        // xMinYMin: image occupies columns 0..2.
+        let par_min = PreserveAspectRatio {
+            align: AspectRatioAlign::XMinYMin,
+            meet_or_slice: MeetOrSlice::Meet,
+        };
+        let out = image_source(&src, 2, 2, 6, 2, par_min, ImageSourceSampling::Nearest);
+        for x in 0..6u32 {
+            let expect = if x < 2 {
+                [10, 20, 30, 255]
+            } else {
+                [0, 0, 0, 0]
+            };
+            assert_eq!(px(&out, 6, x, 0), expect, "xMinYMin column {x}");
+        }
+        // xMaxYMax: image occupies columns 4..6.
+        let par_max = PreserveAspectRatio {
+            align: AspectRatioAlign::XMaxYMax,
+            meet_or_slice: MeetOrSlice::Meet,
+        };
+        let out = image_source(&src, 2, 2, 6, 2, par_max, ImageSourceSampling::Nearest);
+        for x in 0..6u32 {
+            let expect = if x >= 4 {
+                [10, 20, 30, 255]
+            } else {
+                [0, 0, 0, 0]
+            };
+            assert_eq!(px(&out, 6, x, 0), expect, "xMaxYMax column {x}");
+        }
+    }
+
+    #[test]
+    fn slice_covers_whole_target_and_crops_the_overhang() {
+        // 2×2 source with distinct quadrants into a 4×2 target.
+        // Ratios are (2, 1); slice picks s = max = 2, so the scaled
+        // source is 4×4 and the Y overhang is cropped. With YMid the
+        // crop is centred: ty = (2 − 4)/2 = −1, so output row 0 reads
+        // source row (0 + 0.5 + 1)/2 − 0.5 = 0.25 → rounds to source
+        // row 0; output row 1 reads (1.5 + 1)/2 − 0.5 = 0.75 → source
+        // row 1. Every target pixel is covered (no transparent black).
+        let src = build(2, 2, |x, y| [(x * 200) as u8, (y * 200) as u8, 0, 255]);
+        let par = PreserveAspectRatio {
+            align: AspectRatioAlign::XMidYMid,
+            meet_or_slice: MeetOrSlice::Slice,
+        };
+        let out = image_source(&src, 2, 2, 4, 2, par, ImageSourceSampling::Nearest);
+        for oy in 0..2u32 {
+            for ox in 0..4u32 {
+                let sx = ox / 2; // s = 2 on X, tx = 0
+                let sy = oy; // centred crop maps row k → source row k
+                assert_eq!(
+                    px(&out, 4, ox, oy),
+                    [(sx * 200) as u8, (sy * 200) as u8, 0, 255],
+                    "({ox},{oy})"
+                );
+                assert_ne!(px(&out, 4, ox, oy)[3], 0, "slice must cover every pixel");
+            }
+        }
+    }
+
+    #[test]
+    fn bilinear_interior_blends_neighbouring_source_pixels() {
+        // 2×1 black→white strip stretched ×2 with align none. Output
+        // pixel 1 maps to u = (1.5)/2 − 0.5 = 0.25, blending the two
+        // source pixels at weight 0.75/0.25.
+        let src = build(2, 1, |x, _| {
+            if x == 0 {
+                [0, 0, 0, 255]
+            } else {
+                [255, 255, 255, 255]
+            }
+        });
+        let par = PreserveAspectRatio {
+            align: AspectRatioAlign::None,
+            meet_or_slice: MeetOrSlice::Meet,
+        };
+        let out = image_source(&src, 2, 1, 4, 1, par, ImageSourceSampling::Bilinear);
+        // 0 + (255 − 0) · 0.25 = 63.75 → 64
+        assert_eq!(px(&out, 4, 1, 0), [64, 64, 64, 255]);
+        // u(2) = (2.5)/2 − 0.5 = 0.75 → 0 + 255·0.75 = 191.25 → 191
+        assert_eq!(px(&out, 4, 2, 0), [191, 191, 191, 255]);
+    }
+
+    #[test]
+    fn empty_source_renders_transparent_black() {
+        let out = image_source(
+            &[],
+            0,
+            0,
+            3,
+            2,
+            PreserveAspectRatio::default(),
+            ImageSourceSampling::Nearest,
+        );
+        assert_eq!(out, vec![0u8; 3 * 2 * 4]);
+    }
+
+    #[test]
+    fn empty_target_returns_empty_vec() {
+        let src = build(2, 2, |_, _| [1, 2, 3, 4]);
+        let out = image_source(
+            &src,
+            2,
+            2,
+            0,
+            5,
+            PreserveAspectRatio::default(),
+            ImageSourceSampling::Nearest,
+        );
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "image_source: src.len()")]
+    fn wrong_source_length_panics() {
+        image_source(
+            &[0u8; 7],
+            2,
+            2,
+            2,
+            2,
+            PreserveAspectRatio::default(),
+            ImageSourceSampling::Nearest,
+        );
+    }
+
+    #[test]
+    fn typed_path_matches_byte_path() {
+        let src_bytes = build(3, 5, |x, y| {
+            [(x * 80) as u8, (y * 50) as u8, ((x * y) % 256) as u8, 220]
+        });
+        let src_typed: Vec<Rgba> = src_bytes
+            .chunks_exact(4)
+            .map(|c| Rgba::new(c[0], c[1], c[2], c[3]))
+            .collect();
+        let par = PreserveAspectRatio {
+            align: AspectRatioAlign::XMaxYMid,
+            meet_or_slice: MeetOrSlice::Slice,
+        };
+        let bytes_out = image_source(&src_bytes, 3, 5, 10, 7, par, ImageSourceSampling::Bilinear);
+        let typed_out =
+            image_source_pixels(&src_typed, 3, 5, 10, 7, par, ImageSourceSampling::Bilinear);
+        let from_typed: Vec<u8> = typed_out
+            .iter()
+            .flat_map(|p| [p.r, p.g, p.b, p.a])
+            .collect();
+        assert_eq!(bytes_out, from_typed);
     }
 }

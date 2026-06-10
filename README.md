@@ -51,7 +51,8 @@ produces a packed `Rgba` `VideoFrame`.
 | `feBlend` 5-mode pixel-wise blend (§15.9)  | done (round 233)     |
 | `feDiffuseLighting` Phong-diffuse + 3 light sources (§15.14)| done (round 247) |
 | `feSpecularLighting` Phong-specular + 3 light sources (§15.22)| done (round 259) |
-| Filters (drop-shadow, feImage)            | partial (morphology + color-matrix + Gaussian blur + component-transfer + composite + convolve-matrix + turbulence + flood + offset + merge + tile + displacement-map + blend + diffuse-lighting + specular-lighting) |
+| `feImage` raster placement + §7.8 preserveAspectRatio (§15.18)| done (round 268) |
+| Filters (drop-shadow)                     | partial — all 16 SVG 1.1 §15 primitives done (morphology + color-matrix + Gaussian blur + component-transfer + composite + convolve-matrix + turbulence + flood + offset + merge + tile + displacement-map + blend + diffuse-lighting + specular-lighting + image); `feDropShadow` blocked on the W3C Filter Effects Module Level 1 not being staged under `docs/` |
 | `<pattern>` paint                         | pending              |
 | Full ICC color-managed pipeline           | pending              |
 

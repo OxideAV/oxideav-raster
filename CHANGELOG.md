@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `feImage` filter primitive (SVG 1.1 §15.18) — places an
+  already-decoded straight-alpha RGBA raster into the filter chain,
+  fitted to the filter-primitive subregion with the full SVG 1.1 §7.8
+  `preserveAspectRatio` algebra. This completes all 16 `<feXxx>`
+  filter primitives of SVG 1.1 Chapter 15.
+  - `image_source(src, sw, sh, ow, oh, par, sampling) -> Vec<u8>` plus
+    the typed-pixel wrapper `image_source_pixels(...) -> Vec<Rgba>`.
+    New types: `PreserveAspectRatio { align, meet_or_slice }` (with
+    `Default` = `xMidYMid meet` per the §15.18 attribute table),
+    `AspectRatioAlign` (all ten §7.8 `<align>` values),
+    `MeetOrSlice::{Meet, Slice}`, and
+    `ImageSourceSampling::{Nearest, Bilinear}` (the bilinear route
+    follows the §15.18 "high quality viewers make use of appropriate
+    interpolation techniques, for example bilinear or bicubic" note).
+  - Fitting per §7.8: `align = none` scales each axis independently
+    so the source exactly fills the target; the nine uniform
+    alignments force a single scale factor — per-axis minimum under
+    `meet`, maximum under `slice` — then anchor the scaled source at
+    the min / midpoint / max of each axis. Target pixels the fitted
+    source does not cover emit the §15.7.3 transparent-black value.
+  - 12 unit tests (default attribute value, identity copy under both
+    samplers, non-uniform `none` stretch, matching-aspect upscale,
+    centred meet bands, min/max anchors, centred slice crop, bilinear
+    interior weights, degenerate zero-extent source and target, panic
+    guard, typed/byte-path parity) + 7 integration tests
+    (`tests/filter_image.rs`: realistic-extent meet/slice geometry,
+    all anchor placements, ×8 nearest block upscale, bilinear
+    midpoint arithmetic, `feMerge` chain composition, typed parity).
 - `feSpecularLighting` filter primitive (SVG 1.1 §15.22) — Phong-specular
   reflectance computed from the same §15.14 surface-normal Sobel kernel
   and §15.8 light-source descriptor as `feDiffuseLighting`.

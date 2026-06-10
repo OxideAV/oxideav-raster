@@ -201,13 +201,13 @@ pub use filter::{
     component_transfer, component_transfer_pixels, composite_filter, composite_filter_pixels,
     convolve_matrix, convolve_matrix_pixels, diffuse_lighting, diffuse_lighting_pixels,
     displacement_map, displacement_map_pixels, flood, flood_pixels, gaussian_blur,
-    gaussian_blur_pixels, merge, merge_pixels, morphology, morphology_pixels, offset,
-    offset_pixels, specular_lighting, specular_lighting_pixels, tile, tile_pixels,
-    turbulence_filter, turbulence_filter_pixels, BlendFilterMode, ColorMatrix, ColorMatrixOp,
-    ComponentTransfer, CompositeOp, ConvolveEdgeMode, ConvolveMatrix, DiffuseLighting,
-    DisplacementChannel, DisplacementSampling, LightSource, MorphologyOp, OffsetSampling,
-    SpecularLighting, StitchTiles, TransferFunc, Turbulence, TurbulenceType,
-    GAUSSIAN_BLUR_BOX_THRESHOLD,
+    gaussian_blur_pixels, image_source, image_source_pixels, merge, merge_pixels, morphology,
+    morphology_pixels, offset, offset_pixels, specular_lighting, specular_lighting_pixels, tile,
+    tile_pixels, turbulence_filter, turbulence_filter_pixels, AspectRatioAlign, BlendFilterMode,
+    ColorMatrix, ColorMatrixOp, ComponentTransfer, CompositeOp, ConvolveEdgeMode, ConvolveMatrix,
+    DiffuseLighting, DisplacementChannel, DisplacementSampling, ImageSourceSampling, LightSource,
+    MeetOrSlice, MorphologyOp, OffsetSampling, PreserveAspectRatio, SpecularLighting, StitchTiles,
+    TransferFunc, Turbulence, TurbulenceType, GAUSSIAN_BLUR_BOX_THRESHOLD,
 };
 pub use flatten::{flatten_arc_to_cubics, flatten_path, FlatContour};
 pub use gradient::{
