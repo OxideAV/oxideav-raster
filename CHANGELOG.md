@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Pattern `viewBox` / `preserveAspectRatio` tile fitting (SVG 2
+  §14.3.2 — content "fitted into the region … using the standard rules
+  for ‘viewBox’ and ‘preserveAspectRatio’").
+  - New `Pattern` fields `view_box: Option<ViewBox>` /
+    `preserve_aspect_ratio: PreserveAspectRatio` with builders
+    `with_view_box` / `with_preserve_aspect_ratio`. With a `viewBox`,
+    content coordinates live in viewBox space and reach the tile
+    through the §8.2 "equivalent transform of an SVG viewport"
+    algorithm (all 10 alignments × meet / slice; `align=none`
+    stretches non-uniformly). The `slice` overhang is clipped by the
+    tile (`overflow: hidden`).
+  - New public `view_box_fit_transform(vb, e_x, e_y, e_width,
+    e_height, par) -> Transform2D` implementing the §8.2 algorithm,
+    reusable by front-ends for any viewport-establishing element.
+  - A zero / negative / non-finite viewBox `width` / `height` disables
+    painting (§8.6), folded into `Pattern::is_degenerate`.
 - `<pattern>` paint server (SVG 2 §14.3 / SVG 1.1 §13.3) — tiled
   fill and stroke paint.
   - New public `Pattern` type: a user-space tile rectangle

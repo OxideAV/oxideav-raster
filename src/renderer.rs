@@ -765,10 +765,15 @@ impl Renderer {
 
     /// Render one pattern tile into an offscreen `tw × th` RGBA buffer.
     ///
-    /// Content coordinates are tile-origin-relative (§14.3.2), so the
-    /// only transform needed is the pattern-space → tile-pixel scale.
-    /// The offscreen canvas is exactly the tile rectangle, which
-    /// realises the user-agent `overflow: hidden` clip for free.
+    /// Without a `viewBox`, content coordinates are tile-origin-relative
+    /// (§14.3.2), so the only transform needed is the pattern-space →
+    /// tile-pixel scale. With a `viewBox`, content coordinates are first
+    /// fitted onto the tile rectangle by the §8.2 equivalent-transform
+    /// algorithm ([`crate::pattern::view_box_fit_transform`]) under the
+    /// pattern's `preserveAspectRatio`, then scaled to tile pixels. The
+    /// offscreen canvas is exactly the tile rectangle, which realises
+    /// the user-agent `overflow: hidden` clip for free (including the
+    /// overhang a `slice` fitting produces).
     fn rasterize_pattern_tile(&self, pattern: &Pattern, tw: u32, th: u32) -> VideoFrame {
         let mut tile_renderer = Renderer::with_cache_capacity(tw, th, 1);
         tile_renderer.supersampling = self.supersampling;
@@ -778,8 +783,19 @@ impl Renderer {
             tw as f32 / pattern.width.max(1e-9),
             th as f32 / pattern.height.max(1e-9),
         );
+        let content_tf = match &pattern.view_box {
+            Some(vb) => scale.compose(&crate::pattern::view_box_fit_transform(
+                vb,
+                0.0,
+                0.0,
+                pattern.width,
+                pattern.height,
+                pattern.preserve_aspect_ratio,
+            )),
+            None => scale,
+        };
         let group = Group::new().with_children(pattern.content.clone());
-        tile_renderer.render_node(&Node::Group(group), scale)
+        tile_renderer.render_node(&Node::Group(group), content_tf)
     }
 }
 

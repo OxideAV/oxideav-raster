@@ -22,6 +22,27 @@
 //! tile origin (the §14.3.2 "new coordinate system … has its origin at
 //! `(x, y)`" rule for patterns without a `viewBox`).
 //!
+//! # `viewBox` tile fitting
+//!
+//! When a `viewBox` is attached ([`Pattern::with_view_box`]), §14.3.2
+//! applies instead: "If there is a ‘viewBox’ attribute, then the new
+//! coordinate system is fitted into the region defined by the ‘x’,
+//! ‘y’, ‘width’, ‘height’ … attributes on the ‘pattern’ element using
+//! the standard rules for ‘viewBox’ and ‘preserveAspectRatio’." The
+//! standard rules are the §8.2 "equivalent transform of an SVG
+//! viewport" algorithm ([`view_box_fit_transform`]'s doc walks through
+//! it); content coordinates then live in viewBox space and the fitted
+//! transform maps them onto the tile rectangle. Per §14.3.1 a
+//! `patternContentUnits` value "has no effect if attribute ‘viewBox’
+//! is specified", which is why no content-units knob exists here — the
+//! no-viewBox content space is tile-origin-relative user space by
+//! construction, and the viewBox case overrides it entirely.
+//!
+//! Per §8.6 a `viewBox` width or height of zero "disables rendering of
+//! the element" and a negative value is an error; both (and non-finite
+//! values) make the pattern paint nothing, exactly like a degenerate
+//! tile rectangle.
+//!
 //! Per §14.3.1, a `width` or `height` of zero disables rendering — no
 //! paint is applied (negative values are an error in the source
 //! document; this implementation treats them, and non-finite values,
@@ -42,7 +63,8 @@
 //! bilinear filtering — the 2×2 footprint wraps to the opposite tile
 //! edge instead of clamping.
 
-use oxideav_core::{Node, Rgba, Transform2D, VideoFrame};
+use crate::filter::{AspectRatioAlign, MeetOrSlice, PreserveAspectRatio};
+use oxideav_core::{Node, Rgba, Transform2D, VideoFrame, ViewBox};
 
 /// A tiled paint server (SVG `<pattern>`).
 ///
@@ -69,11 +91,24 @@ pub struct Pattern {
     /// coordinate system onto the user coordinate system. Identity by
     /// default.
     pub transform: Transform2D,
-    /// Tile content. Coordinates are relative to the tile origin: a
-    /// point `(px, py)` of content renders at user-space
-    /// `(x + px + m·width, y + py + n·height)` for every tile `(m, n)`.
-    /// Content outside `[0, width) × [0, height)` is clipped to the
-    /// tile (`overflow: hidden`, §14.3.2).
+    /// Optional `viewBox` — when present, content coordinates live in
+    /// viewBox space and are fitted onto the tile rectangle "using the
+    /// standard rules for ‘viewBox’ and ‘preserveAspectRatio’"
+    /// (§14.3.2); see [`view_box_fit_transform`]. A zero / negative /
+    /// non-finite `width` or `height` disables painting (§8.6: zero
+    /// "disables rendering of the element", negative "is an error").
+    pub view_box: Option<ViewBox>,
+    /// `preserveAspectRatio` governing the [`Self::view_box`] fitting.
+    /// Ignored when `view_box` is `None`. Defaults to `xMidYMid meet`
+    /// (§7.8 / §8.2 defaults).
+    pub preserve_aspect_ratio: PreserveAspectRatio,
+    /// Tile content. Without a `view_box`, coordinates are relative to
+    /// the tile origin: a point `(px, py)` of content renders at
+    /// user-space `(x + px + m·width, y + py + n·height)` for every
+    /// tile `(m, n)`. With a `view_box`, coordinates are in viewBox
+    /// space and reach the tile through the §8.2 fitted transform.
+    /// Content outside the tile rectangle is clipped to the tile
+    /// (`overflow: hidden`, §14.3.2).
     pub content: Vec<Node>,
 }
 
@@ -87,6 +122,8 @@ impl Pattern {
             width,
             height,
             transform: Transform2D::identity(),
+            view_box: None,
+            preserve_aspect_ratio: PreserveAspectRatio::default(),
             content: Vec::new(),
         }
     }
@@ -94,6 +131,22 @@ impl Pattern {
     /// Set the `patternTransform`.
     pub fn with_transform(mut self, transform: Transform2D) -> Self {
         self.transform = transform;
+        self
+    }
+
+    /// Attach a `viewBox`: content coordinates become viewBox-space and
+    /// are fitted onto the tile rectangle per §14.3.2 / §8.2 (see
+    /// [`view_box_fit_transform`]). The fitting uses the pattern's
+    /// [`Self::preserve_aspect_ratio`] (default `xMidYMid meet`).
+    pub fn with_view_box(mut self, view_box: ViewBox) -> Self {
+        self.view_box = Some(view_box);
+        self
+    }
+
+    /// Set the `preserveAspectRatio` used for [`Self::view_box`]
+    /// fitting. Has no effect without a `viewBox`.
+    pub fn with_preserve_aspect_ratio(mut self, par: PreserveAspectRatio) -> Self {
+        self.preserve_aspect_ratio = par;
         self
     }
 
@@ -109,14 +162,92 @@ impl Pattern {
         self
     }
 
-    /// `true` when the tile rectangle disables painting (§14.3.1:
-    /// zero `width` / `height` means no paint; negative and non-finite
+    /// `true` when the tile rectangle or the `viewBox` disables
+    /// painting (§14.3.1: zero tile `width` / `height` means no paint;
+    /// §8.6: a zero viewBox `width` / `height` "disables rendering of
+    /// the element" and a negative value is an error; non-finite
     /// extents are treated the same way).
     pub fn is_degenerate(&self) -> bool {
-        !(self.width > 0.0
-            && self.height > 0.0
-            && self.width.is_finite()
-            && self.height.is_finite())
+        let bad = |v: f32| !(v > 0.0 && v.is_finite());
+        bad(self.width)
+            || bad(self.height)
+            || self
+                .view_box
+                .map(|vb| bad(vb.width) || bad(vb.height))
+                .unwrap_or(false)
+    }
+}
+
+/// SVG 2 §8.2 — "Computing the equivalent transform of an SVG
+/// viewport": the translation + scale that fits the `vb` viewBox into
+/// the viewport rectangle `(e_x, e_y, e_width, e_height)` under the
+/// `preserveAspectRatio` value `par`.
+///
+/// The §8.2 steps, verbatim in structure:
+///
+/// 1. `scale-x = e-width / vb-width`, `scale-y = e-height / vb-height`.
+/// 2. If `align` is not `none` and `meetOrSlice` is `meet`, "set the
+///    larger of scale-x and scale-y to the smaller"; if `slice`, "set
+///    the smaller … to the larger".
+/// 3. `translate-x = e-x − (vb-x · scale-x)`,
+///    `translate-y = e-y − (vb-y · scale-y)`.
+/// 4. If `align` contains `xMid`, add `(e-width − vb-width·scale-x)/2`
+///    to `translate-x`; `xMax` adds the whole difference. Same per-axis
+///    rule for `yMid` / `yMax`.
+///
+/// "The transform applied to content contained by the element is given
+/// by `translate(translate-x, translate-y) scale(scale-x, scale-y)`."
+///
+/// The caller guarantees positive finite `vb.width` / `vb.height`
+/// (degenerate viewBoxes never reach the fitting step — they disable
+/// painting per §8.6, see [`Pattern::is_degenerate`]).
+pub fn view_box_fit_transform(
+    vb: &ViewBox,
+    e_x: f32,
+    e_y: f32,
+    e_width: f32,
+    e_height: f32,
+    par: PreserveAspectRatio,
+) -> Transform2D {
+    let mut scale_x = e_width / vb.width;
+    let mut scale_y = e_height / vb.height;
+    if par.align != AspectRatioAlign::None {
+        let s = match par.meet_or_slice {
+            MeetOrSlice::Meet => scale_x.min(scale_y),
+            MeetOrSlice::Slice => scale_x.max(scale_y),
+        };
+        scale_x = s;
+        scale_y = s;
+    }
+    let mut translate_x = e_x - vb.min_x * scale_x;
+    let mut translate_y = e_y - vb.min_y * scale_y;
+    use AspectRatioAlign as A;
+    match par.align {
+        A::XMidYMin | A::XMidYMid | A::XMidYMax => {
+            translate_x += (e_width - vb.width * scale_x) / 2.0;
+        }
+        A::XMaxYMin | A::XMaxYMid | A::XMaxYMax => {
+            translate_x += e_width - vb.width * scale_x;
+        }
+        _ => {}
+    }
+    match par.align {
+        A::XMinYMid | A::XMidYMid | A::XMaxYMid => {
+            translate_y += (e_height - vb.height * scale_y) / 2.0;
+        }
+        A::XMinYMax | A::XMidYMax | A::XMaxYMax => {
+            translate_y += e_height - vb.height * scale_y;
+        }
+        _ => {}
+    }
+    // translate(tx, ty) · scale(sx, sy).
+    Transform2D {
+        a: scale_x,
+        b: 0.0,
+        c: 0.0,
+        d: scale_y,
+        e: translate_x,
+        f: translate_y,
     }
 }
 
@@ -228,6 +359,9 @@ mod tests {
         assert_eq!((p.x, p.y, p.width, p.height), (1.0, 2.0, 3.0, 4.0));
         assert!(p.transform.is_identity());
         assert!(p.content.is_empty());
+        assert!(p.view_box.is_none());
+        // §7.8 / §8.2 default: xMidYMid meet.
+        assert_eq!(p.preserve_aspect_ratio, PreserveAspectRatio::default());
         assert!(!p.is_degenerate());
     }
 
@@ -239,6 +373,116 @@ mod tests {
         assert!(Pattern::new(0.0, 0.0, f32::NAN, 4.0).is_degenerate());
         assert!(Pattern::new(0.0, 0.0, f32::INFINITY, 4.0).is_degenerate());
         assert!(!Pattern::new(0.0, 0.0, 3.0, 4.0).is_degenerate());
+    }
+
+    #[test]
+    fn degenerate_view_box_extents() {
+        // §8.6: zero disables rendering; negative is an error; treat
+        // non-finite the same. A healthy viewBox is not degenerate.
+        for (w, h) in [
+            (0.0f32, 10.0f32),
+            (10.0, 0.0),
+            (-10.0, 10.0),
+            (f32::NAN, 10.0),
+            (10.0, f32::INFINITY),
+        ] {
+            let p = Pattern::new(0.0, 0.0, 3.0, 4.0).with_view_box(ViewBox::new(0.0, 0.0, w, h));
+            assert!(p.is_degenerate(), "viewBox {w}×{h} must be degenerate");
+        }
+        let p = Pattern::new(0.0, 0.0, 3.0, 4.0).with_view_box(ViewBox::new(0.0, 0.0, 10.0, 10.0));
+        assert!(!p.is_degenerate());
+    }
+
+    // §8.2 fitting algebra. Helper: extract (sx, sy, tx, ty) from the
+    // axis-aligned result.
+    fn fit(vb: ViewBox, e: (f32, f32, f32, f32), par: PreserveAspectRatio) -> (f32, f32, f32, f32) {
+        let t = view_box_fit_transform(&vb, e.0, e.1, e.2, e.3, par);
+        assert_eq!((t.b, t.c), (0.0, 0.0), "fit must be translate·scale");
+        (t.a, t.d, t.e, t.f)
+    }
+
+    #[test]
+    fn fit_uniform_scale_no_mismatch() {
+        // vb 10×10 into a 20×20 viewport: scale 2, no alignment slack.
+        let par = PreserveAspectRatio::default(); // xMidYMid meet
+        let vb = ViewBox::new(0.0, 0.0, 10.0, 10.0);
+        assert_eq!(fit(vb, (0.0, 0.0, 20.0, 20.0), par), (2.0, 2.0, 0.0, 0.0));
+    }
+
+    #[test]
+    fn fit_min_xy_translates_origin() {
+        // §8.2 step 3: translate-x = e-x − vb-x·scale-x.
+        let par = PreserveAspectRatio::default();
+        let vb = ViewBox::new(5.0, 5.0, 10.0, 10.0);
+        assert_eq!(
+            fit(vb, (0.0, 0.0, 20.0, 20.0), par),
+            (2.0, 2.0, -10.0, -10.0)
+        );
+        // Element offset adds straight through.
+        assert_eq!(fit(vb, (3.0, 7.0, 20.0, 20.0), par), (2.0, 2.0, -7.0, -3.0));
+    }
+
+    #[test]
+    fn fit_meet_takes_smaller_scale_and_centres() {
+        // vb 10×10 into 40×20: scale-x 4, scale-y 2 → meet picks 2;
+        // xMid adds (40 − 10·2)/2 = 10 to translate-x.
+        let par = PreserveAspectRatio::default();
+        let vb = ViewBox::new(0.0, 0.0, 10.0, 10.0);
+        assert_eq!(fit(vb, (0.0, 0.0, 40.0, 20.0), par), (2.0, 2.0, 10.0, 0.0));
+    }
+
+    #[test]
+    fn fit_slice_takes_larger_scale_and_centres_overflow() {
+        // Same geometry under slice: scale 4; yMid adds
+        // (20 − 10·4)/2 = −10 to translate-y.
+        let par = PreserveAspectRatio {
+            align: AspectRatioAlign::XMidYMid,
+            meet_or_slice: MeetOrSlice::Slice,
+        };
+        let vb = ViewBox::new(0.0, 0.0, 10.0, 10.0);
+        assert_eq!(fit(vb, (0.0, 0.0, 40.0, 20.0), par), (4.0, 4.0, 0.0, -10.0));
+    }
+
+    #[test]
+    fn fit_align_none_scales_each_axis() {
+        // align=none: non-uniform fill, meetOrSlice ignored.
+        for mos in [MeetOrSlice::Meet, MeetOrSlice::Slice] {
+            let par = PreserveAspectRatio {
+                align: AspectRatioAlign::None,
+                meet_or_slice: mos,
+            };
+            let vb = ViewBox::new(0.0, 0.0, 10.0, 10.0);
+            assert_eq!(fit(vb, (0.0, 0.0, 40.0, 20.0), par), (4.0, 2.0, 0.0, 0.0));
+        }
+    }
+
+    #[test]
+    fn fit_min_and_max_anchors() {
+        let vb = ViewBox::new(0.0, 0.0, 10.0, 10.0);
+        let e = (0.0, 0.0, 40.0, 20.0); // meet scale = 2, slack-x = 20
+        let anchor = |align| PreserveAspectRatio {
+            align,
+            meet_or_slice: MeetOrSlice::Meet,
+        };
+        // xMin leaves translate-x at 0; xMax adds the full slack.
+        assert_eq!(
+            fit(vb, e, anchor(AspectRatioAlign::XMinYMin)),
+            (2.0, 2.0, 0.0, 0.0)
+        );
+        assert_eq!(
+            fit(vb, e, anchor(AspectRatioAlign::XMaxYMax)),
+            (2.0, 2.0, 20.0, 0.0)
+        );
+        // Portrait viewport: slack moves to y.
+        let e = (0.0, 0.0, 20.0, 40.0);
+        assert_eq!(
+            fit(vb, e, anchor(AspectRatioAlign::XMinYMax)),
+            (2.0, 2.0, 0.0, 20.0)
+        );
+        assert_eq!(
+            fit(vb, e, anchor(AspectRatioAlign::XMidYMid)),
+            (2.0, 2.0, 0.0, 10.0)
+        );
     }
 
     #[test]

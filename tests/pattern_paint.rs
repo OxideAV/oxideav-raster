@@ -276,3 +276,190 @@ fn tile_content_overflow_is_clipped_to_the_tile() {
     assert_eq!(pixel(&out, 2, 7), Rgba::new(0, 0, 0, 0));
     assert_eq!(pixel(&out, 12, 7), Rgba::new(0, 0, 0, 0));
 }
+
+// ---------------------------------------------------------------------
+// viewBox tile fitting (SVG 2 §14.3.2 — "fitted into the region …
+// using the standard rules for ‘viewBox’ and ‘preserveAspectRatio’",
+// i.e. the §8.2 equivalent-transform algorithm).
+// ---------------------------------------------------------------------
+
+use oxideav_core::ViewBox;
+use oxideav_raster::{AspectRatioAlign, MeetOrSlice, PreserveAspectRatio};
+
+const CLEAR: Rgba = Rgba::new(0, 0, 0, 0);
+
+#[test]
+fn view_box_rescales_content_onto_the_tile() {
+    // 20-unit tile with viewBox "0 0 10 10": content coordinates are
+    // halved relative to tile units, so 5-wide viewBox stripes become
+    // 10-px canvas stripes.
+    let r = exact_renderer(40, 20);
+    let pat = Pattern::new(0.0, 0.0, 20.0, 20.0)
+        .with_view_box(ViewBox::new(0.0, 0.0, 10.0, 10.0))
+        .with_child(rect_node(0.0, 0.0, 5.0, 10.0, RED))
+        .with_child(rect_node(5.0, 0.0, 5.0, 10.0, BLUE));
+    let out = r.fill_path_with_pattern(
+        &rect_path(0.0, 0.0, 40.0, 20.0),
+        FillRule::NonZero,
+        &pat,
+        Transform2D::identity(),
+    );
+    for y in [0u32, 10, 19] {
+        for x in 0..40u32 {
+            let expect = if (x / 10) % 2 == 0 { RED } else { BLUE };
+            assert_eq!(pixel(&out, x, y), expect, "pixel ({x}, {y})");
+        }
+    }
+}
+
+#[test]
+fn view_box_min_offset_shifts_content() {
+    // viewBox "5 5 10 10" over a 20×20 tile: §8.2 step 3 puts viewBox
+    // point (5, 5) at the tile origin, scale 2. A red rect at viewBox
+    // (5, 5, 5, 5) lands on the tile's top-left quarter.
+    let r = exact_renderer(20, 20);
+    let pat = Pattern::new(0.0, 0.0, 20.0, 20.0)
+        .with_view_box(ViewBox::new(5.0, 5.0, 10.0, 10.0))
+        .with_child(rect_node(5.0, 5.0, 5.0, 5.0, RED));
+    let out = r.fill_path_with_pattern(
+        &rect_path(0.0, 0.0, 20.0, 20.0),
+        FillRule::NonZero,
+        &pat,
+        Transform2D::identity(),
+    );
+    assert_eq!(pixel(&out, 4, 4), RED);
+    assert_eq!(pixel(&out, 9, 9), RED);
+    assert_eq!(pixel(&out, 12, 4), CLEAR);
+    assert_eq!(pixel(&out, 4, 12), CLEAR);
+}
+
+#[test]
+fn view_box_meet_centres_with_transparent_bands() {
+    // Square viewBox into a 40×20 (landscape) tile under the default
+    // xMidYMid meet: uniform scale 2, content centred with 10-px
+    // transparent bands left and right.
+    let r = exact_renderer(40, 20);
+    let pat = Pattern::new(0.0, 0.0, 40.0, 20.0)
+        .with_view_box(ViewBox::new(0.0, 0.0, 10.0, 10.0))
+        .with_child(rect_node(0.0, 0.0, 10.0, 10.0, RED));
+    let out = r.fill_path_with_pattern(
+        &rect_path(0.0, 0.0, 40.0, 20.0),
+        FillRule::NonZero,
+        &pat,
+        Transform2D::identity(),
+    );
+    for y in [0u32, 10, 19] {
+        assert_eq!(pixel(&out, 5, y), CLEAR, "left band at y={y}");
+        assert_eq!(pixel(&out, 11, y), RED, "content left edge at y={y}");
+        assert_eq!(pixel(&out, 20, y), RED, "centre at y={y}");
+        assert_eq!(pixel(&out, 28, y), RED, "content right edge at y={y}");
+        assert_eq!(pixel(&out, 35, y), CLEAR, "right band at y={y}");
+    }
+}
+
+#[test]
+fn view_box_slice_overflow_is_clipped_by_the_tile() {
+    // Same geometry under xMidYMid slice: uniform scale 4, the viewBox
+    // overflows vertically (translate-y = −10) and the overhang is
+    // clipped by the tile (overflow: hidden, §14.3.2). A rect covering
+    // only the TOP HALF of the viewBox (y in [0, 5)) maps to y in
+    // [−10, 10): rows 0..10 painted, rows 10..20 clear — pinning both
+    // the larger-scale choice and the yMid anchor.
+    let r = exact_renderer(40, 20);
+    let pat = Pattern::new(0.0, 0.0, 40.0, 20.0)
+        .with_view_box(ViewBox::new(0.0, 0.0, 10.0, 10.0))
+        .with_preserve_aspect_ratio(PreserveAspectRatio {
+            align: AspectRatioAlign::XMidYMid,
+            meet_or_slice: MeetOrSlice::Slice,
+        })
+        .with_child(rect_node(0.0, 0.0, 10.0, 5.0, RED));
+    let out = r.fill_path_with_pattern(
+        &rect_path(0.0, 0.0, 40.0, 20.0),
+        FillRule::NonZero,
+        &pat,
+        Transform2D::identity(),
+    );
+    for x in [0u32, 20, 39] {
+        assert_eq!(pixel(&out, x, 5), RED, "top half at x={x}");
+        assert_eq!(pixel(&out, x, 15), CLEAR, "bottom half at x={x}");
+    }
+}
+
+#[test]
+fn view_box_align_none_stretches_nonuniformly() {
+    // align=none scales each axis independently: the left half of the
+    // viewBox fills the left half of the tile, full height, despite
+    // the 2:1 aspect mismatch.
+    let r = exact_renderer(40, 20);
+    let pat = Pattern::new(0.0, 0.0, 40.0, 20.0)
+        .with_view_box(ViewBox::new(0.0, 0.0, 10.0, 10.0))
+        .with_preserve_aspect_ratio(PreserveAspectRatio {
+            align: AspectRatioAlign::None,
+            meet_or_slice: MeetOrSlice::Meet,
+        })
+        .with_child(rect_node(0.0, 0.0, 5.0, 10.0, RED));
+    let out = r.fill_path_with_pattern(
+        &rect_path(0.0, 0.0, 40.0, 20.0),
+        FillRule::NonZero,
+        &pat,
+        Transform2D::identity(),
+    );
+    for y in [0u32, 10, 19] {
+        assert_eq!(pixel(&out, 5, y), RED, "left half at y={y}");
+        assert_eq!(pixel(&out, 18, y), RED, "left half at y={y}");
+        assert_eq!(pixel(&out, 25, y), CLEAR, "right half at y={y}");
+    }
+}
+
+#[test]
+fn view_box_fitting_composes_with_tiling() {
+    // The fitted tile still tiles periodically: 20-unit tile, viewBox
+    // stripes — every pixel equals its tile-translated twin.
+    let r = exact_renderer(60, 20);
+    let pat = Pattern::new(0.0, 0.0, 20.0, 20.0)
+        .with_view_box(ViewBox::new(0.0, 0.0, 10.0, 10.0))
+        .with_child(rect_node(0.0, 0.0, 5.0, 10.0, RED))
+        .with_child(rect_node(5.0, 0.0, 5.0, 10.0, BLUE));
+    let out = r.fill_path_with_pattern(
+        &rect_path(0.0, 0.0, 60.0, 20.0),
+        FillRule::NonZero,
+        &pat,
+        Transform2D::identity(),
+    );
+    for y in 0..20u32 {
+        for x in 0..40u32 {
+            assert_eq!(
+                pixel(&out, x, y),
+                pixel(&out, x + 20, y),
+                "period violation at ({x}, {y})"
+            );
+        }
+    }
+}
+
+#[test]
+fn degenerate_view_box_paints_nothing() {
+    // §8.6: a zero viewBox width/height disables rendering of the
+    // element; negative is an error — both paint nothing.
+    let r = exact_renderer(20, 20);
+    for (w, h) in [(0.0f32, 10.0f32), (10.0, 0.0), (-10.0, 10.0)] {
+        let pat = Pattern::new(0.0, 0.0, 20.0, 20.0)
+            .with_view_box(ViewBox::new(0.0, 0.0, w, h))
+            .with_child(rect_node(0.0, 0.0, 10.0, 10.0, RED));
+        let out = r.fill_path_with_pattern(
+            &rect_path(0.0, 0.0, 20.0, 20.0),
+            FillRule::NonZero,
+            &pat,
+            Transform2D::identity(),
+        );
+        for y in 0..20u32 {
+            for x in 0..20u32 {
+                assert_eq!(
+                    pixel(&out, x, y),
+                    CLEAR,
+                    "viewBox {w}×{h} painted ({x}, {y})"
+                );
+            }
+        }
+    }
+}
