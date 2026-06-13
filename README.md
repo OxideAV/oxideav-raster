@@ -52,7 +52,8 @@ produces a packed `Rgba` `VideoFrame`.
 | `feDiffuseLighting` Phong-diffuse + 3 light sources (§15.14)| done (round 247) |
 | `feSpecularLighting` Phong-specular + 3 light sources (§15.22)| done (round 259) |
 | `feImage` raster placement + §7.8 preserveAspectRatio (§15.18)| done (round 268) |
-| Filters (drop-shadow)                     | partial — all 16 SVG 1.1 §15 primitives done (morphology + color-matrix + Gaussian blur + component-transfer + composite + convolve-matrix + turbulence + flood + offset + merge + tile + displacement-map + blend + diffuse-lighting + specular-lighting + image); `feDropShadow` blocked on the W3C Filter Effects Module Level 1 not being staged under `docs/` |
+| `feDropShadow` shorthand drop shadow (Filter Effects 1 §9.12)| done (round 288) — spec equivalent chain `feGaussianBlur(alpha) → feOffset → feFlood → feComposite(in) → feMerge(source)` |
+| Filters — all 17 §15 / Filter-Effects-1 primitives | done — morphology + color-matrix + Gaussian blur + component-transfer + composite + convolve-matrix + turbulence + flood + offset + merge + tile + displacement-map + blend + diffuse-lighting + specular-lighting + image + drop-shadow |
 | `<pattern>` tiled fill/stroke paint (SVG2 §14.3)| done (round 276) — user-space tile rect + patternTransform + wrap-around sampling; lacks a core `Paint` variant |
 | Pattern `viewBox` + `preserveAspectRatio` fitting (SVG2 §14.3.2 / §8.2)| done (round 280) — all 10 alignments × meet/slice + `align=none`, slice overhang tile-clipped |
 | Full ICC color-managed pipeline           | pending              |

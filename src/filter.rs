@@ -5447,6 +5447,176 @@ pub fn merge_pixels(width: u32, height: u32, layers: &[&[Rgba]]) -> Vec<Rgba> {
 }
 
 // ----------------------------------------------------------------------
+// Filter Effects Module Level 1 §9.12 `<feDropShadow>` — shorthand
+// drop-shadow primitive.
+// ----------------------------------------------------------------------
+
+/// Filter Effects Module Level 1 §9.12 `<feDropShadow>` — the shorthand
+/// drop-shadow primitive, evaluated as its spec-defined equivalent
+/// primitive chain.
+///
+/// §9.12 states the result "is equivalent to the following":
+///
+/// ```text
+/// <feGaussianBlur in="alpha-channel-of-feDropShadow-in" stdDeviation="…"/>
+/// <feOffset dx="…" dy="…" result="offsetblur"/>
+/// <feFlood flood-color="…" flood-opacity="…"/>
+/// <feComposite in2="offsetblur" operator="in"/>
+/// <feMerge>
+///   <feMergeNode/>
+///   <feMergeNode in="in-of-feDropShadow"/>
+/// </feMerge>
+/// ```
+///
+/// The §9.12 "divided into steps" elaboration is implemented verbatim:
+///
+/// 1. Take the **alpha channel** of the input (RGB forced to `0`, alpha
+///    preserved) and blur it with a [`gaussian_blur`] of `std_x` /
+///    `std_y` (the §9.12 `stdDeviation`, a `<number-optional-number>`;
+///    when only one value is given the caller passes it for both axes).
+/// 2. [`offset`] that blurred alpha by `(dx, dy)` to produce the
+///    spec's `"offsetblur"` buffer.
+/// 3. Produce an [`flood`] of the resolved `flood-color`
+///    (`flood_r` / `flood_g` / `flood_b`) at `flood_opacity`.
+/// 4. [`composite_filter`] the flood with `"offsetblur"` under
+///    [`CompositeOp::In`] (`in1` = flood, `in2` = offsetblur), so the
+///    flood colour is clipped to the offset blurred-alpha coverage —
+///    this is the coloured shadow.
+/// 5. [`merge`] the shadow (bottom) with the original input (top),
+///    i.e. the source graphic drawn over its own shadow.
+///
+/// The §9.12 note that "it is not required that it is implemented like
+/// that … user agents can optimize the handling" is honoured in spirit:
+/// the equivalent tree is the normative definition, and evaluating it
+/// directly is observably identical to any optimised path.
+///
+/// **Defaults** (§9.12 attribute table): `dx` initial value `2`, `dy`
+/// initial value `2`, `stdDeviation` initial value `2`. §9.13.1
+/// `flood-color` initial value is `black` (`(0, 0, 0)`); §9.13.2
+/// `flood-opacity` initial value is `1`. These are *not* applied here —
+/// the caller resolves the presentation attributes and passes concrete
+/// values, mirroring every other primitive entry point in this module.
+///
+/// `src` must be exactly `width · height · 4` bytes in row-major
+/// straight-alpha RGBA order. `sampling` selects the [`offset`]
+/// reconstruction policy for fractional `(dx, dy)`.
+///
+/// # Panics
+///
+/// * If `src.len() != width as usize * height as usize * 4`.
+/// * If `std_x`, `std_y`, `dx`, `dy`, or `flood_opacity` is NaN.
+/// * If `std_x` or `std_y` is negative (§15.17 / §9.12 "a negative
+///   value … is an error").
+///
+/// # Returns
+///
+/// A new packed-RGBA `Vec<u8>` of the same dimensions as the source —
+/// the source graphic composited over its coloured, blurred, offset
+/// drop shadow.
+#[allow(clippy::too_many_arguments)]
+pub fn drop_shadow(
+    src: &[u8],
+    width: u32,
+    height: u32,
+    std_x: f32,
+    std_y: f32,
+    dx: f32,
+    dy: f32,
+    flood_r: u8,
+    flood_g: u8,
+    flood_b: u8,
+    flood_opacity: f32,
+    sampling: OffsetSampling,
+) -> Vec<u8> {
+    let w = width as usize;
+    let h = height as usize;
+    let expected = w
+        .checked_mul(h)
+        .and_then(|n| n.checked_mul(4))
+        .expect("drop_shadow: width * height * 4 overflowed usize");
+    assert_eq!(
+        src.len(),
+        expected,
+        "drop_shadow: src.len() == {} but width*height*4 == {expected}",
+        src.len()
+    );
+
+    if width == 0 || height == 0 {
+        return Vec::new();
+    }
+
+    // Step 1: alpha channel of the input → RGB zeroed, alpha preserved.
+    // §9.12: "Take the alpha channel of the input". Blurring this
+    // alpha-only buffer is the feGaussianBlur of the equivalent tree.
+    let mut alpha_only = vec![0u8; expected];
+    for (dst, s) in alpha_only.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
+        dst[3] = s[3];
+    }
+    let blurred = gaussian_blur(&alpha_only, width, height, std_x, std_y);
+
+    // Step 2: feOffset(dx, dy) → "offsetblur".
+    let offsetblur = offset(&blurred, width, height, dx, dy, sampling);
+
+    // Step 3: feFlood(flood-color, flood-opacity).
+    let flooded = flood(width, height, flood_r, flood_g, flood_b, flood_opacity);
+
+    // Step 4: feComposite(flood in2="offsetblur" operator="in"). The
+    // flood colour is the `in` operand, the offset blurred alpha the
+    // `in2` operand; CompositeOp::In clips `in` to `in2`'s coverage.
+    let shadow = composite_filter(&flooded, &offsetblur, width, height, CompositeOp::In);
+
+    // Step 5: feMerge — shadow on the bottom, source graphic on top.
+    merge(width, height, &[&shadow, src])
+}
+
+/// Typed-pixel wrapper around [`drop_shadow`]. Returns a `Vec<Rgba>` of
+/// length `width · height`.
+#[allow(clippy::too_many_arguments)]
+pub fn drop_shadow_pixels(
+    src: &[Rgba],
+    width: u32,
+    height: u32,
+    std_x: f32,
+    std_y: f32,
+    dx: f32,
+    dy: f32,
+    flood_r: u8,
+    flood_g: u8,
+    flood_b: u8,
+    flood_opacity: f32,
+    sampling: OffsetSampling,
+) -> Vec<Rgba> {
+    let n = width as usize * height as usize;
+    assert_eq!(
+        src.len(),
+        n,
+        "drop_shadow_pixels: src.len() == {} but width*height == {n}",
+        src.len()
+    );
+    let mut bytes = Vec::with_capacity(n * 4);
+    for p in src {
+        bytes.extend_from_slice(&[p.r, p.g, p.b, p.a]);
+    }
+    let out = drop_shadow(
+        &bytes,
+        width,
+        height,
+        std_x,
+        std_y,
+        dx,
+        dy,
+        flood_r,
+        flood_g,
+        flood_b,
+        flood_opacity,
+        sampling,
+    );
+    out.chunks_exact(4)
+        .map(|c| Rgba::new(c[0], c[1], c[2], c[3]))
+        .collect()
+}
+
+// ----------------------------------------------------------------------
 // SVG 1.1 §15.23 `<feTile>` — periodic tiling of a reference subregion.
 // ----------------------------------------------------------------------
 

@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `<feDropShadow>` shorthand drop-shadow filter primitive (Filter
+  Effects Module Level 1 §9.12). The spec defines the primitive purely
+  as an equivalent chain, implemented verbatim:
+  `feGaussianBlur(alpha-channel-of-in) → feOffset(dx, dy) →
+  feFlood(flood-color, flood-opacity) → feComposite(in2=offsetblur,
+  operator="in") → feMerge(shadow, source-graphic)`.
+  - New public `drop_shadow(src, width, height, std_x, std_y, dx, dy,
+    flood_r, flood_g, flood_b, flood_opacity, sampling)` (with the
+    typed-pixel wrapper `drop_shadow_pixels`). The shadow is built from
+    the input's alpha channel only (RGB zeroed), blurred, offset,
+    coloured by the flood, and the source graphic is composited on top.
+  - `sampling` selects the `feOffset` reconstruction policy
+    (`OffsetSampling::Nearest` / `Bilinear`) for fractional `(dx, dy)`.
+    Presentation-attribute defaults (`dx`/`dy`/`stdDeviation` = 2,
+    `flood-color` = black, `flood-opacity` = 1) are resolved by the
+    caller, matching every other primitive entry point.
+  - This completes the full set of 17 SVG 1.1 §15 / Filter Effects
+    Module Level 1 filter primitives.
 - Pattern `viewBox` / `preserveAspectRatio` tile fitting (SVG 2
   §14.3.2 — content "fitted into the region … using the standard rules
   for ‘viewBox’ and ‘preserveAspectRatio’").

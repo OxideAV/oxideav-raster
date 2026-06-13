@@ -132,6 +132,11 @@
 //!   bottom-to-top using the §14.2 simple-alpha-compositing `over`
 //!   operator. Exposed as [`merge`] (with the typed-pixel wrapper
 //!   [`merge_pixels`]).
+//! * `<feDropShadow>` (Filter Effects Module Level 1 §9.12) — the
+//!   shorthand drop-shadow primitive, evaluated as its spec-defined
+//!   equivalent chain `feGaussianBlur(alpha) → feOffset → feFlood →
+//!   feComposite(in) → feMerge(source)`. Exposed as [`drop_shadow`]
+//!   (with the typed-pixel wrapper [`drop_shadow_pixels`]).
 //! * `<feDisplacementMap>` (SVG 1.1 §15.15) per-pixel channel-driven
 //!   warp of `in1` by the §15.15 formula
 //!   `P'(x, y) = P(x + scale · (XC − 0.5), y + scale · (YC − 0.5))`,
@@ -217,14 +222,15 @@ pub use filter::{
     blend_filter, blend_filter_pixels, color_matrix, color_matrix_op, color_matrix_pixels,
     component_transfer, component_transfer_pixels, composite_filter, composite_filter_pixels,
     convolve_matrix, convolve_matrix_pixels, diffuse_lighting, diffuse_lighting_pixels,
-    displacement_map, displacement_map_pixels, flood, flood_pixels, gaussian_blur,
-    gaussian_blur_pixels, image_source, image_source_pixels, merge, merge_pixels, morphology,
-    morphology_pixels, offset, offset_pixels, specular_lighting, specular_lighting_pixels, tile,
-    tile_pixels, turbulence_filter, turbulence_filter_pixels, AspectRatioAlign, BlendFilterMode,
-    ColorMatrix, ColorMatrixOp, ComponentTransfer, CompositeOp, ConvolveEdgeMode, ConvolveMatrix,
-    DiffuseLighting, DisplacementChannel, DisplacementSampling, ImageSourceSampling, LightSource,
-    MeetOrSlice, MorphologyOp, OffsetSampling, PreserveAspectRatio, SpecularLighting, StitchTiles,
-    TransferFunc, Turbulence, TurbulenceType, GAUSSIAN_BLUR_BOX_THRESHOLD,
+    displacement_map, displacement_map_pixels, drop_shadow, drop_shadow_pixels, flood,
+    flood_pixels, gaussian_blur, gaussian_blur_pixels, image_source, image_source_pixels, merge,
+    merge_pixels, morphology, morphology_pixels, offset, offset_pixels, specular_lighting,
+    specular_lighting_pixels, tile, tile_pixels, turbulence_filter, turbulence_filter_pixels,
+    AspectRatioAlign, BlendFilterMode, ColorMatrix, ColorMatrixOp, ComponentTransfer, CompositeOp,
+    ConvolveEdgeMode, ConvolveMatrix, DiffuseLighting, DisplacementChannel, DisplacementSampling,
+    ImageSourceSampling, LightSource, MeetOrSlice, MorphologyOp, OffsetSampling,
+    PreserveAspectRatio, SpecularLighting, StitchTiles, TransferFunc, Turbulence, TurbulenceType,
+    GAUSSIAN_BLUR_BOX_THRESHOLD,
 };
 pub use flatten::{flatten_arc_to_cubics, flatten_path, FlatContour};
 pub use gradient::{
