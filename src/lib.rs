@@ -21,15 +21,14 @@
 //! 5. **Composite** premultiplied-alpha onto the output frame; group
 //!    opacity multiplies the alpha during composite.
 //!
-//! # Workspace policy
+//! # Provenance
 //!
-//! No `lyon` / `tiny-skia` / `resvg` / `kurbo` / `pathfinder` source
-//! material is used here. Algorithms are implemented from first
-//! principles against SVG 1.1 + PDF 1.4 specifications. The closest
-//! prior art in this repository is `oxideav-scribe`'s glyph rasterizer
-//! (which inspired the de Casteljau + active-edge-list implementations
-//! that ship here in generalised form), but every module is a fresh
-//! implementation that does not depend on `oxideav-scribe`.
+//! Algorithms are implemented from first principles against the
+//! SVG 1.1 + PDF 1.4 specifications. The closest prior art in this
+//! repository is `oxideav-scribe`'s glyph rasterizer (whose de Casteljau
+//! + active-edge-list implementations are generalised here), but every
+//! module is a fresh implementation that does not depend on
+//! `oxideav-scribe`.
 //!
 //! # Implemented
 //!
