@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Two-circle radial gradient with a non-zero **focal radius** (`fr`),
+  the SVG 2 §13.2.4 / CSS Images Level 3 §3.3 model. The classical
+  radial gradient treats the focal point as an infinitesimal point
+  (`fr = 0`); the two-circle form interpolates between a *focal circle*
+  (centre `focal`, radius `fr`) at `t = 0` and an *end circle* (centre
+  `center`, radius `radius`) at `t = 1`. Each iso-contour at parameter
+  `t` is the circle `centre = focal + t·(center − focal)`,
+  `radius = fr + t·(radius − fr)`.
+  - New crate-local `FocalRadialGradient` paint type
+    (`oxideav-core`'s `RadialGradient` has no `fr` field) plus
+    `eval_focal_radial_gradient` / `…_in` / `…_lut` evaluators sharing
+    the existing `StopsLut`, spread-method, and interpolation-space
+    machinery.
+  - The parameter `t` is solved from first principles: the pixel lies
+    on the `t`-iso-contour when `|P − C(t)|² = R(t)²`, giving the
+    quadratic `A·t² − 2·B·t + C₀ = 0` with `A = c·c − Δr²`,
+    `B = d·c + fr·Δr`, `C₀ = d·d − fr²` (`c = center − focal`,
+    `d = pixel − focal`, `Δr = radius − fr`). The larger root with a
+    non-negative iso-contour radius is selected (CSS outward-growing
+    rule). With `fr = 0` this reduces exactly to the existing
+    point-focal evaluator.
+  - 8 new tests: fr=0 agreement with the point-focal path, inner/outer
+    circle = first/last stop, midway iso-contour = mid colour, displaced
+    focal-circle rim, LUT-vs-direct parity over a 20×20 grid, Repeat
+    spread wrap, and determinism.
+
 - `<feDropShadow>` shorthand drop-shadow filter primitive (Filter
   Effects Module Level 1 §9.12). The spec defines the primitive purely
   as an equivalent chain, implemented verbatim:

@@ -19,6 +19,7 @@ produces a packed `Rgba` `VideoFrame`.
 | Dash patterns                             | done                 |
 | Linear + radial gradients                 | done                 |
 | Off-centre focal radial                   | done                 |
+| Two-circle radial (`fr` focal radius)     | done (round 297) — SVG 2 §13.2.4 / CSS Images 3 |
 | Pad / Reflect / Repeat spread             | done                 |
 | `color-interpolation: sRGB` (default)     | done                 |
 | `color-interpolation: linearRGB`          | done (round 4)       |

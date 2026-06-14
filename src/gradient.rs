@@ -274,6 +274,186 @@ pub fn eval_radial_gradient_in(
     sample_stops_in(&g.stops, apply_spread(t, g.spread), space)
 }
 
+/// A *two-circle* radial gradient: an extension of [`RadialGradient`]
+/// that gives the focal point its own non-zero radius (`focal_radius`,
+/// the SVG 2 §13.2.4 / CSS Images Level 3 §3.3 `fr` attribute).
+///
+/// The classical [`RadialGradient`] treats the focal point as an
+/// infinitesimal point (`fr = 0`): the `t = 0` iso-contour is a single
+/// point and the `t = 1` iso-contour is the bounding circle. A
+/// two-circle gradient instead interpolates between a **focal circle**
+/// (centre = `focal`, radius = `focal_radius`) at `t = 0` and an **end
+/// circle** (centre = `center`, radius = `radius`) at `t = 1`. Each
+/// iso-contour at parameter `t` is the circle
+///
+/// ```text
+///   centre  C(t) = focal  + t · (center − focal)
+///   radius  R(t) = fr     + t · (radius − fr)
+/// ```
+///
+/// `oxideav-core`'s [`RadialGradient`] carries no `fr` field, so this
+/// crate models the feature locally; callers that decode SVG 2 / CSS
+/// gradients construct it directly. With `focal_radius == 0.0` it
+/// reduces exactly to [`eval_radial_gradient`].
+#[derive(Clone, Debug)]
+pub struct FocalRadialGradient {
+    /// Centre of the end circle (the `t = 1` iso-contour).
+    pub center: Point,
+    /// Radius of the end circle. Must be `> focal_radius` for a
+    /// well-formed gradient (the iso-contours grow outward with `t`).
+    pub radius: f32,
+    /// Centre of the focal circle (the `t = 0` iso-contour).
+    pub focal: Point,
+    /// Radius of the focal circle (`fr`). `0.0` recovers the classical
+    /// point-focal radial gradient.
+    pub focal_radius: f32,
+    /// Colour stops along `t ∈ [0, 1]`.
+    pub stops: Vec<oxideav_core::GradientStop>,
+    /// Behaviour past the `[0, 1]` parameter range.
+    pub spread: SpreadMethod,
+}
+
+impl FocalRadialGradient {
+    /// Build a two-circle gradient with empty stops and `Pad` spread.
+    pub fn new(center: Point, radius: f32, focal: Point, focal_radius: f32) -> Self {
+        Self {
+            center,
+            radius,
+            focal,
+            focal_radius,
+            stops: Vec::new(),
+            spread: SpreadMethod::Pad,
+        }
+    }
+
+    /// Replace the gradient stops.
+    pub fn with_stops(mut self, stops: Vec<oxideav_core::GradientStop>) -> Self {
+        self.stops = stops;
+        self
+    }
+
+    /// Set the spread method.
+    pub fn with_spread(mut self, spread: SpreadMethod) -> Self {
+        self.spread = spread;
+        self
+    }
+}
+
+/// Solve for the gradient parameter `t` of a two-circle radial gradient
+/// at pixel `(px, py)`, or `None` when no usable iso-contour passes
+/// through the pixel.
+///
+/// Derivation (first principles): the pixel `P` lies on the iso-contour
+/// at parameter `t` when `|P − C(t)|² = R(t)²` with
+/// `C(t) = F + t·(C − F)` and `R(t) = fr + t·(r − fr)`. Writing
+/// `c = C − F`, `d = P − F`, `Δr = r − fr` and expanding gives the
+/// quadratic
+///
+/// ```text
+///   A·t² − 2·B·t + C₀ = 0
+///   A  = c·c − Δr²
+///   B  = d·c + fr·Δr
+///   C₀ = d·d − fr²
+/// ```
+///
+/// We take the **largest** root whose iso-contour radius `R(t)` is
+/// non-negative — the CSS Images 3 rule that resolves the two-solution
+/// ambiguity in favour of the outward-growing circle. With `fr = 0`
+/// (`A = c·c − r²`, `B = d·c`, `C₀ = d·d`) the larger root is exactly
+/// the `(B − √Δ)/A` branch already used by [`eval_radial_gradient_in`]
+/// (`A ≤ 0` for a focal inside the circle flips the sign of the
+/// preferred root), so the point-focal path is unchanged.
+fn focal_radial_t(g: &FocalRadialGradient, px: f32, py: f32) -> Option<f32> {
+    let cdx = g.center.x - g.focal.x;
+    let cdy = g.center.y - g.focal.y;
+    let dr = g.radius - g.focal_radius;
+    let dx = px - g.focal.x;
+    let dy = py - g.focal.y;
+    let aa = cdx * cdx + cdy * cdy - dr * dr;
+    let bb = dx * cdx + dy * cdy + g.focal_radius * dr;
+    let c0 = dx * dx + dy * dy - g.focal_radius * g.focal_radius;
+
+    // Keep a candidate root only when its iso-contour has a
+    // non-negative radius R(t) = fr + t·Δr.
+    let radius_ok = |t: f32| g.focal_radius + t * dr >= -1e-6;
+
+    if aa.abs() < 1e-12 {
+        // Quadratic degenerates to linear: −2·B·t + C₀ = 0.
+        if bb.abs() < 1e-12 {
+            return None;
+        }
+        let t = c0 / (2.0 * bb);
+        return if radius_ok(t) { Some(t) } else { None };
+    }
+
+    let disc = bb * bb - aa * c0;
+    if disc < 0.0 {
+        return None;
+    }
+    let s = disc.sqrt();
+    let t1 = (bb + s) / aa;
+    let t2 = (bb - s) / aa;
+    // Largest root with a non-negative iso-contour radius.
+    let (hi, lo) = if t1 >= t2 { (t1, t2) } else { (t2, t1) };
+    if radius_ok(hi) {
+        Some(hi)
+    } else if radius_ok(lo) {
+        Some(lo)
+    } else {
+        None
+    }
+}
+
+/// Sample a two-circle radial gradient at pixel `(px, py)` in the sRGB
+/// interpolation space. See [`FocalRadialGradient`] for the geometry and
+/// [`focal_radial_t`] for the parameter solve. Pixels with no usable
+/// iso-contour return the gradient's transparent default (or, under a
+/// non-`Pad` spread, fall back to the nearest meaningful parameter).
+pub fn eval_focal_radial_gradient(g: &FocalRadialGradient, px: f32, py: f32) -> Rgba {
+    eval_focal_radial_gradient_in(g, px, py, InterpolationSpace::Srgb)
+}
+
+/// Sample a two-circle radial gradient at pixel `(px, py)` in the
+/// requested interpolation space.
+pub fn eval_focal_radial_gradient_in(
+    g: &FocalRadialGradient,
+    px: f32,
+    py: f32,
+    space: InterpolationSpace,
+) -> Rgba {
+    if g.stops.is_empty() {
+        return Rgba::new(0, 0, 0, 0);
+    }
+    if g.stops.len() == 1 || g.radius <= 1e-12 {
+        return g.stops[0].color;
+    }
+    match focal_radial_t(g, px, py) {
+        Some(t) => sample_stops_in(&g.stops, apply_spread(t, g.spread), space),
+        None => Rgba::new(0, 0, 0, 0),
+    }
+}
+
+/// Evaluate a two-circle radial gradient using a pre-built stops LUT.
+/// Geometry is identical to [`eval_focal_radial_gradient_in`]; the
+/// per-pixel stops scan is replaced by [`StopsLut::sample`].
+pub fn eval_focal_radial_gradient_lut(
+    g: &FocalRadialGradient,
+    px: f32,
+    py: f32,
+    lut: &StopsLut,
+) -> Rgba {
+    if g.stops.is_empty() {
+        return Rgba::new(0, 0, 0, 0);
+    }
+    if g.stops.len() == 1 || g.radius <= 1e-12 {
+        return g.stops[0].color;
+    }
+    match focal_radial_t(g, px, py) {
+        Some(t) => lut.sample(apply_spread(t, g.spread)),
+        None => Rgba::new(0, 0, 0, 0),
+    }
+}
+
 /// Pull `focal` strictly inside the bounding circle when it lies on
 /// or outside the boundary. SVG normalises this so the gradient
 /// equation always has a real positive root for points inside the
@@ -495,6 +675,145 @@ mod tests {
         let c = eval_radial_gradient(&g, 5.0, 5.0);
         assert_eq!(c.r, 255);
         assert_eq!(c.b, 0);
+    }
+
+    fn red_to_blue_stops() -> Vec<GradientStop> {
+        vec![
+            GradientStop::new(0.0, Rgba::opaque(255, 0, 0)),
+            GradientStop::new(1.0, Rgba::opaque(0, 0, 255)),
+        ]
+    }
+
+    #[test]
+    fn focal_radius_zero_matches_point_focal() {
+        // A two-circle gradient with fr=0 and focal==center must agree
+        // with the classical point-focal radial gradient everywhere.
+        let center = Point::new(20.0, 20.0);
+        let radius = 15.0;
+        let stops = red_to_blue_stops();
+        let pf = RadialGradient {
+            center,
+            radius,
+            focal: None,
+            stops: stops.clone(),
+            spread: SpreadMethod::Pad,
+        };
+        let two = FocalRadialGradient::new(center, radius, center, 0.0).with_stops(stops);
+        for &(x, y) in &[
+            (20.0, 20.0),
+            (20.0, 27.5),
+            (20.0, 35.0),
+            (12.0, 16.0),
+            (33.0, 20.0),
+            (5.0, 5.0),
+        ] {
+            let a = eval_radial_gradient(&pf, x, y);
+            let b = eval_focal_radial_gradient(&two, x, y);
+            assert!(
+                (a.r as i32 - b.r as i32).abs() <= 1
+                    && (a.g as i32 - b.g as i32).abs() <= 1
+                    && (a.b as i32 - b.b as i32).abs() <= 1,
+                "mismatch at ({x},{y}): point={a:?} two-circle={b:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn focal_radius_inner_circle_is_first_stop() {
+        // Any pixel on or inside the focal circle (t = 0) is the first
+        // stop colour; on the end circle (t = 1) it is the last.
+        let center = Point::new(0.0, 0.0);
+        let g = FocalRadialGradient::new(center, 10.0, center, 4.0).with_stops(red_to_blue_stops());
+        // Focal-circle boundary: distance 4 from centre → t = 0 → red.
+        let on_inner = eval_focal_radial_gradient(&g, 4.0, 0.0);
+        assert_eq!(on_inner.r, 255);
+        assert_eq!(on_inner.b, 0);
+        // End-circle boundary: distance 10 → t = 1 → blue.
+        let on_outer = eval_focal_radial_gradient(&g, 10.0, 0.0);
+        assert_eq!(on_outer.b, 255);
+        assert_eq!(on_outer.r, 0);
+    }
+
+    #[test]
+    fn focal_radius_midway_circle_is_mid_color() {
+        // Halfway between fr=2 and r=10 the iso-contour radius is 6;
+        // a pixel there sits at t = 0.5 → mid red↔blue.
+        let center = Point::new(0.0, 0.0);
+        let g = FocalRadialGradient::new(center, 10.0, center, 2.0).with_stops(red_to_blue_stops());
+        let mid = eval_focal_radial_gradient(&g, 6.0, 0.0);
+        assert!((mid.r as i32 - 128).abs() <= 3, "r={}", mid.r);
+        assert!((mid.b as i32 - 128).abs() <= 3, "b={}", mid.b);
+    }
+
+    #[test]
+    fn focal_radius_offset_focal_circle_is_first_stop_on_its_rim() {
+        // Concentric circles are the easy case; verify a displaced focal
+        // circle too. Focal circle centre (3,0) radius 2 → its rightmost
+        // rim point (5,0) is t = 0 (first stop).
+        let g = FocalRadialGradient::new(Point::new(0.0, 0.0), 10.0, Point::new(3.0, 0.0), 2.0)
+            .with_stops(red_to_blue_stops());
+        let on_rim = eval_focal_radial_gradient(&g, 5.0, 0.0);
+        assert_eq!(on_rim.r, 255);
+        assert_eq!(on_rim.b, 0);
+        // And the leftmost rim point (1,0) is also on the focal circle.
+        let on_rim2 = eval_focal_radial_gradient(&g, 1.0, 0.0);
+        assert_eq!(on_rim2.r, 255);
+        assert_eq!(on_rim2.b, 0);
+    }
+
+    #[test]
+    fn focal_radius_lut_matches_direct() {
+        let center = Point::new(8.0, 8.0);
+        let g = FocalRadialGradient::new(center, 12.0, Point::new(6.0, 7.0), 3.0).with_stops(vec![
+            GradientStop::new(0.0, Rgba::opaque(255, 0, 0)),
+            GradientStop::new(0.5, Rgba::opaque(0, 255, 0)),
+            GradientStop::new(1.0, Rgba::opaque(0, 0, 255)),
+        ]);
+        let lut = StopsLut::build(&g.stops, InterpolationSpace::Srgb);
+        for y in 0..20 {
+            for x in 0..20 {
+                let (px, py) = (x as f32, y as f32);
+                let direct = eval_focal_radial_gradient(&g, px, py);
+                let via_lut = eval_focal_radial_gradient_lut(&g, px, py, &lut);
+                assert!(
+                    (direct.r as i32 - via_lut.r as i32).abs() <= 1
+                        && (direct.g as i32 - via_lut.g as i32).abs() <= 1
+                        && (direct.b as i32 - via_lut.b as i32).abs() <= 1
+                        && (direct.a as i32 - via_lut.a as i32).abs() <= 1,
+                    "LUT vs direct mismatch at ({px},{py}): {direct:?} vs {via_lut:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn focal_radius_repeat_wraps_outside_end_circle() {
+        // Past the end circle under Repeat the parameter wraps; at a
+        // distance giving t = 1.5 the colour mirrors a t = 0.5 sample
+        // is NOT expected (repeat, not reflect) — instead t→0.5.
+        let center = Point::new(0.0, 0.0);
+        let g = FocalRadialGradient::new(center, 10.0, center, 0.0)
+            .with_stops(red_to_blue_stops())
+            .with_spread(SpreadMethod::Repeat);
+        // Distance 15 with fr=0 → t = 15/10 = 1.5 → repeat → 0.5 → mid.
+        let c = eval_focal_radial_gradient(&g, 15.0, 0.0);
+        assert!((c.r as i32 - 128).abs() <= 3, "r={}", c.r);
+    }
+
+    #[test]
+    fn focal_radius_deterministic() {
+        // Same inputs → byte-identical outputs across repeated calls.
+        let g = FocalRadialGradient::new(Point::new(4.0, 4.0), 9.0, Point::new(5.0, 3.0), 2.5)
+            .with_stops(red_to_blue_stops());
+        let first: Vec<Rgba> = (0..15)
+            .flat_map(|y| (0..15).map(move |x| (x as f32, y as f32)))
+            .map(|(x, y)| eval_focal_radial_gradient(&g, x, y))
+            .collect();
+        let second: Vec<Rgba> = (0..15)
+            .flat_map(|y| (0..15).map(move |x| (x as f32, y as f32)))
+            .map(|(x, y)| eval_focal_radial_gradient(&g, x, y))
+            .collect();
+        assert_eq!(first, second);
     }
 
     #[test]

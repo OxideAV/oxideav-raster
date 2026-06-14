@@ -233,8 +233,10 @@ pub use filter::{
 };
 pub use flatten::{flatten_arc_to_cubics, flatten_path, FlatContour};
 pub use gradient::{
+    eval_focal_radial_gradient, eval_focal_radial_gradient_in, eval_focal_radial_gradient_lut,
     eval_linear_gradient, eval_linear_gradient_in, eval_linear_gradient_lut, eval_radial_gradient,
-    eval_radial_gradient_in, eval_radial_gradient_lut, InterpolationSpace, StopsLut,
+    eval_radial_gradient_in, eval_radial_gradient_lut, FocalRadialGradient, InterpolationSpace,
+    StopsLut,
 };
 pub use paint::{sample_paint, sample_paint_in};
 pub use pattern::{view_box_fit_transform, Pattern};
