@@ -83,7 +83,21 @@ struct DashSegment {
 }
 
 /// Walk `points` along their length, splitting into "on" sub-polylines
-/// according to `dash`. The output sub-polylines are always open.
+/// according to `dash`.
+///
+/// For an open contour every output sub-polyline is open and each gets
+/// its own caps.
+///
+/// For a **closed** contour the pattern wraps continuously around the
+/// loop: SVG 1.1 §11.4 / SVG 2 §13.5.6 require the stroke (and therefore
+/// the dash pattern) to start at the path's first point and progress
+/// along one continuous outline. When the dash pattern is in its "on"
+/// phase as it crosses the start/end seam, the trailing dash and the
+/// leading dash are the *same* dash and must be rendered as one
+/// continuous, *joined* piece — not two separately *capped* pieces.
+/// This function detects that case and splices the leading and trailing
+/// sub-polylines into a single segment that passes through the seam
+/// vertex (so the caller's join logic, not a cap, is applied there).
 fn apply_dash(points: &[(f32, f32)], closed: bool, dash: &DashPattern) -> Vec<DashSegment> {
     if dash.array.is_empty() || dash.array.iter().all(|&v| v <= 0.0) {
         return vec![DashSegment {
@@ -129,6 +143,9 @@ fn apply_dash(points: &[(f32, f32)], closed: bool, dash: &DashPattern) -> Vec<Da
 
     let mut out: Vec<DashSegment> = Vec::new();
     let mut cur: Vec<(f32, f32)> = Vec::new();
+    // Whether the pattern is "on" exactly at the seam (path position 0).
+    // If so the first emitted sub-polyline begins at the seam vertex.
+    let started_on = on;
     if on {
         cur.push(walk[0]);
     }
@@ -196,11 +213,47 @@ fn apply_dash(points: &[(f32, f32)], closed: bool, dash: &DashPattern) -> Vec<Da
             }
         }
     }
-    if on && cur.len() >= 2 {
+    // `ended_on` records that the walk finished mid-dash at the seam:
+    // the still-open `cur` reaches the loop's final point (== the start
+    // vertex for a closed contour).
+    let ended_on = on && cur.len() >= 2;
+    if ended_on {
         out.push(DashSegment {
             points: cur,
             closed: false,
         });
+    } else if !cur.is_empty() {
+        // Drop a dangling single-point run.
+        cur.clear();
+    }
+
+    // Closed-contour seam splice: when the dash pattern is "on" across
+    // the start/end seam, the trailing dash (last segment, ending at the
+    // seam vertex) and the leading dash (first segment, starting at the
+    // seam vertex) are one continuous dash. Merge them so the seam
+    // vertex carries a join instead of two abutting caps.
+    if closed && started_on && ended_on {
+        if out.len() >= 2 {
+            let tail = out.pop().expect("ended_on implies a trailing segment");
+            // `tail` ends at the seam vertex; `out[0]` starts at the same
+            // seam vertex. Concatenate, dropping the duplicated seam point.
+            let head = &mut out[0].points;
+            let mut merged = tail.points;
+            // The shared seam vertex is `merged.last()` == `head[0]`; skip
+            // the duplicate when appending the head's interior + tail points.
+            merged.extend_from_slice(&head[1..]);
+            out[0].points = merged;
+        } else if out.len() == 1 {
+            // A single "on" run spans the whole loop (e.g. a zero-length
+            // gap): it is effectively an undashed closed contour. Drop
+            // the duplicated seam point and mark it closed so both offset
+            // loops are emitted with joins all round.
+            let seg = &mut out[0];
+            if seg.points.len() >= 2 && seg.points.first() == seg.points.last() {
+                seg.points.pop();
+            }
+            seg.closed = true;
+        }
     }
     out
 }
@@ -542,6 +595,139 @@ mod tests {
         });
         let geom = stroke_to_fill_path(&c, &s, 1.0);
         assert_eq!(geom.len(), 5, "expected 5 dashes, got {}", geom.len());
+    }
+
+    /// Count the "on" sub-polylines produced by the dash walker for a
+    /// given contour + dash, before any caps/joins are applied.
+    fn dash_segment_count(c: &FlatContour, dash: &DashPattern) -> usize {
+        apply_dash(&c.points, c.closed, dash).len()
+    }
+
+    #[test]
+    fn closed_dash_on_at_seam_does_not_split_into_two() {
+        // 10×10 closed square, perimeter 40, dasharray [10,10], offset 5.
+        // The walk: on 0..5, off 5..15, on 15..25, off 25..35,
+        // on 35..40 then wrapping to 0..5. The trailing on-run (35..40)
+        // and the leading on-run (0..5) are the SAME dash across the
+        // seam and must be merged into a single segment.
+        let c = FlatContour {
+            points: vec![(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)],
+            closed: true,
+        };
+        let dash = DashPattern {
+            array: vec![10.0, 10.0],
+            offset: 5.0,
+        };
+        // Naively this would be 3 runs (0..5, 15..25, 35..40); after the
+        // seam splice the 0..5 and 35..40 runs merge → 2 runs.
+        let segs = apply_dash(&c.points, c.closed, &dash);
+        assert_eq!(
+            segs.len(),
+            2,
+            "seam-crossing dash must merge: got {} segments",
+            segs.len()
+        );
+        // Some merged segment must pass *through* the seam vertex (0,0):
+        // it contains (0,0) as an interior point, not an endpoint, so the
+        // caller applies a join there rather than two caps.
+        let seam = (0.0_f32, 0.0_f32);
+        let interior_seam = segs.iter().any(|s| {
+            s.points.len() >= 3
+                && s.points[1..s.points.len() - 1]
+                    .iter()
+                    .any(|&p| (p.0 - seam.0).abs() < 1e-4 && (p.1 - seam.1).abs() < 1e-4)
+        });
+        assert!(
+            interior_seam,
+            "seam vertex must be interior (joined), not a capped endpoint"
+        );
+    }
+
+    /// True if any sub-polyline carries the seam vertex `(0,0)` as an
+    /// interior point (i.e. a join, not a cap, lands there).
+    fn seam_is_joined(segs: &[DashSegment]) -> bool {
+        let seam = (0.0_f32, 0.0_f32);
+        segs.iter().any(|s| {
+            s.closed
+                || (s.points.len() >= 3
+                    && s.points[1..s.points.len() - 1]
+                        .iter()
+                        .any(|&p| (p.0 - seam.0).abs() < 1e-4 && (p.1 - seam.1).abs() < 1e-4))
+        })
+    }
+
+    #[test]
+    fn closed_dash_off_at_seam_is_unaffected() {
+        // Same square, offset 0: on 0..10, off 10..20, on 20..30,
+        // off 30..40. The seam (pos 0 / pos 40) sits between an off-run
+        // ending at 40 and an on-run starting at 0 — NO merge expected.
+        let c = FlatContour {
+            points: vec![(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)],
+            closed: true,
+        };
+        let dash = DashPattern {
+            array: vec![10.0, 10.0],
+            offset: 0.0,
+        };
+        assert_eq!(dash_segment_count(&c, &dash), 2);
+    }
+
+    #[test]
+    fn closed_dash_seam_joined_open_dash_capped() {
+        // Same geometry + dash. For the CLOSED contour the seam dash is
+        // joined (seam vertex is interior); for the OPEN contour the
+        // seam vertex is necessarily a capped endpoint.
+        let pts = vec![(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)];
+        let dash = DashPattern {
+            array: vec![10.0, 10.0],
+            offset: 5.0,
+        };
+        let open = apply_dash(&pts, false, &dash);
+        let closed = apply_dash(&pts, true, &dash);
+        assert!(
+            seam_is_joined(&closed),
+            "closed seam dash must be joined through the start vertex"
+        );
+        assert!(
+            !seam_is_joined(&open),
+            "open contour has no seam to join across"
+        );
+    }
+
+    #[test]
+    fn closed_dash_run_longer_than_perimeter_is_closed_loop() {
+        // A single dash longer than the whole perimeter (40) with a gap:
+        // the "on" run spans the entire loop and re-enters the seam, so
+        // it must be reported as one CLOSED segment (both offset loops,
+        // joins all round — no caps).
+        let c = FlatContour {
+            points: vec![(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)],
+            closed: true,
+        };
+        let dash = DashPattern {
+            array: vec![100.0, 10.0],
+            offset: 0.0,
+        };
+        let segs = apply_dash(&c.points, c.closed, &dash);
+        assert_eq!(segs.len(), 1, "a perimeter-spanning dash is one run");
+        assert!(
+            segs[0].closed,
+            "a full-loop dash run must be marked closed, not open-capped"
+        );
+    }
+
+    #[test]
+    fn open_dash_pattern_still_splits_unchanged() {
+        // Regression guard: the original open-contour behaviour is intact.
+        let c = FlatContour {
+            points: vec![(0.0, 5.0), (20.0, 5.0)],
+            closed: false,
+        };
+        let dash = DashPattern {
+            array: vec![2.0, 2.0],
+            offset: 0.0,
+        };
+        assert_eq!(dash_segment_count(&c, &dash), 5);
     }
 
     #[test]

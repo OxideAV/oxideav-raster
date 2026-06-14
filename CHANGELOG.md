@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Dashed closed subpaths now join across the start/end seam.** SVG 1.1
+  §11.4 / SVG 2 §13.5.6 require the stroke (and its dash pattern) to
+  start at the path's first point and progress along one continuous
+  outline. When the dash pattern was in its "on" phase as it crossed the
+  closing seam, the dasher previously emitted the trailing dash and the
+  leading dash as two separate *capped* sub-polylines, producing two
+  abutting line-caps and a visible notch at the start vertex instead of
+  one continuous, *joined* dash. The dash walker now detects the
+  seam-crossing case and splices the trailing and leading runs into a
+  single sub-polyline that passes *through* the seam vertex, so the
+  configured line-join (not a cap) is applied there. A dash run that
+  spans the entire perimeter is recognised and emitted as a closed
+  contour (both offset loops, joins all round). Open contours are
+  unaffected. 5 new tests.
+
 ### Added
 
 - Two-circle radial gradient with a non-zero **focal radius** (`fr`),

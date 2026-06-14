@@ -16,7 +16,7 @@ produces a packed `Rgba` `VideoFrame`.
 | Scanline AA fill (even-odd / NZ)          | done                 |
 | Configurable supersampling 1/2/4/8×       | done                 |
 | Stroke geometry (caps + joins)            | done                 |
-| Dash patterns                             | done                 |
+| Dash patterns                             | done — closed-subpath seam dash joins continuously (SVG 1.1 §11.4 / SVG 2 §13.5.6) |
 | Linear + radial gradients                 | done                 |
 | Off-centre focal radial                   | done                 |
 | Two-circle radial (`fr` focal radius)     | done (round 297) — SVG 2 §13.2.4 / CSS Images 3 |
