@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`<feGaussianBlur>` `edgeMode` attribute** (Filter Effects Module
+  Level 1 §9.14). The spec adds an `edgeMode` to the Gaussian-blur
+  primitive — the same `duplicate | wrap | none` choice the
+  convolution primitive already exposes — that "determines how to
+  extend the input image […] when the kernel is positioned at or near
+  the edge of the input image":
+  - `duplicate` — extend each border by duplicating its edge color
+    values (clamp-to-edge); this was the only prior behaviour.
+  - `wrap` — extend by taking color values from the opposite edge
+    (toroidal blur).
+  - `none` — extend with pixel values of zero for R, G, B and A. This
+    is the spec's **initial value**, so an unattributed
+    `feGaussianBlur` darkens toward transparent black at the image
+    border.
+  - New `gaussian_blur_edge(src, w, h, std_x, std_y, edge)` public
+    entry takes the `ConvolveEdgeMode`; the existing
+    `gaussian_blur(...)` is now a thin shim that passes `Duplicate`,
+    so every existing caller is byte-for-byte unchanged. The chosen
+    mode applies uniformly to both separable passes and to both the
+    direct-kernel (`s < 2.0`) and three-box-blur (`s ≥ 2.0`) code
+    paths. The box path keeps its O(W·H) rolling sum under
+    `duplicate` and falls back to a fixed-width windowed sum under
+    `wrap` / `none` (where the rolling subtract/add is ill-defined),
+    with the divisor held at the full window width so a `none` border
+    pixel averages the in-range samples against the implicit zero
+    border. 7 new tests (shim≡duplicate parity, none-border darkening
+    across both paths, wrap uniform-preservation, wrap seam-bleed vs.
+    none, determinism, and a `resolve_line_index` truth table).
+
 ### Fixed
 
 - **Dashed closed subpaths now join across the start/end seam.** SVG 1.1

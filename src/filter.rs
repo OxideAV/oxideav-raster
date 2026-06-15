@@ -1481,7 +1481,52 @@ pub const GAUSSIAN_BLUR_BOX_THRESHOLD: f32 = 2.0;
 ///
 /// A new packed-RGBA `Vec<u8>` of the same dimensions. With
 /// `std_x == 0.0` and `std_y == 0.0` the input is returned unchanged.
+///
+/// Boundary handling is **clamp-to-edge** ([`ConvolveEdgeMode::Duplicate`]).
+/// This is the historical behaviour; for the Filter Effects Module
+/// Level 1 `edgeMode` attribute (initial value `none`, plus `wrap`),
+/// call [`gaussian_blur_edge`] with the desired mode.
 pub fn gaussian_blur(src: &[u8], width: u32, height: u32, std_x: f32, std_y: f32) -> Vec<u8> {
+    gaussian_blur_edge(
+        src,
+        width,
+        height,
+        std_x,
+        std_y,
+        ConvolveEdgeMode::Duplicate,
+    )
+}
+
+/// `<feGaussianBlur>` with an explicit `edgeMode` (Filter Effects Module
+/// Level 1 §9.14).
+///
+/// Identical to [`gaussian_blur`] except the caller chooses how the
+/// blur kernel reads samples that fall outside the image when it is
+/// positioned at or near an edge:
+///
+/// * [`ConvolveEdgeMode::Duplicate`] — extend each border by
+///   duplicating its edge color values (clamp-to-edge).
+/// * [`ConvolveEdgeMode::Wrap`] — extend by taking the color values
+///   from the opposite edge of the image.
+/// * [`ConvolveEdgeMode::None`] — extend with pixel values of zero for
+///   R, G, B and A. This is the spec's **initial value** for
+///   `edgeMode`, so a renderer flattening `<feGaussianBlur>` with no
+///   `edgeMode` attribute should pass this variant; the bordering rows
+///   /columns then darken toward transparent black, matching the
+///   reference rendering of an unattributed `feGaussianBlur`.
+///
+/// The same `edgeMode` is applied to both the X and Y separable passes
+/// and to both the direct-kernel (`s < 2.0`) and three-box-blur
+/// (`s ≥ 2.0`) code paths, so the choice is consistent across all
+/// `stdDeviation` magnitudes.
+pub fn gaussian_blur_edge(
+    src: &[u8],
+    width: u32,
+    height: u32,
+    std_x: f32,
+    std_y: f32,
+    edge: ConvolveEdgeMode,
+) -> Vec<u8> {
     let w = width as usize;
     let h = height as usize;
     let expected = w
@@ -1516,17 +1561,17 @@ pub fn gaussian_blur(src: &[u8], width: u32, height: u32, std_x: f32, std_y: f32
     if std_x > 0.0 {
         if std_x < GAUSSIAN_BLUR_BOX_THRESHOLD {
             let kernel = build_gaussian_kernel(std_x);
-            gaussian_separable_pass(&mut buf, w, h, &kernel, Axis::X);
+            gaussian_separable_pass(&mut buf, w, h, &kernel, Axis::X, edge);
         } else {
-            box_blur_three_pass(&mut buf, w, h, box_sizes_for_std(std_x), Axis::X);
+            box_blur_three_pass(&mut buf, w, h, box_sizes_for_std(std_x), Axis::X, edge);
         }
     }
     if std_y > 0.0 {
         if std_y < GAUSSIAN_BLUR_BOX_THRESHOLD {
             let kernel = build_gaussian_kernel(std_y);
-            gaussian_separable_pass(&mut buf, w, h, &kernel, Axis::Y);
+            gaussian_separable_pass(&mut buf, w, h, &kernel, Axis::Y, edge);
         } else {
-            box_blur_three_pass(&mut buf, w, h, box_sizes_for_std(std_y), Axis::Y);
+            box_blur_three_pass(&mut buf, w, h, box_sizes_for_std(std_y), Axis::Y, edge);
         }
     }
     buf
@@ -1598,7 +1643,14 @@ fn build_gaussian_kernel(std: f32) -> Vec<f32> {
 /// in-place on a packed-RGBA byte buffer. Channels are processed
 /// independently; the accumulator is `f32` per-channel; boundary
 /// samples reuse the nearest edge pixel (clamp-to-edge).
-fn gaussian_separable_pass(buf: &mut [u8], w: usize, h: usize, kernel: &[f32], axis: Axis) {
+fn gaussian_separable_pass(
+    buf: &mut [u8],
+    w: usize,
+    h: usize,
+    kernel: &[f32],
+    axis: Axis,
+    edge: ConvolveEdgeMode,
+) {
     debug_assert_eq!(buf.len(), w * h * 4);
     let half = (kernel.len() - 1) / 2;
     let (stride, primary, secondary) = match axis {
@@ -1607,7 +1659,6 @@ fn gaussian_separable_pass(buf: &mut [u8], w: usize, h: usize, kernel: &[f32], a
     };
     let mut line_in = vec![0u8; primary * 4];
     let mut line_out = vec![0u8; primary * 4];
-    let imax = primary as isize - 1;
     for s in 0..secondary {
         // Gather one "line" (row for X-pass, column for Y-pass) into a
         // contiguous scratch buffer so the inner loop is sequential.
@@ -1623,7 +1674,13 @@ fn gaussian_separable_pass(buf: &mut [u8], w: usize, h: usize, kernel: &[f32], a
         for i in 0..primary {
             let mut acc = [0f32; 4];
             for (k_idx, w_coef) in kernel.iter().enumerate() {
-                let pi = (i as isize + k_idx as isize - half as isize).clamp(0, imax) as usize;
+                let logical = i as isize + k_idx as isize - half as isize;
+                // §9.14 edgeMode: out-of-line samples are duplicated /
+                // wrapped / zeroed. `None` contributes nothing to the
+                // accumulator.
+                let Some(pi) = resolve_line_index(logical, primary, edge) else {
+                    continue;
+                };
                 let p = &line_in[pi * 4..pi * 4 + 4];
                 acc[0] += p[0] as f32 * w_coef;
                 acc[1] += p[1] as f32 * w_coef;
@@ -1654,6 +1711,45 @@ fn quantise_u8(v: f32) -> u8 {
     }
     let clamped = v.clamp(0.0, 255.0);
     (clamped + 0.5) as u8
+}
+
+/// Resolve a (possibly out-of-range) 1-D line index under the requested
+/// edge mode for the separable Gaussian / box-blur passes.
+///
+/// Filter Effects Module Level 1 §9.14 adds the `edgeMode` attribute to
+/// `<feGaussianBlur>` with the same three values the convolution
+/// primitive uses, "Determines how to extend the input image […] so
+/// that the matrix operations can be applied when the kernel is
+/// positioned at or near the edge of the input image":
+///
+/// * [`ConvolveEdgeMode::Duplicate`] — "the input image is extended
+///   along each of its borders […] by duplicating the color values at
+///   the given edge" → the index is clamped to `[0, len)`.
+/// * [`ConvolveEdgeMode::Wrap`] — "the input image is extended by
+///   taking the color values from the opposite edge" → the index is
+///   reduced modulo `len` (Euclidean remainder so negatives wrap).
+/// * [`ConvolveEdgeMode::None`] (the spec's initial value) — "the
+///   input image is extended with pixel values of zero for R, G, B and
+///   A" → an out-of-range index returns `None`, contributing nothing
+///   to the running sum / weighted accumulator.
+///
+/// `len` is the number of samples along the pass axis and is assumed
+/// `>= 1` (callers early-return on empty images).
+#[inline]
+fn resolve_line_index(idx: isize, len: usize, edge: ConvolveEdgeMode) -> Option<usize> {
+    debug_assert!(len >= 1);
+    let imax = len as isize - 1;
+    match edge {
+        ConvolveEdgeMode::Duplicate => Some(idx.clamp(0, imax) as usize),
+        ConvolveEdgeMode::Wrap => Some(idx.rem_euclid(len as isize) as usize),
+        ConvolveEdgeMode::None => {
+            if idx < 0 || idx > imax {
+                None
+            } else {
+                Some(idx as usize)
+            }
+        }
+    }
 }
 
 /// Compute the three box-blur sizes for the §15.17 approximation.
@@ -1711,16 +1807,34 @@ enum BoxKind {
 
 /// Apply the three box-blur passes that approximate one Gaussian pass,
 /// in-place along the requested axis.
-fn box_blur_three_pass(buf: &mut [u8], w: usize, h: usize, kinds: [BoxKind; 3], axis: Axis) {
+fn box_blur_three_pass(
+    buf: &mut [u8],
+    w: usize,
+    h: usize,
+    kinds: [BoxKind; 3],
+    axis: Axis,
+    edge: ConvolveEdgeMode,
+) {
     for k in kinds {
-        box_blur_pass(buf, w, h, k, axis);
+        box_blur_pass(buf, w, h, k, axis, edge);
     }
 }
 
 /// Run one box-blur pass along `axis` on the packed-RGBA buffer using
-/// a rolling-sum O(W·H) per pass (per channel). Boundary handling is
-/// clamp-to-edge.
-fn box_blur_pass(buf: &mut [u8], w: usize, h: usize, kind: BoxKind, axis: Axis) {
+/// a rolling-sum O(W·H) per pass (per channel). Boundary handling
+/// follows `edge` ([`ConvolveEdgeMode`]): out-of-line samples are the
+/// duplicated edge pixel, the opposite-edge pixel (wrap), or zero
+/// (none). The window width stays a fixed `n` samples in every mode, so
+/// the divisor is always `n` and `none`-mode edge windows average the
+/// in-range pixels against the implicit zero border.
+fn box_blur_pass(
+    buf: &mut [u8],
+    w: usize,
+    h: usize,
+    kind: BoxKind,
+    axis: Axis,
+    edge: ConvolveEdgeMode,
+) {
     debug_assert_eq!(buf.len(), w * h * 4);
     let (n, lo_off, hi_off) = match kind {
         BoxKind::Centered(n) => {
@@ -1759,40 +1873,71 @@ fn box_blur_pass(buf: &mut [u8], w: usize, h: usize, kind: BoxKind, axis: Axis) 
             line_in[i * 4..i * 4 + 4].copy_from_slice(&buf[off..off + 4]);
         }
 
-        // Rolling sum: prime the accumulator with the window at i=0,
-        // then for each subsequent i add the new right edge and
-        // subtract the old left edge. Edge handling uses clamp-to-edge
-        // (samples outside [0, primary) reuse index 0 / imax).
-        let mut acc = [0u32; 4];
-        for k_off in lo_off..=hi_off {
-            let pi = k_off.clamp(0, imax) as usize;
-            let p = &line_in[pi * 4..pi * 4 + 4];
-            acc[0] += p[0] as u32;
-            acc[1] += p[1] as u32;
-            acc[2] += p[2] as u32;
-            acc[3] += p[3] as u32;
-        }
+        match edge {
+            ConvolveEdgeMode::Duplicate => {
+                // Rolling sum: prime the accumulator with the window at
+                // i=0, then for each subsequent i add the new right edge
+                // and subtract the old left edge. Clamp-to-edge means
+                // out-of-line indices reuse 0 / imax, so the window
+                // always holds exactly `n` (possibly duplicated)
+                // samples. Byte-identical to the prior behaviour.
+                let mut acc = [0u32; 4];
+                for k_off in lo_off..=hi_off {
+                    let pi = k_off.clamp(0, imax) as usize;
+                    let p = &line_in[pi * 4..pi * 4 + 4];
+                    acc[0] += p[0] as u32;
+                    acc[1] += p[1] as u32;
+                    acc[2] += p[2] as u32;
+                    acc[3] += p[3] as u32;
+                }
 
-        for i in 0..primary {
-            // Write current sample.
-            let off = i * 4;
-            line_out[off] = (acc[0] as f32 * inv_n + 0.5) as u8;
-            line_out[off + 1] = (acc[1] as f32 * inv_n + 0.5) as u8;
-            line_out[off + 2] = (acc[2] as f32 * inv_n + 0.5) as u8;
-            line_out[off + 3] = (acc[3] as f32 * inv_n + 0.5) as u8;
+                for i in 0..primary {
+                    let off = i * 4;
+                    line_out[off] = (acc[0] as f32 * inv_n + 0.5) as u8;
+                    line_out[off + 1] = (acc[1] as f32 * inv_n + 0.5) as u8;
+                    line_out[off + 2] = (acc[2] as f32 * inv_n + 0.5) as u8;
+                    line_out[off + 3] = (acc[3] as f32 * inv_n + 0.5) as u8;
 
-            // Advance: incoming sample at i + 1 + hi_off, outgoing at
-            // i + lo_off.
-            if i + 1 < primary {
-                let next_i = (i + 1) as isize;
-                let in_idx = (next_i + hi_off).clamp(0, imax) as usize;
-                let out_idx = (next_i + lo_off - 1).clamp(0, imax) as usize;
-                let p_in = &line_in[in_idx * 4..in_idx * 4 + 4];
-                let p_out = &line_in[out_idx * 4..out_idx * 4 + 4];
-                acc[0] = acc[0] + p_in[0] as u32 - p_out[0] as u32;
-                acc[1] = acc[1] + p_in[1] as u32 - p_out[1] as u32;
-                acc[2] = acc[2] + p_in[2] as u32 - p_out[2] as u32;
-                acc[3] = acc[3] + p_in[3] as u32 - p_out[3] as u32;
+                    if i + 1 < primary {
+                        let next_i = (i + 1) as isize;
+                        let in_idx = (next_i + hi_off).clamp(0, imax) as usize;
+                        let out_idx = (next_i + lo_off - 1).clamp(0, imax) as usize;
+                        let p_in = &line_in[in_idx * 4..in_idx * 4 + 4];
+                        let p_out = &line_in[out_idx * 4..out_idx * 4 + 4];
+                        acc[0] = acc[0] + p_in[0] as u32 - p_out[0] as u32;
+                        acc[1] = acc[1] + p_in[1] as u32 - p_out[1] as u32;
+                        acc[2] = acc[2] + p_in[2] as u32 - p_out[2] as u32;
+                        acc[3] = acc[3] + p_in[3] as u32 - p_out[3] as u32;
+                    }
+                }
+            }
+            ConvolveEdgeMode::Wrap | ConvolveEdgeMode::None => {
+                // The rolling-sum subtract/add trick assumes the leaving
+                // and entering samples can be read back exactly; under
+                // `wrap` the window indices are non-monotone and under
+                // `none` they may be absent, so we sum each fixed-width
+                // window directly. The divisor stays `n` (a `none`
+                // out-of-line sample contributes 0 value but still
+                // counts toward the fixed window width, exactly like a
+                // zero-padded border pixel).
+                for i in 0..primary {
+                    let mut acc = [0u32; 4];
+                    let base = i as isize;
+                    for k_off in lo_off..=hi_off {
+                        if let Some(pi) = resolve_line_index(base + k_off, primary, edge) {
+                            let p = &line_in[pi * 4..pi * 4 + 4];
+                            acc[0] += p[0] as u32;
+                            acc[1] += p[1] as u32;
+                            acc[2] += p[2] as u32;
+                            acc[3] += p[3] as u32;
+                        }
+                    }
+                    let off = i * 4;
+                    line_out[off] = (acc[0] as f32 * inv_n + 0.5) as u8;
+                    line_out[off + 1] = (acc[1] as f32 * inv_n + 0.5) as u8;
+                    line_out[off + 2] = (acc[2] as f32 * inv_n + 0.5) as u8;
+                    line_out[off + 3] = (acc[3] as f32 * inv_n + 0.5) as u8;
+                }
             }
         }
 
@@ -2096,6 +2241,175 @@ mod gaussian_blur_tests {
     fn wrong_length_panics() {
         let bad = vec![0u8; 7];
         let _ = gaussian_blur(&bad, 2, 2, 1.0, 1.0);
+    }
+
+    // ---- Filter Effects Module Level 1 §9.14: feGaussianBlur edgeMode --
+
+    /// The public `gaussian_blur` shim must be exactly equal to
+    /// `gaussian_blur_edge(..., Duplicate)` — the historical
+    /// clamp-to-edge default — for both code paths and a mix of axes.
+    #[test]
+    fn default_shim_equals_duplicate_edge() {
+        let w = 13u32;
+        let h = 9u32;
+        // A non-trivial gradient so the boundary handling actually
+        // matters at every edge.
+        let mut img = Vec::with_capacity((w * h * 4) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                img.extend_from_slice(&[(x * 17) as u8, (y * 23) as u8, ((x + y) * 7) as u8, 200]);
+            }
+        }
+        for &(sx, sy) in &[(1.0, 1.5), (3.0, 0.0), (0.0, 4.0), (2.5, 2.5)] {
+            let shim = gaussian_blur(&img, w, h, sx, sy);
+            let dup = gaussian_blur_edge(&img, w, h, sx, sy, ConvolveEdgeMode::Duplicate);
+            assert_eq!(shim, dup, "shim != duplicate at ({sx},{sy})");
+        }
+    }
+
+    /// `edgeMode = none` (the spec initial value) extends the image with
+    /// transparent black. A solid-opaque image must therefore darken
+    /// toward the border under `none`, while `duplicate` preserves a
+    /// solid image exactly. This holds in BOTH the direct-kernel path
+    /// (`s < 2.0`) and the box-blur path (`s >= 2.0`).
+    #[test]
+    fn none_edge_darkens_border_solid() {
+        // Large enough that the centre lies well outside any edge
+        // kernel reach for the stddevs tested (s=3 spreads ≈9 px).
+        let w = 31u32;
+        let h = 31u32;
+        let img = solid(w, h, Rgba::new(200, 200, 200, 255));
+        for &s in &[1.0f32, 3.0f32] {
+            let dup = gaussian_blur_edge(&img, w, h, s, s, ConvolveEdgeMode::Duplicate);
+            let none = gaussian_blur_edge(&img, w, h, s, s, ConvolveEdgeMode::None);
+            // Duplicate leaves a solid image untouched.
+            assert_eq!(dup, img, "duplicate must preserve solid at s={s}");
+            // None: the interior centre is unchanged but the corner
+            // pixel is pulled toward zero by the implicit black border.
+            let centre = ((h / 2 * w + w / 2) * 4) as usize;
+            let corner = 0usize;
+            assert!(
+                none[centre] >= 190,
+                "centre should stay near full at s={s}, got {}",
+                none[centre]
+            );
+            assert!(
+                none[corner] < img[corner],
+                "corner R must darken under none at s={s}: {} !< {}",
+                none[corner],
+                img[corner]
+            );
+            // Every corner touches two zero borders, so all four darken
+            // under `none` (the even-`d` box passes are asymmetric, so we
+            // assert darkening rather than exact corner equality).
+            let tr = ((w - 1) * 4) as usize;
+            let bl = ((h - 1) * w * 4) as usize;
+            let br = ((h * w - 1) * 4) as usize;
+            assert!(none[tr] < img[tr], "TR corner must darken at s={s}");
+            assert!(none[bl] < img[bl], "BL corner must darken at s={s}");
+            assert!(none[br] < img[br], "BR corner must darken at s={s}");
+        }
+    }
+
+    /// `edgeMode = wrap` makes the blur toroidal: a horizontally
+    /// constant-per-column image that is periodic across the wrap
+    /// boundary stays unchanged, whereas the same image under `none`
+    /// would darken at the seam. Concretely, a fully uniform image is
+    /// preserved by `wrap` (every off-image read returns an identical
+    /// in-image value).
+    #[test]
+    fn wrap_edge_preserves_uniform() {
+        let w = 9u32;
+        let h = 7u32;
+        let img = solid(w, h, Rgba::new(40, 90, 160, 255));
+        for &s in &[1.0f32, 3.0f32] {
+            let wrap = gaussian_blur_edge(&img, w, h, s, s, ConvolveEdgeMode::Wrap);
+            assert_eq!(wrap, img, "wrap must preserve a uniform image at s={s}");
+        }
+    }
+
+    /// Under `wrap` along X, a single bright column wraps its energy
+    /// around the horizontal seam: blurring column 0 must deposit some
+    /// brightness onto the LAST column (its wrap-around left neighbour),
+    /// which `none` and `duplicate` would never do.
+    #[test]
+    fn wrap_edge_bleeds_across_seam() {
+        let w = 9u32;
+        let h = 3u32;
+        // Bright column at x = 0, everything else zero/transparent.
+        let mut img = solid(w, h, Rgba::new(0, 0, 0, 0));
+        for y in 0..h as usize {
+            let off = (y * w as usize) * 4;
+            img[off..off + 4].copy_from_slice(&[255, 255, 255, 255]);
+        }
+        // Use a box-path stddev so it spreads a couple of pixels.
+        let s = 2.0f32;
+        let wrap = gaussian_blur_edge(&img, w, h, s, 0.0, ConvolveEdgeMode::Wrap);
+        let none = gaussian_blur_edge(&img, w, h, s, 0.0, ConvolveEdgeMode::None);
+        let last = ((w - 1) * 4) as usize; // row 0, last column
+        assert!(
+            wrap[last] > 0,
+            "wrap must bleed onto the opposite edge, got {}",
+            wrap[last]
+        );
+        assert_eq!(
+            none[last], 0,
+            "none must NOT bleed across the seam, got {}",
+            none[last]
+        );
+    }
+
+    /// Determinism: the edge-aware path is a pure function of its inputs.
+    #[test]
+    fn edge_mode_is_deterministic() {
+        let w = 8u32;
+        let h = 6u32;
+        let mut img = solid(w, h, Rgba::new(0, 0, 0, 0));
+        img[((2 * w + 3) * 4) as usize] = 255;
+        for mode in [
+            ConvolveEdgeMode::Duplicate,
+            ConvolveEdgeMode::Wrap,
+            ConvolveEdgeMode::None,
+        ] {
+            let a = gaussian_blur_edge(&img, w, h, 1.3, 2.7, mode);
+            let b = gaussian_blur_edge(&img, w, h, 1.3, 2.7, mode);
+            assert_eq!(a, b, "non-deterministic under {mode:?}");
+        }
+    }
+
+    /// `resolve_line_index` table: the three edge rules on a length-4
+    /// line for indices spanning two periods on each side.
+    #[test]
+    fn resolve_line_index_table() {
+        let len = 4usize;
+        // Duplicate clamps.
+        assert_eq!(
+            resolve_line_index(-3, len, ConvolveEdgeMode::Duplicate),
+            Some(0)
+        );
+        assert_eq!(
+            resolve_line_index(-1, len, ConvolveEdgeMode::Duplicate),
+            Some(0)
+        );
+        assert_eq!(
+            resolve_line_index(2, len, ConvolveEdgeMode::Duplicate),
+            Some(2)
+        );
+        assert_eq!(
+            resolve_line_index(7, len, ConvolveEdgeMode::Duplicate),
+            Some(3)
+        );
+        // Wrap reduces modulo (Euclidean for negatives).
+        assert_eq!(resolve_line_index(-1, len, ConvolveEdgeMode::Wrap), Some(3));
+        assert_eq!(resolve_line_index(-4, len, ConvolveEdgeMode::Wrap), Some(0));
+        assert_eq!(resolve_line_index(-5, len, ConvolveEdgeMode::Wrap), Some(3));
+        assert_eq!(resolve_line_index(4, len, ConvolveEdgeMode::Wrap), Some(0));
+        assert_eq!(resolve_line_index(6, len, ConvolveEdgeMode::Wrap), Some(2));
+        // None drops out-of-range.
+        assert_eq!(resolve_line_index(-1, len, ConvolveEdgeMode::None), None);
+        assert_eq!(resolve_line_index(0, len, ConvolveEdgeMode::None), Some(0));
+        assert_eq!(resolve_line_index(3, len, ConvolveEdgeMode::None), Some(3));
+        assert_eq!(resolve_line_index(4, len, ConvolveEdgeMode::None), None);
     }
 }
 
