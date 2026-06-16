@@ -267,6 +267,250 @@
 
 use oxideav_core::Rgba;
 
+/// Working colour space for filter imaging operations.
+///
+/// Filter Effects Module Level 1 §10 (`color-interpolation-filters`)
+/// defines which colour space the per-pixel arithmetic of a filter
+/// primitive is carried out in. The property takes one of three values
+/// and its **initial value is `linearRGB`** — i.e. unless an author
+/// explicitly opts out, every filter primitive operates on
+/// light-linear samples, *not* on the gamma-encoded sRGB bytes that a
+/// source graphic is stored in.
+///
+/// Concretely: blurs, convolutions, lighting, blends, composites and
+/// component transfers are meant to combine *energy*, so the source is
+/// linearised before the primitive runs and the result is re-encoded to
+/// sRGB afterwards. Performing the same arithmetic directly on
+/// gamma-encoded bytes darkens blurred edges and skews blends — the
+/// difference this enum exists to control.
+///
+/// The transfer curve used to move between the two spaces is the
+/// IEC 61966-2-1 sRGB transfer function (the same one SVG 2 §13.9 names
+/// for the `color-interpolation` `linearRGB` conversion); see
+/// [`srgb_to_linear_f32`] / [`linear_to_srgb_f32`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FilterColorSpace {
+    /// `color-interpolation-filters: linearRGB` — the property's
+    /// **initial value**. Filter colour operations occur in the
+    /// linearised (light-energy) RGB space.
+    #[default]
+    LinearRgb,
+    /// `color-interpolation-filters: sRGB` — colour operations occur
+    /// directly in the gamma-encoded sRGB space (no linearisation).
+    Srgb,
+    /// `color-interpolation-filters: auto` — the user agent may choose
+    /// either space; the author does not require a particular one. This
+    /// implementation resolves `auto` to [`LinearRgb`](Self::LinearRgb)
+    /// (the property's initial value), so a primitive run under `auto`
+    /// matches the spec default rather than silently skipping
+    /// linearisation.
+    Auto,
+}
+
+impl FilterColorSpace {
+    /// Resolve [`Auto`](Self::Auto) to a concrete space. `auto` collapses
+    /// to [`LinearRgb`](Self::LinearRgb) (the property's initial value);
+    /// the other two variants pass through unchanged.
+    #[inline]
+    pub fn resolve(self) -> Self {
+        match self {
+            FilterColorSpace::Auto => FilterColorSpace::LinearRgb,
+            other => other,
+        }
+    }
+
+    /// `true` when filter operations under this space must first
+    /// linearise the source (and re-encode the result afterwards).
+    /// [`Srgb`](Self::Srgb) returns `false`; [`LinearRgb`](Self::LinearRgb)
+    /// and [`Auto`](Self::Auto) return `true`.
+    #[inline]
+    pub fn needs_linearisation(self) -> bool {
+        matches!(self.resolve(), FilterColorSpace::LinearRgb)
+    }
+}
+
+/// IEC 61966-2-1 sRGB → linear-light transfer function, full precision.
+///
+/// Input is a straight (non-premultiplied) sRGB sample in `[0.0, 1.0]`;
+/// output is the corresponding light-energy value in `[0.0, 1.0]`. This
+/// is the curve `color-interpolation-filters: linearRGB` requires before
+/// a filter primitive runs (Filter Effects 1 §10; the transfer function
+/// itself is SVG 2 §13.9 / IEC 61966-2-1).
+#[inline]
+pub fn srgb_to_linear_f32(cs: f32) -> f32 {
+    if cs <= 0.040_45 {
+        cs / 12.92
+    } else {
+        ((cs + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+/// IEC 61966-2-1 linear-light → sRGB transfer function, full precision.
+///
+/// The exact inverse of [`srgb_to_linear_f32`]: input is a light-energy
+/// value (clamped to `[0.0, 1.0]`), output is the gamma-encoded sRGB
+/// sample. This re-encodes a filter result back to sRGB after the
+/// primitive has run in linear space.
+#[inline]
+pub fn linear_to_srgb_f32(c: f32) -> f32 {
+    let c = c.clamp(0.0, 1.0);
+    if c <= 0.003_130_8 {
+        c * 12.92
+    } else {
+        1.055 * c.powf(1.0 / 2.4) - 0.055
+    }
+}
+
+/// 256-entry sRGB-byte → linear-light lookup table.
+///
+/// Every distinct 8-bit sRGB colour value maps to exactly one
+/// light-energy float, so the per-pixel linearisation collapses to a
+/// table read instead of a `powf` call. Built once on first access.
+fn srgb_to_linear_lut() -> &'static [f32; 256] {
+    use std::sync::OnceLock;
+    static LUT: OnceLock<[f32; 256]> = OnceLock::new();
+    LUT.get_or_init(|| {
+        let mut t = [0.0f32; 256];
+        for (i, slot) in t.iter_mut().enumerate() {
+            *slot = srgb_to_linear_f32(i as f32 / 255.0);
+        }
+        t
+    })
+}
+
+/// Convert one straight-alpha sRGB pixel into the linearRGB working
+/// space. Only the colour channels pass through the transfer curve;
+/// **alpha is coverage, not colour, and is left untouched** (Filter
+/// Effects 1 §10 — the property governs *colour* operations only).
+#[inline]
+fn pixel_srgb_to_linear(p: Rgba) -> Rgba {
+    let lut = srgb_to_linear_lut();
+    Rgba::new(
+        (lut[p.r as usize] * 255.0).round().clamp(0.0, 255.0) as u8,
+        (lut[p.g as usize] * 255.0).round().clamp(0.0, 255.0) as u8,
+        (lut[p.b as usize] * 255.0).round().clamp(0.0, 255.0) as u8,
+        p.a,
+    )
+}
+
+/// Re-encode one straight-alpha linearRGB pixel back to sRGB. The
+/// inverse of [`pixel_srgb_to_linear`]; alpha is again passed through
+/// unchanged.
+#[inline]
+fn pixel_linear_to_srgb(p: Rgba) -> Rgba {
+    Rgba::new(
+        (linear_to_srgb_f32(p.r as f32 / 255.0) * 255.0)
+            .round()
+            .clamp(0.0, 255.0) as u8,
+        (linear_to_srgb_f32(p.g as f32 / 255.0) * 255.0)
+            .round()
+            .clamp(0.0, 255.0) as u8,
+        (linear_to_srgb_f32(p.b as f32 / 255.0) * 255.0)
+            .round()
+            .clamp(0.0, 255.0) as u8,
+        p.a,
+    )
+}
+
+/// Convert an sRGB filter buffer into the linearRGB working space
+/// in place (per [`Rgba`] pixel). Colour channels are linearised;
+/// alpha is preserved. This is the *entry* transform a filter primitive
+/// applies before it runs when `color-interpolation-filters` resolves
+/// to `linearRGB` (the spec default).
+pub fn to_linear_rgb_pixels(buf: &mut [Rgba]) {
+    for p in buf.iter_mut() {
+        *p = pixel_srgb_to_linear(*p);
+    }
+}
+
+/// Re-encode a linearRGB filter buffer back to sRGB in place (per
+/// [`Rgba`] pixel) — the *exit* transform applied after a primitive
+/// has run in linear space. Inverse of [`to_linear_rgb_pixels`].
+pub fn to_srgb_pixels(buf: &mut [Rgba]) {
+    for p in buf.iter_mut() {
+        *p = pixel_linear_to_srgb(*p);
+    }
+}
+
+/// Packed-byte (`RGBA8`, row-major) counterpart of
+/// [`to_linear_rgb_pixels`]: linearise the colour bytes of an sRGB
+/// filter buffer in place, leaving every fourth (alpha) byte untouched.
+/// `buf.len()` must be a multiple of 4.
+///
+/// An 8-bit *linear* intermediate cannot represent every sRGB code
+/// distinctly (sRGB spends proportionally more codes in the dark end),
+/// so a byte-buffer round trip through linear and back drifts by up to
+/// six codes in the very dark range. Use [`srgb_to_linear_f32`] when
+/// full precision is required.
+pub fn to_linear_rgb(buf: &mut [u8]) {
+    let lut = srgb_to_linear_lut();
+    for px in buf.chunks_exact_mut(4) {
+        px[0] = (lut[px[0] as usize] * 255.0).round().clamp(0.0, 255.0) as u8;
+        px[1] = (lut[px[1] as usize] * 255.0).round().clamp(0.0, 255.0) as u8;
+        px[2] = (lut[px[2] as usize] * 255.0).round().clamp(0.0, 255.0) as u8;
+        // px[3] (alpha) unchanged.
+    }
+}
+
+/// Packed-byte (`RGBA8`, row-major) counterpart of [`to_srgb_pixels`]:
+/// re-encode the colour bytes of a linearRGB filter buffer back to sRGB
+/// in place, leaving alpha untouched. `buf.len()` must be a multiple
+/// of 4.
+pub fn to_srgb(buf: &mut [u8]) {
+    for px in buf.chunks_exact_mut(4) {
+        px[0] = (linear_to_srgb_f32(px[0] as f32 / 255.0) * 255.0)
+            .round()
+            .clamp(0.0, 255.0) as u8;
+        px[1] = (linear_to_srgb_f32(px[1] as f32 / 255.0) * 255.0)
+            .round()
+            .clamp(0.0, 255.0) as u8;
+        px[2] = (linear_to_srgb_f32(px[2] as f32 / 255.0) * 255.0)
+            .round()
+            .clamp(0.0, 255.0) as u8;
+        // px[3] (alpha) unchanged.
+    }
+}
+
+/// Run a filter primitive in the colour space selected by a resolved
+/// [`FilterColorSpace`], over a packed-byte (`RGBA8`) buffer.
+///
+/// When `space` resolves to `linearRGB` (the `color-interpolation-filters`
+/// default, including `auto`), the source is linearised, `op` runs on the
+/// linear buffer, and the result is re-encoded to sRGB. When `space` is
+/// `sRGB`, `op` runs directly on the gamma-encoded bytes with no
+/// conversion. `op` receives the working buffer and returns the
+/// primitive output in the *same* space it was handed.
+pub fn in_filter_space<F>(space: FilterColorSpace, src: &[u8], op: F) -> Vec<u8>
+where
+    F: FnOnce(&[u8]) -> Vec<u8>,
+{
+    if space.needs_linearisation() {
+        let mut lin = src.to_vec();
+        to_linear_rgb(&mut lin);
+        let mut out = op(&lin);
+        to_srgb(&mut out);
+        out
+    } else {
+        op(src)
+    }
+}
+
+/// [`Rgba`]-pixel counterpart of [`in_filter_space`].
+pub fn in_filter_space_pixels<F>(space: FilterColorSpace, src: &[Rgba], op: F) -> Vec<Rgba>
+where
+    F: FnOnce(&[Rgba]) -> Vec<Rgba>,
+{
+    if space.needs_linearisation() {
+        let mut lin = src.to_vec();
+        to_linear_rgb_pixels(&mut lin);
+        let mut out = op(&lin);
+        to_srgb_pixels(&mut out);
+        out
+    } else {
+        op(src)
+    }
+}
+
 /// Operator selector for [`morphology`].
 ///
 /// Mirrors the `operator` attribute of SVG 1.1 §15.20 `<feMorphology>`

@@ -37,6 +37,7 @@ produces a packed `Rgba` `VideoFrame`.
 | Filters — all 17 §15 / Filter-Effects-1 primitives | done — morphology, color-matrix, Gaussian blur (incl. Filter-Effects-1 §9.14 `edgeMode` duplicate/wrap/none), component-transfer, composite, convolve-matrix, turbulence, flood, offset, merge, tile, displacement-map, blend, diffuse-lighting, specular-lighting, image, drop-shadow |
 | `<pattern>` tiled fill/stroke paint (SVG2 §14.3) | done — user-space tile rect + patternTransform + wrap-around sampling; lacks a core `Paint` variant |
 | Pattern `viewBox` + `preserveAspectRatio` (SVG2 §14.3.2 / §8.2) | done — all 10 alignments × meet/slice + `align=none`, slice overhang tile-clipped |
+| `color-interpolation-filters` working space (Filter Effects 1 §10) | done — `linearRGB` (initial) / `sRGB` / `auto`; linearise→run→re-encode wrapper, alpha preserved |
 | Full ICC color-managed pipeline           | not yet              |
 
 ## Usage

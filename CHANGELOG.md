@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`color-interpolation-filters` working space** (Filter Effects
+  Module Level 1 §10). The property selects the colour space in which
+  a filter primitive's per-pixel arithmetic is carried out, with
+  **initial value `linearRGB`** — so unless an author opts out, blurs,
+  blends, composites, lighting and component transfers combine
+  light-linear samples, not gamma-encoded sRGB bytes. New
+  `FilterColorSpace` enum (`LinearRgb` / `Srgb` / `Auto`, with `auto`
+  resolving to the `linearRGB` initial value) plus the
+  `in_filter_space` / `in_filter_space_pixels` wrappers that linearise
+  the source, run the primitive, and re-encode to sRGB. Standalone
+  `to_linear_rgb` / `to_srgb` (+ `_pixels`) buffer converters and the
+  full-precision `srgb_to_linear_f32` / `linear_to_srgb_f32` transfer
+  functions (IEC 61966-2-1 / SVG 2 §13.9). Alpha is coverage, not
+  colour, and is preserved across the conversion. An 8-bit linear
+  intermediate loses a few dark-end codes on round trip (≤6); the f32
+  path is exact.
+
 - **`<feGaussianBlur>` `edgeMode` attribute** (Filter Effects Module
   Level 1 §9.14). The spec adds an `edgeMode` to the Gaussian-blur
   primitive — the same `duplicate | wrap | none` choice the
