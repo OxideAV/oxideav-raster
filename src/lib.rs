@@ -183,6 +183,15 @@
 //!   continuous under bilinear filtering. Exposed as
 //!   [`Renderer::fill_path_with_pattern`] /
 //!   [`Renderer::stroke_path_with_pattern`].
+//! * filter primitive subregion clip (Filter Effects Module Level 1
+//!   §9.4) — every `fe*` primitive's `x` / `y` / `width` / `height`
+//!   "act[s] as a hard clip clipping rectangle on the filter primitive
+//!   result"; [`clip_to_subregion`] (with the typed-pixel wrapper
+//!   [`clip_to_subregion_pixels`]) clears every pixel outside the
+//!   resolved [`Subregion`] to transparent black, keeping any pixel that
+//!   even partly intersects it, and disables the whole primitive
+//!   (transparent-black result) when the subregion width or height is
+//!   non-positive.
 //!
 //! Deferred to a later round:
 //!
@@ -218,20 +227,20 @@ pub use cache::{CacheStats, RasterizedSubtree};
 pub use composite::{composite_rgba_premultiplied, composite_rgba_premultiplied_blend};
 pub use fill::{rasterize_fill, AlphaMask};
 pub use filter::{
-    blend_filter, blend_filter_pixels, color_matrix, color_matrix_op, color_matrix_pixels,
-    component_transfer, component_transfer_pixels, composite_filter, composite_filter_pixels,
-    convolve_matrix, convolve_matrix_pixels, diffuse_lighting, diffuse_lighting_pixels,
-    displacement_map, displacement_map_pixels, drop_shadow, drop_shadow_pixels, flood,
-    flood_pixels, gaussian_blur, gaussian_blur_pixels, image_source, image_source_pixels,
-    in_filter_space, in_filter_space_pixels, linear_to_srgb_f32, merge, merge_pixels, morphology,
-    morphology_pixels, offset, offset_pixels, specular_lighting, specular_lighting_pixels,
-    srgb_to_linear_f32, tile, tile_pixels, to_linear_rgb, to_linear_rgb_pixels, to_srgb,
-    to_srgb_pixels, turbulence_filter, turbulence_filter_pixels, AspectRatioAlign, BlendFilterMode,
-    ColorMatrix, ColorMatrixOp, ComponentTransfer, CompositeOp, ConvolveEdgeMode, ConvolveMatrix,
-    DiffuseLighting, DisplacementChannel, DisplacementSampling, FilterColorSpace,
-    ImageSourceSampling, LightSource, MeetOrSlice, MorphologyOp, OffsetSampling,
-    PreserveAspectRatio, SpecularLighting, StitchTiles, TransferFunc, Turbulence, TurbulenceType,
-    GAUSSIAN_BLUR_BOX_THRESHOLD,
+    blend_filter, blend_filter_pixels, clip_to_subregion, clip_to_subregion_pixels, color_matrix,
+    color_matrix_op, color_matrix_pixels, component_transfer, component_transfer_pixels,
+    composite_filter, composite_filter_pixels, convolve_matrix, convolve_matrix_pixels,
+    diffuse_lighting, diffuse_lighting_pixels, displacement_map, displacement_map_pixels,
+    drop_shadow, drop_shadow_pixels, flood, flood_pixels, gaussian_blur, gaussian_blur_pixels,
+    image_source, image_source_pixels, in_filter_space, in_filter_space_pixels, linear_to_srgb_f32,
+    merge, merge_pixels, morphology, morphology_pixels, offset, offset_pixels, specular_lighting,
+    specular_lighting_pixels, srgb_to_linear_f32, tile, tile_pixels, to_linear_rgb,
+    to_linear_rgb_pixels, to_srgb, to_srgb_pixels, turbulence_filter, turbulence_filter_pixels,
+    AspectRatioAlign, BlendFilterMode, ColorMatrix, ColorMatrixOp, ComponentTransfer, CompositeOp,
+    ConvolveEdgeMode, ConvolveMatrix, DiffuseLighting, DisplacementChannel, DisplacementSampling,
+    FilterColorSpace, ImageSourceSampling, LightSource, MeetOrSlice, MorphologyOp, OffsetSampling,
+    PreserveAspectRatio, SpecularLighting, StitchTiles, Subregion, TransferFunc, Turbulence,
+    TurbulenceType, GAUSSIAN_BLUR_BOX_THRESHOLD,
 };
 pub use flatten::{flatten_arc_to_cubics, flatten_path, FlatContour};
 pub use gradient::{

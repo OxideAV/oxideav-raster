@@ -6175,6 +6175,313 @@ pub fn drop_shadow_pixels(
 }
 
 // ----------------------------------------------------------------------
+// Filter Effects Module Level 1 §9.4 — filter primitive subregion clip.
+// ----------------------------------------------------------------------
+
+/// A filter-primitive subregion rectangle, in the same pixel coordinate
+/// space as the primitive's result buffer (the buffer's pixel `(px, py)`
+/// covers the continuous square `[px, px + 1) × [py, py + 1)`; the
+/// buffer's top-left pixel `(0, 0)` sits at the filter region origin).
+///
+/// The four fields mirror the `x` / `y` / `width` / `height` attributes
+/// that Filter Effects Module Level 1 §9.4 ("Filter primitive
+/// subregion") places on every `fe*` element. They are stored here as
+/// already-resolved device-pixel offsets / extents — the caller folds
+/// `primitiveUnits` (`userSpaceOnUse` vs `objectBoundingBox`) and any
+/// percentage-against-the-filter-region resolution into these numbers
+/// before constructing a `Subregion`, exactly as the
+/// [`flood`] / [`tile`] primitives expect their rectangle pre-resolved.
+///
+/// A subregion with a non-positive `width` or `height` means "the effect
+/// of the filter primitive is disabled" per §9.4 — [`clip_to_subregion`]
+/// turns the whole result transparent black in that case.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Subregion {
+    /// Left edge of the subregion, in result-buffer pixel units.
+    pub x: f32,
+    /// Top edge of the subregion, in result-buffer pixel units.
+    pub y: f32,
+    /// Subregion width, in result-buffer pixel units. Non-positive ⇒
+    /// the primitive is disabled (§9.4).
+    pub width: f32,
+    /// Subregion height, in result-buffer pixel units. Non-positive ⇒
+    /// the primitive is disabled (§9.4).
+    pub height: f32,
+}
+
+impl Subregion {
+    /// Construct a subregion from its resolved pixel-space `x` / `y` /
+    /// `width` / `height`.
+    pub fn new(x: f32, y: f32, width: f32, height: f32) -> Self {
+        Self {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    /// `true` when the subregion is "disabled" per §9.4: a non-positive
+    /// (or NaN) width or height. A disabled subregion clips the whole
+    /// primitive result to transparent black.
+    #[inline]
+    fn is_disabled(&self) -> bool {
+        // A dimension is "positive" only if it compares strictly greater
+        // than zero; NaN fails this test (NaN is unordered), so a NaN
+        // extent is treated as disabled — exactly the §9.4 intent for a
+        // non-positive subregion dimension.
+        let positive = self.width > 0.0 && self.height > 0.0;
+        !positive
+    }
+
+    /// `true` when pixel column `px` (covering `[px, px + 1)`) even
+    /// partly intersects the subregion's `[x, x + width)` X-extent.
+    ///
+    /// §9.4: the offscreens are sized so that "all pixels which even
+    /// partly intersect" the subregion are kept; we therefore use the
+    /// half-open-interval overlap test `px + 1 > x && px < x + width`
+    /// rather than a centroid-inside test, so a subregion whose edge
+    /// falls mid-pixel retains the straddling pixel.
+    #[inline]
+    fn contains_col(&self, px: u32) -> bool {
+        let lo = px as f32;
+        let hi = lo + 1.0;
+        hi > self.x && lo < self.x + self.width
+    }
+
+    /// `true` when pixel row `py` (covering `[py, py + 1)`) even partly
+    /// intersects the subregion's `[y, y + height)` Y-extent. See
+    /// [`Subregion::contains_col`] for the half-open overlap rationale.
+    #[inline]
+    fn contains_row(&self, py: u32) -> bool {
+        let lo = py as f32;
+        let hi = lo + 1.0;
+        hi > self.y && lo < self.y + self.height
+    }
+}
+
+/// Filter Effects Module Level 1 §9.4 — apply a filter primitive
+/// subregion as a hard clip on a primitive's packed-RGBA result.
+///
+/// §9.4: "The filter primitive subregion acts as a hard clip clipping
+/// rectangle on the filter primitive result." Every pixel of `buf` that
+/// lies outside `region` is set to transparent black `(0, 0, 0, 0)`
+/// (the §15.7.3 undefined-pixel value); pixels inside — including any
+/// pixel that *even partly* intersects the subregion, per the §9.4
+/// offscreen-sizing rule — pass through unchanged.
+///
+/// A `region` whose `width` or `height` is non-positive disables the
+/// primitive (§9.4: "If the filter primitive subregion has a negative or
+/// zero width or height, the effect of the filter primitive is
+/// disabled"); the entire `buf` is cleared to transparent black.
+///
+/// The clip is applied in place. `buf` is interpreted as `width ×
+/// height` row-major straight-alpha RGBA, with pixel `(0, 0)` at the
+/// filter region origin — the same coordinate convention the [`tile`]
+/// and [`flood`] primitives use for their subregion rectangles.
+///
+/// # Panics
+///
+/// * If `buf.len() != width as usize * height as usize * 4`.
+/// * If `width as usize * height as usize * 4` overflows `usize`.
+pub fn clip_to_subregion(buf: &mut [u8], width: u32, height: u32, region: Subregion) {
+    let w = width as usize;
+    let h = height as usize;
+    let expected = w
+        .checked_mul(h)
+        .and_then(|n| n.checked_mul(4))
+        .expect("clip_to_subregion: width * height * 4 overflowed usize");
+    assert_eq!(
+        buf.len(),
+        expected,
+        "clip_to_subregion: buf.len() == {} but width*height*4 == {expected}",
+        buf.len()
+    );
+    if width == 0 || height == 0 {
+        return;
+    }
+    if region.is_disabled() {
+        buf.fill(0);
+        return;
+    }
+    // Precompute the kept X-span once: `contains_col` is monotone, so the
+    // kept columns form a single contiguous run `[col_lo, col_hi)`.
+    let mut col_lo = width;
+    let mut col_hi = 0u32;
+    for px in 0..width {
+        if region.contains_col(px) {
+            if px < col_lo {
+                col_lo = px;
+            }
+            col_hi = px + 1;
+        }
+    }
+    for py in 0..height {
+        let row_kept = region.contains_row(py);
+        let row_off = py as usize * w * 4;
+        if !row_kept || col_lo >= col_hi {
+            // Whole row outside the subregion's Y-span (or the X-span is
+            // empty for this image) ⇒ clear the entire row.
+            buf[row_off..row_off + w * 4].fill(0);
+            continue;
+        }
+        // Clear the left margin `[0, col_lo)` and right margin
+        // `[col_hi, width)`; the middle run passes through untouched.
+        if col_lo > 0 {
+            buf[row_off..row_off + col_lo as usize * 4].fill(0);
+        }
+        if col_hi < width {
+            let r0 = row_off + col_hi as usize * 4;
+            buf[r0..row_off + w * 4].fill(0);
+        }
+    }
+}
+
+/// Typed-pixel wrapper around [`clip_to_subregion`]. Clears every
+/// [`Rgba`] outside `region` to `Rgba::new(0, 0, 0, 0)` in place,
+/// keeping pixels that even partly intersect the subregion.
+///
+/// # Panics
+///
+/// * If `pixels.len() != width as usize * height as usize`.
+/// * If `width as usize * height as usize` overflows `usize`.
+pub fn clip_to_subregion_pixels(pixels: &mut [Rgba], width: u32, height: u32, region: Subregion) {
+    let w = width as usize;
+    let h = height as usize;
+    let expected = w
+        .checked_mul(h)
+        .expect("clip_to_subregion_pixels: width * height overflowed usize");
+    assert_eq!(
+        pixels.len(),
+        expected,
+        "clip_to_subregion_pixels: pixels.len() == {} but width*height == {expected}",
+        pixels.len()
+    );
+    if width == 0 || height == 0 {
+        return;
+    }
+    let transparent = Rgba::new(0, 0, 0, 0);
+    if region.is_disabled() {
+        pixels.fill(transparent);
+        return;
+    }
+    for py in 0..height {
+        let row_kept = region.contains_row(py);
+        let row_off = py as usize * w;
+        for px in 0..width {
+            if !(row_kept && region.contains_col(px)) {
+                pixels[row_off + px as usize] = transparent;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod subregion_tests {
+    use super::*;
+
+    fn build(width: u32, height: u32, f: impl Fn(u32, u32) -> [u8; 4]) -> Vec<u8> {
+        let mut out = Vec::with_capacity((width * height * 4) as usize);
+        for y in 0..height {
+            for x in 0..width {
+                out.extend_from_slice(&f(x, y));
+            }
+        }
+        out
+    }
+
+    fn px(buf: &[u8], width: u32, x: u32, y: u32) -> [u8; 4] {
+        let i = ((y * width + x) * 4) as usize;
+        [buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]
+    }
+
+    #[test]
+    fn integer_aligned_rect_keeps_interior_clears_outside() {
+        let mut buf = build(6, 5, |_, _| [10, 20, 30, 255]);
+        // Keep the 3×2 block at (1,1)..(4,3).
+        clip_to_subregion(&mut buf, 6, 5, Subregion::new(1.0, 1.0, 3.0, 2.0));
+        for y in 0..5 {
+            for x in 0..6 {
+                let inside = (1..4).contains(&x) && (1..3).contains(&y);
+                let got = px(&buf, 6, x, y);
+                if inside {
+                    assert_eq!(got, [10, 20, 30, 255], "kept pixel ({x},{y})");
+                } else {
+                    assert_eq!(got, [0, 0, 0, 0], "cleared pixel ({x},{y})");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fractional_edges_keep_partly_intersecting_pixels() {
+        // Subregion x in [1.5, 4.5): columns 1,2,3,4 all partly intersect
+        // (col 1 spans [1,2) overlaps [1.5,4.5); col 4 spans [4,5) overlaps).
+        // Column 0 ([0,1)) and column 5 ([5,6)) do not.
+        let mut buf = build(6, 1, |_, _| [9, 9, 9, 200]);
+        clip_to_subregion(&mut buf, 6, 1, Subregion::new(1.5, 0.0, 3.0, 1.0));
+        assert_eq!(px(&buf, 6, 0, 0), [0, 0, 0, 0]);
+        for x in 1..=4 {
+            assert_eq!(px(&buf, 6, x, 0), [9, 9, 9, 200], "col {x} partly inside");
+        }
+        assert_eq!(px(&buf, 6, 5, 0), [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn nonpositive_extent_disables_primitive() {
+        let mut zero_w = build(3, 3, |_, _| [1, 2, 3, 255]);
+        clip_to_subregion(&mut zero_w, 3, 3, Subregion::new(0.0, 0.0, 0.0, 3.0));
+        assert!(zero_w.iter().all(|&b| b == 0), "zero width clears all");
+
+        let mut neg_h = build(3, 3, |_, _| [1, 2, 3, 255]);
+        clip_to_subregion(&mut neg_h, 3, 3, Subregion::new(0.0, 0.0, 3.0, -1.0));
+        assert!(neg_h.iter().all(|&b| b == 0), "negative height clears all");
+    }
+
+    #[test]
+    fn subregion_outside_image_clears_everything() {
+        let mut buf = build(4, 4, |_, _| [7, 7, 7, 255]);
+        // Subregion entirely to the right of the image.
+        clip_to_subregion(&mut buf, 4, 4, Subregion::new(10.0, 0.0, 2.0, 4.0));
+        assert!(buf.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn full_region_is_a_no_op() {
+        let orig = build(5, 4, |x, y| [x as u8, y as u8, 0, 255]);
+        let mut buf = orig.clone();
+        clip_to_subregion(&mut buf, 5, 4, Subregion::new(0.0, 0.0, 5.0, 4.0));
+        assert_eq!(buf, orig);
+    }
+
+    #[test]
+    fn typed_path_matches_byte_path() {
+        let bytes = build(7, 6, |x, y| {
+            [(x * 30) as u8, (y * 40) as u8, ((x + y) * 10) as u8, 180]
+        });
+        let mut typed: Vec<Rgba> = bytes
+            .chunks_exact(4)
+            .map(|c| Rgba::new(c[0], c[1], c[2], c[3]))
+            .collect();
+        let region = Subregion::new(2.0, 1.5, 3.5, 3.0);
+
+        let mut bytes_clipped = bytes.clone();
+        clip_to_subregion(&mut bytes_clipped, 7, 6, region);
+        clip_to_subregion_pixels(&mut typed, 7, 6, region);
+
+        let from_typed: Vec<u8> = typed.iter().flat_map(|p| [p.r, p.g, p.b, p.a]).collect();
+        assert_eq!(bytes_clipped, from_typed);
+    }
+
+    #[test]
+    #[should_panic(expected = "clip_to_subregion: buf.len()")]
+    fn wrong_buffer_length_panics() {
+        let mut buf = vec![0u8; 7];
+        clip_to_subregion(&mut buf, 2, 2, Subregion::new(0.0, 0.0, 2.0, 2.0));
+    }
+}
+
+// ----------------------------------------------------------------------
 // SVG 1.1 §15.23 `<feTile>` — periodic tiling of a reference subregion.
 // ----------------------------------------------------------------------
 

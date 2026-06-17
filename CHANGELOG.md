@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Filter primitive subregion clip** (Filter Effects Module Level 1
+  §9.4). Every `fe*` filter primitive carries `x` / `y` / `width` /
+  `height` attributes that define its *filter primitive subregion*,
+  which "acts as a hard clip clipping rectangle on the filter primitive
+  result." New `clip_to_subregion` / `clip_to_subregion_pixels` apply a
+  resolved `Subregion` rectangle in place: pixels outside the rectangle
+  are set to transparent black (the §15.7.3 undefined-pixel value),
+  while any pixel that **even partly intersects** the subregion is kept
+  (half-open `[px, px+1)` overlap test, so a subregion edge that falls
+  mid-pixel retains the straddling pixel, matching the §9.4 rule that
+  offscreens accommodate "any pixels which even partly intersect"). A
+  subregion with a non-positive (or NaN) width or height disables the
+  whole primitive — §9.4: "If the filter primitive subregion has a
+  negative or zero width or height, the effect of the filter primitive
+  is disabled" — clearing the entire result to transparent black. The
+  caller resolves `primitiveUnits` and percentage-against-the-filter-
+  region semantics into the `Subregion`'s device-pixel fields before
+  the clip, the same pre-resolution convention `flood` / `tile` use.
+
 - **`color-interpolation-filters` working space** (Filter Effects
   Module Level 1 §10). The property selects the colour space in which
   a filter primitive's per-pixel arithmetic is carried out, with

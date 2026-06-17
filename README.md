@@ -38,6 +38,7 @@ produces a packed `Rgba` `VideoFrame`.
 | `<pattern>` tiled fill/stroke paint (SVG2 §14.3) | done — user-space tile rect + patternTransform + wrap-around sampling; lacks a core `Paint` variant |
 | Pattern `viewBox` + `preserveAspectRatio` (SVG2 §14.3.2 / §8.2) | done — all 10 alignments × meet/slice + `align=none`, slice overhang tile-clipped |
 | `color-interpolation-filters` working space (Filter Effects 1 §10) | done — `linearRGB` (initial) / `sRGB` / `auto`; linearise→run→re-encode wrapper, alpha preserved |
+| Filter primitive subregion clip (Filter Effects 1 §9.4) | done — `x`/`y`/`width`/`height` hard-clip rectangle on a primitive result; keeps partly-intersecting pixels, disables the primitive on non-positive extent |
 | Full ICC color-managed pipeline           | not yet              |
 
 ## Usage
