@@ -104,3 +104,76 @@ fn nested_group_opacities_multiply() {
         p[3]
     );
 }
+
+#[test]
+fn group_opacity_does_not_double_darken_overlapping_children() {
+    // SVG 2 §3.4 group opacity / "Simple Alpha Compositing": a group with
+    // `opacity = 0.5` is rendered into an offscreen image at full opacity
+    // and *then* blended onto the canvas uniformly. Two overlapping
+    // opaque children inside that group must therefore produce the SAME
+    // final pixel in their overlap as in the region only one child
+    // covers — opacity is a post-process on the composited group, not a
+    // per-child alpha. (The pre-fix direct path multiplied each child by
+    // 0.5 then over-composited them, so the overlap accumulated to alpha
+    // ~192 while the single-cover region stayed ~128 — a visible seam.)
+    let mut group = Group {
+        opacity: 0.5,
+        ..Default::default()
+    };
+    // Two opaque red rects whose union spans (0,0)..(6,4) and whose
+    // overlap is the central column band x in [2,4).
+    group
+        .children
+        .push(rect_node(0.0, 0.0, 4.0, 4.0, Rgba::opaque(255, 0, 0)));
+    group
+        .children
+        .push(rect_node(2.0, 0.0, 4.0, 4.0, Rgba::opaque(255, 0, 0)));
+
+    let mut root = Group::default();
+    root.children.push(Node::Group(group));
+
+    // Transparent background so we read the composited group alpha
+    // directly rather than blended into an opaque colour.
+    let r = Renderer::new(6, 4);
+    let v = VectorFrame {
+        width: 6.0,
+        height: 4.0,
+        view_box: None,
+        root,
+        pts: None,
+        time_base: oxideav_core::time::TimeBase::new(1, 1),
+    };
+    let out = r.render(&v);
+    let stride = out.planes[0].stride;
+    let px = |x: usize, y: usize| {
+        let i = y * stride + x * 4;
+        let d = &out.planes[0].data[i..i + 4];
+        [d[0], d[1], d[2], d[3]]
+    };
+    // Single-cover sample (only the first rect): x = 1.
+    let single = px(1, 2);
+    // Overlap sample (both rects): x = 3.
+    let overlap = px(3, 2);
+
+    // Opaque red at group opacity 0.5 over transparent → alpha ~128,
+    // red 255, in BOTH regions.
+    assert!(
+        (single[3] as i32 - 128).abs() <= 2,
+        "single-cover alpha should be ~128, got {}",
+        single[3]
+    );
+    assert!(
+        (overlap[3] as i32 - 128).abs() <= 2,
+        "overlap alpha should be ~128 (NOT double-darkened ~192), got {}",
+        overlap[3]
+    );
+    // The whole union must be a uniform colour+alpha — no seam.
+    assert_eq!(
+        single, overlap,
+        "overlap pixel {overlap:?} must equal single-cover pixel {single:?}"
+    );
+    // Red channel is opaque red in both.
+    assert_eq!(overlap[0], 255, "overlap red channel");
+    assert_eq!(overlap[1], 0, "overlap green channel");
+    assert_eq!(overlap[2], 0, "overlap blue channel");
+}

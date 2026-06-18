@@ -18,8 +18,12 @@
 //!    factor for anti-aliasing (1 / 2 / 4 / 8×).
 //! 4. **Paint** the mask: solid colors, linear/radial gradients (sRGB
 //!    interpolation, Pad / Reflect / Repeat spread).
-//! 5. **Composite** premultiplied-alpha onto the output frame; group
-//!    opacity multiplies the alpha during composite.
+//! 5. **Composite** premultiplied-alpha onto the output frame. A
+//!    partially-transparent group (`opacity < 1`) is first rendered to
+//!    an isolated offscreen image at full opacity, then blended onto the
+//!    canvas as a unit with its opacity applied uniformly (SVG 2 §3.4
+//!    group-opacity model), so overlapping children inside the group do
+//!    not double-darken in their overlap region.
 //!
 //! # Provenance
 //!
@@ -41,7 +45,10 @@
 //!   space — see [`InterpolationSpace`] and
 //!   [`Renderer::color_interpolation`]),
 //! * single-path clip,
-//! * group opacity,
+//! * group opacity (isolated offscreen composite per SVG 2 §3.4 — a
+//!   partially-transparent group renders into a temporary RGBA image at
+//!   full opacity, then blends as a unit so overlapping children don't
+//!   double-darken),
 //! * embedded raster images (`Node::Image`) — nearest-neighbour,
 //!   bilinear, Lanczos2 (4×4 windowed sinc), Mitchell–Netravali bicubic
 //!   (`B = C = 1/3`), Catmull–Rom bicubic (`B = 0, C = 1/2`, the

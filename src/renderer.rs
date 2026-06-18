@@ -266,11 +266,12 @@ impl Renderer {
         // Bitmap-cache fast path: when the group is tagged with a
         // `cache_key`, memoise its rendered children under
         // `composite_key(g.cache_key, local)` so a re-render at the
-        // same effective transform reuses the prior bitmap. The cache
-        // bakes in the group's *own* opacity (`g.opacity`) but never
-        // the parent's, so parent-opacity changes don't invalidate the
-        // cache; the parent's clip mask is also applied at blit time
-        // (not baked in) for the same reason.
+        // same effective transform reuses the prior bitmap. The cached
+        // bitmap is the group at *full opacity*; neither `g.opacity` nor
+        // the parent's opacity is baked in, so an opacity change never
+        // invalidates the cache. `g.opacity` and the parent opacity are
+        // both applied uniformly at blit time (along with the parent
+        // clip mask), exactly matching the SVG group-opacity model.
         if let Some(key) = g.cache_key {
             let composite = composite_key(key, &local);
             let bitmap = match self.cache.get(composite) {
@@ -288,7 +289,34 @@ impl Renderer {
                 bitmap.offset_x,
                 bitmap.offset_y,
                 clip_mask,
-                parent_opacity,
+                parent_opacity * g.opacity,
+            );
+            return;
+        }
+        // Group-opacity isolation (SVG 2 §3.4 "group opacity" / Simple
+        // Alpha Compositing): when the group is partially transparent we
+        // must render its children into an offscreen image *at full
+        // opacity*, then blend that image onto the canvas as a unit with
+        // `g.opacity` applied uniformly. Pushing `g.opacity` onto each
+        // child individually (the cheap direct path below) double-darkens
+        // the overlap region of any two overlapping children, which the
+        // spec's post-process model forbids. The group's own clip is
+        // baked into the offscreen; the inherited parent clip is applied
+        // at blit time so it intersects the composited unit.
+        if g.opacity < 1.0 {
+            let bitmap = self.rasterize_group_to_subtree(g, local);
+            blit_rgba_over(
+                buf,
+                stride,
+                self.width,
+                self.height,
+                &bitmap.rgba,
+                bitmap.width,
+                bitmap.height,
+                bitmap.offset_x,
+                bitmap.offset_y,
+                clip_mask,
+                parent_opacity * g.opacity,
             );
             return;
         }
@@ -311,26 +339,32 @@ impl Renderer {
             }
         });
         let effective_clip: Option<&AlphaMask> = group_clip_storage.as_ref().or(clip_mask);
-        let combined = parent_opacity * g.opacity;
+        // Reached only when `g.opacity == 1.0` (the partially-transparent
+        // case isolated offscreen above), so the group contributes no
+        // extra alpha and children inherit the parent opacity directly.
         for child in &g.children {
-            self.draw_node(child, local, combined, buf, stride, effective_clip);
+            self.draw_node(child, local, parent_opacity, buf, stride, effective_clip);
         }
     }
 
     /// Render `g`'s children onto a fresh canvas-sized RGBA buffer at
-    /// `local` transform, with `g.opacity` as the modulator and the
-    /// group's own clip path (but no inherited clip — that's applied
-    /// at blit time). Then scans the offscreen buffer for the
-    /// touched-pixel bounding box, allocates a tight crop, and stores
-    /// only that crop in the bitmap cache (saves significant memory for
-    /// tiny glyphs in large canvases — a 16 px glyph on a 4096 px canvas
-    /// drops from 64 MB to ~1 KB per cache entry).
-    fn render_group_offscreen(
-        &self,
-        g: &Group,
-        local: Transform2D,
-        composite: u64,
-    ) -> RasterizedSubtree {
+    /// `local` transform — at **full opacity**, with only the group's
+    /// own clip path applied (the inherited parent clip and the group's
+    /// `opacity` are applied uniformly at blit time, per the SVG group-
+    /// opacity rendering model). Then scan the offscreen buffer for the
+    /// touched-pixel bounding box, allocate a tight crop, and return it
+    /// as a [`RasterizedSubtree`].
+    ///
+    /// Rendering children at full opacity (rather than pre-multiplying
+    /// each child by `g.opacity`) is what makes group opacity behave as
+    /// a *post-process* on the composited group rather than a per-child
+    /// alpha — overlapping children inside the group no longer
+    /// double-darken in their overlap region (SVG 2 §3.4 / "Simple
+    /// Alpha Compositing": "the group ... is rendered into an RGBA
+    /// offscreen image[;] the offscreen image as [a] whole is then
+    /// blended into the canvas with the specified opacity value used
+    /// uniformly across the offscreen image").
+    fn rasterize_group_to_subtree(&self, g: &Group, local: Transform2D) -> RasterizedSubtree {
         let stride = (self.width as usize) * 4;
         let mut off = vec![0u8; stride * (self.height as usize)];
         // Apply the group's own clip mask only — the parent clip is
@@ -347,9 +381,25 @@ impl Renderer {
         });
         let effective_clip = group_clip_storage.as_ref();
         for child in &g.children {
-            self.draw_node(child, local, g.opacity, &mut off, stride, effective_clip);
+            self.draw_node(child, local, 1.0, &mut off, stride, effective_clip);
         }
-        let subtree = crop_to_bbox(&off, stride, self.width, self.height, local);
+        crop_to_bbox(&off, stride, self.width, self.height, local)
+    }
+
+    /// Cache-aware wrapper around [`Self::rasterize_group_to_subtree`]:
+    /// rasterises the group offscreen and stores the crop in the bitmap
+    /// cache under `composite` (saves significant memory for tiny glyphs
+    /// in large canvases — a 16 px glyph on a 4096 px canvas drops from
+    /// 64 MB to ~1 KB per cache entry). The cached bitmap is the group
+    /// at full opacity; callers apply `g.opacity` at blit time so an
+    /// opacity change never invalidates the cache.
+    fn render_group_offscreen(
+        &self,
+        g: &Group,
+        local: Transform2D,
+        composite: u64,
+    ) -> RasterizedSubtree {
+        let subtree = self.rasterize_group_to_subtree(g, local);
         self.cache.put(composite, subtree.clone());
         subtree
     }

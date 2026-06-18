@@ -76,6 +76,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Group opacity is now an isolated offscreen composite — overlapping
+  children no longer double-darken.** SVG 2 §3.4 ("Simple Alpha
+  Compositing") defines `opacity` on a group as a post-process: the
+  group "is rendered into an RGBA offscreen image[;] the offscreen image
+  as [a] whole is then blended into the canvas with the specified
+  opacity value used uniformly." The renderer previously took a cheaper
+  direct path for partially-transparent groups, multiplying each child's
+  alpha by `g.opacity` and compositing the children one-by-one onto the
+  canvas. For two overlapping children this accumulated extra alpha in
+  the overlap region (e.g. two opaque rects under `opacity = 0.5`
+  reached alpha ≈ 192 in the overlap versus ≈ 128 elsewhere — a visible
+  seam). A group with `opacity < 1` now renders its children to a
+  temporary RGBA image at full opacity (with the group's own clip baked
+  in) and blits that image as a single unit with `opacity` applied
+  uniformly and the inherited parent clip intersected at blit time. The
+  `cache_key` fast path is harmonised: cached group bitmaps are now
+  stored at full opacity and have `opacity` applied at blit time too, so
+  an opacity change no longer invalidates the cache and the cached and
+  non-cached paths produce identical pixels. New
+  `composite_group::group_opacity_does_not_double_darken_overlapping_children`
+  test pins the overlap == single-cover invariant.
+
 - **Dashed closed subpaths now join across the start/end seam.** SVG 1.1
   §11.4 / SVG 2 §13.5.6 require the stroke (and its dash pattern) to
   start at the path's first point and progress along one continuous

@@ -25,7 +25,7 @@ produces a packed `Rgba` `VideoFrame`.
 | `color-interpolation: linearRGB`          | done                 |
 | Gradient stops LUT (256-entry pre-bake)   | done                 |
 | Single-path clip                          | done                 |
-| Group opacity                             | done                 |
+| Group opacity                             | done — isolated offscreen composite (SVG 2 §3.4); overlapping children no longer double-darken |
 | Soft masks (luminance / alpha)            | done                 |
 | Bitmap cache (`Group::cache_key`)         | done (bbox)          |
 | Image resample: nearest / bilinear        | done                 |
