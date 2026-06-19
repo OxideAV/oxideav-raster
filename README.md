@@ -25,6 +25,7 @@ produces a packed `Rgba` `VideoFrame`.
 | `color-interpolation: linearRGB`          | done                 |
 | Gradient stops LUT (256-entry pre-bake)   | done                 |
 | Single-path clip                          | done                 |
+| Top-level `viewBox` → viewport `preserveAspectRatio` (SVG 1.1 §7.8 / §8.2 / §8.6) | done — all 10 alignments × meet/slice + `none`; default `xMidYMid meet`; slice overflow cropped at canvas edge; degenerate viewBox disables render |
 | Group opacity                             | done — isolated offscreen composite (SVG 2 §3.4); overlapping children no longer double-darken |
 | Soft masks (luminance / alpha)            | done                 |
 | Bitmap cache (`Group::cache_key`)         | done (bbox)          |

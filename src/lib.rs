@@ -45,6 +45,12 @@
 //!   space — see [`InterpolationSpace`] and
 //!   [`Renderer::color_interpolation`]),
 //! * single-path clip,
+//! * top-level `viewBox` → viewport fitting under `preserveAspectRatio`
+//!   (SVG 1.1 §7.8 / §8.2 / §8.6) — selectable via
+//!   [`Renderer::preserve_aspect_ratio`]; default `xMidYMid meet`
+//!   (uniform-scale + centre, letterboxed), `slice` covers the canvas
+//!   with overflow cropped at the edge, and `none` is the legacy
+//!   non-uniform stretch; a degenerate viewBox disables rendering,
 //! * group opacity (isolated offscreen composite per SVG 2 §3.4 — a
 //!   partially-transparent group renders into a temporary RGBA image at
 //!   full opacity, then blends as a unit so overlapping children don't

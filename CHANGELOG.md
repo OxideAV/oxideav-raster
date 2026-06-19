@@ -9,6 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Top-level `preserveAspectRatio` viewport fitting** (SVG 1.1 §7.8 /
+  §8.2 / §8.6). `Renderer::render` previously mapped a frame's `viewBox`
+  onto the output canvas with an unconditional non-uniform stretch
+  (independent X / Y scale factors), equivalent to a hard-wired
+  `preserveAspectRatio="none"`. It now fits the viewBox into the
+  `(0, 0, width, height)` viewport under a configurable
+  `Renderer::preserve_aspect_ratio` (`PreserveAspectRatio`), reusing the
+  spec-exact §8.2 equivalent-transform routine (`view_box_fit_transform`,
+  all 10 alignments × meet / slice) already used for `<pattern>`
+  viewBox fitting. The default is `xMidYMid meet` — the SVG §7.8 / §15.18
+  default ("If attribute `preserveAspectRatio` is not specified, then the
+  effect is as if a value of xMidYMid meet were specified"): the viewBox
+  is scaled uniformly to fit entirely inside the canvas and centred
+  (letterboxing transparent bands when the aspect ratios differ). A
+  `slice` value instead covers the whole canvas, with the overflow
+  cropped at the canvas edge (§8.6 `overflow: hidden`, enforced for free
+  by the fixed-size output buffer); `AspectRatioAlign::None` reproduces
+  the legacy non-uniform stretch byte-for-byte. A degenerate (zero /
+  negative / non-finite) viewBox extent now disables rendering and
+  returns the cleared canvas (§8.6) instead of producing a NaN-transform
+  smear. Builder entry point `Renderer::with_preserve_aspect_ratio`.
+  Seven new unit tests cover meet-letterbox, `xMinYMin` top-left
+  alignment, slice-cover, none-stretch, the zero-extent guard, and
+  policy-invariance when the viewBox aspect already matches the canvas.
+
 - **Filter primitive subregion clip** (Filter Effects Module Level 1
   §9.4). Every `fe*` filter primitive carries `x` / `y` / `width` /
   `height` attributes that define its *filter primitive subregion*,

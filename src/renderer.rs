@@ -12,10 +12,13 @@ use crate::blend::BlendMode;
 use crate::cache::{composite_key, CacheStats, RasterizedSubtree, SharedCache};
 use crate::composite::composite_rgba_premultiplied_blend;
 use crate::fill::{rasterize_fill, AlphaMask};
+use crate::filter::PreserveAspectRatio;
 use crate::flatten::{flatten_path, FlatContour};
 use crate::gradient::InterpolationSpace;
 use crate::paint::{build_paint_lut, sample_paint_in, sample_paint_with_lut};
-use crate::pattern::{sample_tile_bilinear_wrap, sample_tile_nearest_wrap, Pattern};
+use crate::pattern::{
+    sample_tile_bilinear_wrap, sample_tile_nearest_wrap, view_box_fit_transform, Pattern,
+};
 use crate::stroke::stroke_to_fill_path;
 
 /// Top-level vector→raster renderer.
@@ -67,6 +70,19 @@ pub struct Renderer {
     /// to fill, stroke, and image paints in the current renderer; SVG 2
     /// `mix-blend-mode` per-element override is a future extension.
     pub blend_mode: BlendMode,
+    /// How the frame's `viewBox` is fitted into the output canvas
+    /// (SVG 1.1 §7.8 / §8.2 `preserveAspectRatio`). Defaults to
+    /// `xMidYMid meet` — the SVG §7.8 / §15.18 default ("If attribute
+    /// `preserveAspectRatio` is not specified, then the effect is as if
+    /// a value of xMidYMid meet were specified"): the viewBox is scaled
+    /// uniformly to fit entirely within the canvas (letterboxed) and
+    /// centred. Set to [`AspectRatioAlign::None`] for the legacy
+    /// non-uniform stretch (viewBox bounding box mapped exactly onto the
+    /// canvas rectangle), or to a `slice` value to cover the whole
+    /// canvas with overflow cropped at the canvas edge (§8.6
+    /// `overflow: hidden`). Has no effect when the frame carries no
+    /// `viewBox` (user-space is already in pixels).
+    pub preserve_aspect_ratio: PreserveAspectRatio,
     /// Bitmap cache for memoised group subtrees. Shared via
     /// `Arc<Mutex<...>>` so the cache survives `Clone`, and so the
     /// cache lookup remains coherent across the scene walk's
@@ -160,6 +176,7 @@ impl Renderer {
             image_filter: ImageFilter::default(),
             color_interpolation: InterpolationSpace::default(),
             blend_mode: BlendMode::default(),
+            preserve_aspect_ratio: PreserveAspectRatio::default(),
             cache: SharedCache::with_capacity(DEFAULT_CACHE_CAPACITY),
         }
     }
@@ -190,6 +207,13 @@ impl Renderer {
         self.cache.reset_stats();
     }
 
+    /// Set the [`Self::preserve_aspect_ratio`] viewport-fitting policy
+    /// (SVG 1.1 §7.8) and return `self`, for builder-style construction.
+    pub fn with_preserve_aspect_ratio(mut self, par: PreserveAspectRatio) -> Self {
+        self.preserve_aspect_ratio = par;
+        self
+    }
+
     /// Render a [`VectorFrame`] into a packed `Rgba` `VideoFrame`.
     ///
     /// The frame's `view_box` (when present) is used to derive the
@@ -212,12 +236,34 @@ impl Renderer {
             }
         }
         // Compute the user-space → raster transform from the view box
-        // (or default to "user space already in pixels").
+        // (or default to "user space already in pixels"). The viewBox is
+        // fitted into the (0, 0, width, height) viewport rectangle under
+        // the configured `preserveAspectRatio` policy (SVG 1.1 §7.8 /
+        // §8.2). The default `xMidYMid meet` scales uniformly and centres
+        // (letterboxing when the aspect ratios differ); `none` reproduces
+        // the legacy non-uniform stretch; a `slice` value covers the
+        // whole canvas with the overflow cropped at the canvas edge
+        // (§8.6 `overflow: hidden`, which the fixed-size output buffer
+        // enforces for free).
         let initial = if let Some(vb) = frame.view_box {
-            let sx = self.width as f32 / vb.width.max(1e-9);
-            let sy = self.height as f32 / vb.height.max(1e-9);
-            // Translate so view-box top-left lands at (0, 0), then scale.
-            Transform2D::scale(sx, sy).compose(&Transform2D::translate(-vb.min_x, -vb.min_y))
+            // Degenerate viewBox extents disable rendering (§8.6); guard
+            // the division so a zero/negative/non-finite extent doesn't
+            // produce a NaN transform.
+            if !(vb.width > 0.0 && vb.height > 0.0 && vb.width.is_finite() && vb.height.is_finite())
+            {
+                return VideoFrame {
+                    pts: frame.pts,
+                    planes: vec![VideoPlane { stride, data: buf }],
+                };
+            }
+            view_box_fit_transform(
+                &vb,
+                0.0,
+                0.0,
+                self.width as f32,
+                self.height as f32,
+                self.preserve_aspect_ratio,
+            )
         } else {
             Transform2D::identity()
         };
@@ -1656,6 +1702,7 @@ pub fn rasterize(frame: &VectorFrame) -> Frame {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::filter::{AspectRatioAlign, MeetOrSlice};
     use oxideav_core::{
         FillRule, Group, Node, Paint, Path, PathNode, Point, Rgba, Transform2D, VectorFrame,
     };
@@ -1730,6 +1777,146 @@ mod tests {
         // inside the 10×10 rect → must be red.
         let i = 10 * stride + 10 * 4;
         assert_eq!(out.planes[0].data[i], 255);
+    }
+
+    /// Helper: read the RGBA at (x, y) of a rendered frame.
+    fn px_at(out: &VideoFrame, x: u32, y: u32) -> [u8; 4] {
+        let stride = out.planes[0].stride;
+        let i = (y as usize) * stride + (x as usize) * 4;
+        let s = &out.planes[0].data[i..i + 4];
+        [s[0], s[1], s[2], s[3]]
+    }
+
+    /// `xMidYMid meet` is the SVG §7.8 default. A wide viewBox painted
+    /// fully red, fitted into a square canvas, must letterbox: the
+    /// content is scaled uniformly to the limiting (here horizontal)
+    /// dimension and centred vertically, leaving transparent bands top
+    /// and bottom.
+    #[test]
+    fn view_box_meet_letterboxes_wide_content() {
+        // viewBox 20×10 (2:1) into a 20×20 canvas. meet → uniform
+        // scale = min(20/20, 20/10) = min(1, 2) = 1. Content height
+        // 10·1 = 10, centred → occupies canvas rows 5..15.
+        let mut root = Group::default();
+        root.children.push(red_rect_node(0.0, 0.0, 20.0, 10.0));
+        let mut v = frame(20, 20, root);
+        v.view_box = Some(oxideav_core::ViewBox::new(0.0, 0.0, 20.0, 10.0));
+        let r = Renderer::new(20, 20); // default xMidYMid meet
+        let out = r.render(&v);
+        // Middle band (row 10) is red across the width.
+        assert_eq!(px_at(&out, 10, 10), [255, 0, 0, 255]);
+        // Top band (row 1) and bottom band (row 18) are transparent
+        // (outside the centred content).
+        assert_eq!(px_at(&out, 10, 1), [0, 0, 0, 0]);
+        assert_eq!(px_at(&out, 10, 18), [0, 0, 0, 0]);
+    }
+
+    /// `xMinYMin meet`: a tall viewBox into a square canvas aligns the
+    /// content's top-left to the viewport top-left rather than centring,
+    /// so the empty band is on the right.
+    #[test]
+    fn view_box_meet_xminymin_aligns_top_left() {
+        // viewBox 10×20 (1:2) into 20×20. meet uniform scale =
+        // min(20/10, 20/20) = min(2, 1) = 1. Content width 10·1 = 10,
+        // aligned left → occupies columns 0..10, columns 10..20 empty.
+        let mut root = Group::default();
+        root.children.push(red_rect_node(0.0, 0.0, 10.0, 20.0));
+        let mut v = frame(20, 20, root);
+        v.view_box = Some(oxideav_core::ViewBox::new(0.0, 0.0, 10.0, 20.0));
+        let r = Renderer::new(20, 20).with_preserve_aspect_ratio(PreserveAspectRatio {
+            align: AspectRatioAlign::XMinYMin,
+            meet_or_slice: MeetOrSlice::Meet,
+        });
+        let out = r.render(&v);
+        // Left half painted, right half empty.
+        assert_eq!(px_at(&out, 2, 10), [255, 0, 0, 255]);
+        assert_eq!(px_at(&out, 18, 10), [0, 0, 0, 0]);
+    }
+
+    /// `none` reproduces the legacy non-uniform stretch: a square
+    /// viewBox painted red fills the whole rectangular canvas (no
+    /// letterboxing), matching pre-`preserveAspectRatio` behaviour.
+    #[test]
+    fn view_box_none_stretches_to_fill() {
+        let mut root = Group::default();
+        root.children.push(red_rect_node(0.0, 0.0, 10.0, 10.0));
+        let mut v = frame(40, 20, root);
+        v.view_box = Some(oxideav_core::ViewBox::new(0.0, 0.0, 10.0, 10.0));
+        let r = Renderer::new(40, 20).with_preserve_aspect_ratio(PreserveAspectRatio {
+            align: AspectRatioAlign::None,
+            meet_or_slice: MeetOrSlice::Meet,
+        });
+        let out = r.render(&v);
+        // Every corner is red — the content stretched across the whole
+        // 40×20 canvas.
+        assert_eq!(px_at(&out, 1, 1), [255, 0, 0, 255]);
+        assert_eq!(px_at(&out, 38, 1), [255, 0, 0, 255]);
+        assert_eq!(px_at(&out, 1, 18), [255, 0, 0, 255]);
+        assert_eq!(px_at(&out, 38, 18), [255, 0, 0, 255]);
+    }
+
+    /// `xMidYMid slice` covers the whole canvas (uniform scale to the
+    /// larger dimension) with the overflow cropped at the canvas edge
+    /// (§8.6 `overflow: hidden`). A wide red viewBox sliced into a
+    /// square canvas fills every pixel.
+    #[test]
+    fn view_box_slice_covers_canvas() {
+        // viewBox 20×10 into 20×20. slice uniform scale =
+        // max(20/20, 20/10) = max(1, 2) = 2. Content 40×20 centred
+        // horizontally (overflow cropped) → every canvas pixel covered.
+        let mut root = Group::default();
+        root.children.push(red_rect_node(0.0, 0.0, 20.0, 10.0));
+        let mut v = frame(20, 20, root);
+        v.view_box = Some(oxideav_core::ViewBox::new(0.0, 0.0, 20.0, 10.0));
+        let r = Renderer::new(20, 20).with_preserve_aspect_ratio(PreserveAspectRatio {
+            align: AspectRatioAlign::XMidYMid,
+            meet_or_slice: MeetOrSlice::Slice,
+        });
+        let out = r.render(&v);
+        // Corners and centre all red — full coverage.
+        assert_eq!(px_at(&out, 1, 1), [255, 0, 0, 255]);
+        assert_eq!(px_at(&out, 18, 18), [255, 0, 0, 255]);
+        assert_eq!(px_at(&out, 10, 10), [255, 0, 0, 255]);
+    }
+
+    /// A degenerate (zero-extent) viewBox disables rendering (§8.6):
+    /// the output is the cleared canvas, never a NaN-transform smear.
+    #[test]
+    fn view_box_zero_extent_disables_rendering() {
+        let mut root = Group::default();
+        root.children.push(red_rect_node(0.0, 0.0, 10.0, 10.0));
+        let mut v = frame(8, 8, root);
+        v.view_box = Some(oxideav_core::ViewBox::new(0.0, 0.0, 0.0, 10.0));
+        let r = Renderer::new(8, 8);
+        let out = r.render(&v);
+        assert!(out.planes[0].data.iter().all(|&b| b == 0));
+    }
+
+    /// When the viewBox aspect ratio already matches the canvas, all
+    /// three policies (`meet`, `slice`, `none`) produce the same fit —
+    /// there is nothing to letterbox or crop.
+    #[test]
+    fn view_box_matching_aspect_is_policy_invariant() {
+        let build = |par: PreserveAspectRatio| {
+            let mut root = Group::default();
+            root.children.push(red_rect_node(0.0, 0.0, 10.0, 10.0));
+            let mut v = frame(20, 20, root);
+            v.view_box = Some(oxideav_core::ViewBox::new(0.0, 0.0, 10.0, 10.0));
+            Renderer::new(20, 20)
+                .with_preserve_aspect_ratio(par)
+                .render(&v)
+        };
+        let meet = build(PreserveAspectRatio::default());
+        let slice = build(PreserveAspectRatio {
+            align: AspectRatioAlign::XMidYMid,
+            meet_or_slice: MeetOrSlice::Slice,
+        });
+        let none = build(PreserveAspectRatio {
+            align: AspectRatioAlign::None,
+            meet_or_slice: MeetOrSlice::Meet,
+        });
+        assert_eq!(meet.planes[0].data, slice.planes[0].data);
+        assert_eq!(meet.planes[0].data, none.planes[0].data);
     }
 
     #[test]
