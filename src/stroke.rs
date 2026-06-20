@@ -36,6 +36,81 @@
 use crate::flatten::FlatContour;
 use oxideav_core::{DashPattern, LineCap, LineJoin, Stroke};
 
+/// The full SVG 2 §13.5.5 `stroke-linejoin` value set.
+///
+/// `oxideav_core::LineJoin` carries the three SVG 1.1 / PDF 1.4 values
+/// (`Miter`, `Round`, `Bevel`); the two **new in SVG 2** values
+/// (`miter-clip` and `arcs`) have no core enum variant, so this crate
+/// models them locally — the same extension pattern
+/// [`crate::FocalRadialGradient`] uses for the SVG 2 `fr` focal radius.
+///
+/// Drive the SVG 2 joins through [`ExtendedStroke`] +
+/// [`stroke_to_fill_path_ext`]; the core [`stroke_to_fill_path`] keeps
+/// taking a plain [`Stroke`] and maps its join through
+/// [`ExtendedLineJoin::from_core`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtendedLineJoin {
+    /// Sharp corner; collapses to a bevel past the miter limit
+    /// (SVG 1.1 / SVG 2 `miter`).
+    Miter,
+    /// Sharp corner; past the miter limit the apex is *clipped* by a
+    /// line perpendicular to the corner bisector at
+    /// `miter_limit/2 · stroke-width` from the join, rather than
+    /// collapsing to a bevel (SVG 2 `miter-clip`).
+    MiterClip,
+    /// Circular-sector corner (`round`).
+    Round,
+    /// Triangular bevel corner (`bevel`).
+    Bevel,
+    /// Arcs corner built from circles matching the incident edge
+    /// curvature (SVG 2 `arcs`). On the flattened polyline the renderer
+    /// feeds the stroker, both edges have zero curvature, so per the
+    /// spec this falls through to [`MiterClip`](Self::MiterClip).
+    Arcs,
+}
+
+impl ExtendedLineJoin {
+    /// Lift a core [`LineJoin`] into the extended set (lossless: the
+    /// three core values map onto their namesakes).
+    #[inline]
+    pub fn from_core(join: LineJoin) -> Self {
+        match join {
+            LineJoin::Miter => ExtendedLineJoin::Miter,
+            LineJoin::Round => ExtendedLineJoin::Round,
+            LineJoin::Bevel => ExtendedLineJoin::Bevel,
+        }
+    }
+}
+
+/// A [`Stroke`] whose join is an [`ExtendedLineJoin`], so SVG 2's
+/// `miter-clip` and `arcs` corners can be requested.
+///
+/// Every other stroke attribute (width, cap, miter limit, dash) comes
+/// from the wrapped [`Stroke`]; only [`Stroke::join`] is overridden.
+/// Build one with [`ExtendedStroke::new`] or
+/// [`ExtendedStroke::with_join`].
+#[derive(Debug, Clone)]
+pub struct ExtendedStroke {
+    /// The base stroke. Its `join` field is ignored in favour of
+    /// [`ExtendedStroke::join`].
+    pub base: Stroke,
+    /// The SVG 2 join shape.
+    pub join: ExtendedLineJoin,
+}
+
+impl ExtendedStroke {
+    /// Wrap `base`, taking its core join as the initial extended join.
+    pub fn new(base: Stroke) -> Self {
+        let join = ExtendedLineJoin::from_core(base.join);
+        ExtendedStroke { base, join }
+    }
+
+    /// Wrap `base` and override the join with an [`ExtendedLineJoin`].
+    pub fn with_join(base: Stroke, join: ExtendedLineJoin) -> Self {
+        ExtendedStroke { base, join }
+    }
+}
+
 /// Build the fillable stroke geometry for a flattened input contour.
 ///
 /// `width_px` is the stroke width in raster pixels (the caller has
@@ -60,15 +135,55 @@ pub fn stroke_to_fill_path(
             closed: input.closed,
         }]
     };
+    let join = ExtendedLineJoin::from_core(stroke.join);
+    build_segments(segments, half, stroke, join)
+}
+
+/// SVG 2 variant of [`stroke_to_fill_path`] that honours the full
+/// `stroke-linejoin` value set via [`ExtendedStroke`], including the two
+/// new-in-SVG-2 joins `miter-clip` and `arcs`.
+///
+/// Behaviour is identical to [`stroke_to_fill_path`] for the three
+/// SVG 1.1 joins; the only difference is the corner shape selected at
+/// each interior vertex.
+pub fn stroke_to_fill_path_ext(
+    input: &FlatContour,
+    stroke: &ExtendedStroke,
+    width_px: f32,
+) -> Vec<FlatContour> {
+    if input.points.len() < 2 || width_px <= 0.0 {
+        return Vec::new();
+    }
+    let half = width_px * 0.5;
+    let base = &stroke.base;
+    let segments = if let Some(dash) = &base.dash {
+        apply_dash(&input.points, input.closed, dash)
+    } else {
+        vec![DashSegment {
+            points: input.points.clone(),
+            closed: input.closed,
+        }]
+    };
+    build_segments(segments, half, base, stroke.join)
+}
+
+/// Shared outline builder for both entry points: turn dash-split
+/// sub-polylines into fillable contours using the given join shape.
+fn build_segments(
+    segments: Vec<DashSegment>,
+    half: f32,
+    stroke: &Stroke,
+    join: ExtendedLineJoin,
+) -> Vec<FlatContour> {
     let mut out: Vec<FlatContour> = Vec::with_capacity(segments.len());
     for seg in segments {
         if seg.closed {
             // Closed input → emit outer + inner offset loops.
-            if let Some(loops) = stroke_closed(&seg.points, half, stroke) {
+            if let Some(loops) = stroke_closed(&seg.points, half, stroke, join) {
                 out.extend(loops);
             }
         } else if seg.points.len() >= 2 {
-            if let Some(c) = stroke_open(&seg.points, half, stroke) {
+            if let Some(c) = stroke_open(&seg.points, half, stroke, join) {
                 out.push(c);
             }
         }
@@ -259,12 +374,18 @@ fn apply_dash(points: &[(f32, f32)], closed: bool, dash: &DashPattern) -> Vec<Da
 }
 
 /// Build the fillable outline for an open polyline.
-fn stroke_open(points: &[(f32, f32)], half: f32, stroke: &Stroke) -> Option<FlatContour> {
+fn stroke_open(
+    points: &[(f32, f32)],
+    half: f32,
+    stroke: &Stroke,
+    join: ExtendedLineJoin,
+) -> Option<FlatContour> {
     let n = points.len();
     if n < 2 {
         return None;
     }
     let mut out: Vec<(f32, f32)> = Vec::with_capacity(n * 4);
+    let ml = stroke.miter_limit;
 
     // Forward (right side).
     for i in 0..n {
@@ -277,13 +398,14 @@ fn stroke_open(points: &[(f32, f32)], half: f32, stroke: &Stroke) -> Option<Flat
             let (nx, ny) = right_normal(points[n - 2], points[n - 1]);
             out.push((points[n - 1].0 + nx * half, points[n - 1].1 + ny * half));
         } else {
-            push_join(
+            push_join_kind(
                 &mut out,
                 points[i - 1],
                 points[i],
                 points[i + 1],
                 half,
-                stroke,
+                join,
+                ml,
                 true,
             );
         }
@@ -301,13 +423,14 @@ fn stroke_open(points: &[(f32, f32)], half: f32, stroke: &Stroke) -> Option<Flat
             let (nx, ny) = right_normal(points[1], points[0]);
             out.push((points[0].0 + nx * half, points[0].1 + ny * half));
         } else {
-            push_join(
+            push_join_kind(
                 &mut out,
                 points[i + 1],
                 points[i],
                 points[i - 1],
                 half,
-                stroke,
+                join,
+                ml,
                 true,
             );
         }
@@ -324,19 +447,25 @@ fn stroke_open(points: &[(f32, f32)], half: f32, stroke: &Stroke) -> Option<Flat
 
 /// Build the fillable outline for a closed contour. Returns up to two
 /// loops (outer then inner) for the caller to fill with NonZero.
-fn stroke_closed(points: &[(f32, f32)], half: f32, stroke: &Stroke) -> Option<Vec<FlatContour>> {
+fn stroke_closed(
+    points: &[(f32, f32)],
+    half: f32,
+    stroke: &Stroke,
+    join: ExtendedLineJoin,
+) -> Option<Vec<FlatContour>> {
     let n = points.len();
     if n < 2 {
         return None;
     }
+    let ml = stroke.miter_limit;
     let mut outer: Vec<(f32, f32)> = Vec::with_capacity(n);
     let mut inner: Vec<(f32, f32)> = Vec::with_capacity(n);
     for i in 0..n {
         let prev = points[(i + n - 1) % n];
         let cur = points[i];
         let nxt = points[(i + 1) % n];
-        push_join(&mut outer, prev, cur, nxt, half, stroke, true);
-        push_join(&mut inner, prev, cur, nxt, half, stroke, false);
+        push_join_kind(&mut outer, prev, cur, nxt, half, join, ml, true);
+        push_join_kind(&mut inner, prev, cur, nxt, half, join, ml, false);
     }
     // Inner loop is wound opposite to the outer so a NonZero fill
     // produces a hollow ring.
@@ -364,16 +493,46 @@ fn right_normal(a: (f32, f32), b: (f32, f32)) -> (f32, f32) {
     (dy / len, -dx / len)
 }
 
-/// Emit join geometry at vertex `cur` between segments `prev→cur` and
-/// `cur→nxt`. `outer_side` selects the right-hand offset (true) or
-/// left-hand (false).
-fn push_join(
+/// Kind-parametrised join emitter shared by the SVG 1.1
+/// ([`stroke_to_fill_path`]) and SVG 2 ([`stroke_to_fill_path_ext`])
+/// entry points.
+///
+/// `join` selects the corner shape and `miter_limit` is the
+/// `stroke-miterlimit` ratio (a multiple of `stroke-width`). `half` is
+/// half the stroke width. The function appends the outer-boundary
+/// vertices of the corner at `cur` for the offset side chosen by
+/// `outer_side` (true = right-hand offset, false = left-hand).
+///
+/// The geometry follows SVG 2 §13.5.5 / the "line join shape"
+/// construction in the stroke implementation notes: the bevel triangle
+/// is `P, P1, P2` (here `cur`, `off0`, `off1`); the miter point `P3` is
+/// the intersection of the two offset edges. The new SVG 2 values are:
+///
+/// * **`MiterClip`** — identical to `Miter` while
+///   `1/sin(θ/2) ≤ miter_limit`. When the limit is exceeded the miter
+///   region is *clipped* by a line perpendicular to the corner bisector
+///   at distance `miter_limit/2 · stroke-width` from `cur`, rather than
+///   collapsing all the way to a bevel. This gives a flat-topped corner
+///   whose width is stable across a multi-join path.
+/// * **`Arcs`** — the arcs corner is built from circles tangent to the
+///   stroke edges with the same curvature as those edges at the join.
+///   The curvatures are defined in user space "before any transforms
+///   are applied"; the renderer flattens every curve to a polyline
+///   before stroking, so both incident edges have zero curvature here.
+///   Per the spec's "If both curvatures are zero fall through to
+///   miter-clip" rule, `Arcs` therefore evaluates exactly as
+///   `MiterClip` on polyline input. Callers that retain curvature can
+///   pre-bend the incident segments; the fall-through stays
+///   spec-faithful for the flattened path.
+#[allow(clippy::too_many_arguments)]
+fn push_join_kind(
     out: &mut Vec<(f32, f32)>,
     prev: (f32, f32),
     cur: (f32, f32),
     nxt: (f32, f32),
     half: f32,
-    stroke: &Stroke,
+    join: ExtendedLineJoin,
+    miter_limit: f32,
     outer_side: bool,
 ) {
     let sign = if outer_side { 1.0 } else { -1.0 };
@@ -385,10 +544,14 @@ fn push_join(
         out.push(off0);
         return;
     }
-    match stroke.join {
-        LineJoin::Miter => {
-            // Intersect the two offset lines. If the miter length
-            // exceeds miter_limit * width, fall back to a bevel.
+    // `Arcs` falls through to `MiterClip` on zero-curvature polylines.
+    let join = match join {
+        ExtendedLineJoin::Arcs => ExtendedLineJoin::MiterClip,
+        other => other,
+    };
+    match join {
+        ExtendedLineJoin::Miter | ExtendedLineJoin::MiterClip => {
+            // Intersect the two offset lines to find the miter apex P3.
             let dpx = nxt.0 - cur.0;
             let dpy = nxt.1 - cur.1;
             let dqx = cur.0 - prev.0;
@@ -407,23 +570,30 @@ fn push_join(
             let t = (rhsx * dpy - rhsy * dpx) / denom;
             let mx = off0.0 + dqx * t;
             let my = off0.1 + dqy * t;
-            // Miter length = distance from cur to (mx, my).
+            // Miter length = distance from cur to the apex (mx, my).
             let mlx = mx - cur.0;
             let mly = my - cur.1;
             let miter_len = (mlx * mlx + mly * mly).sqrt();
-            if miter_len > stroke.miter_limit * half {
-                // Fall back to bevel.
+            if miter_len <= miter_limit * half {
+                // Within the limit: full miter for both Miter and
+                // MiterClip.
+                out.push((mx, my));
+            } else if join == ExtendedLineJoin::Miter {
+                // `miter` collapses to a bevel when the limit is hit.
                 out.push(off0);
                 out.push(off1);
             } else {
-                out.push((mx, my));
+                // `miter-clip`: keep the miter direction but clip the
+                // apex by a line perpendicular to the corner bisector
+                // at distance `miter_limit/2 · stroke-width` from `cur`.
+                push_miter_clip(out, cur, off0, off1, (mx, my), miter_limit * half);
             }
         }
-        LineJoin::Bevel => {
+        ExtendedLineJoin::Bevel => {
             out.push(off0);
             out.push(off1);
         }
-        LineJoin::Round => {
+        ExtendedLineJoin::Round => {
             // Approximate the round join as a polyline arc on the
             // offset circle of radius `half` around `cur`. Step in
             // ~12° increments so a full quarter-turn becomes ~7
@@ -432,7 +602,77 @@ fn push_join(
             arc_polyline(out, cur, off0, off1, half);
             out.push(off1);
         }
+        ExtendedLineJoin::Arcs => unreachable!("Arcs is rewritten to MiterClip above"),
     }
+}
+
+/// Emit a clipped-miter corner (SVG 2 `stroke-linejoin: miter-clip`).
+///
+/// The full miter would extend from `off0` to the apex `apex` to
+/// `off1`. When the miter limit is exceeded we instead clip the region
+/// with a line perpendicular to the corner bisector at distance
+/// `clip_dist` (= `miter_limit/2 · stroke-width`) from the join point
+/// `cur`. The emitted boundary walks `off0 → c0 → c1 → off1`, where
+/// `c0` and `c1` are the points where the two miter edges cross the
+/// clip line. If an edge never reaches the clip line within its miter
+/// span (the apex is already inside the clip distance), the
+/// corresponding clip point coincides with `apex`, degrading
+/// gracefully to the plain miter.
+fn push_miter_clip(
+    out: &mut Vec<(f32, f32)>,
+    cur: (f32, f32),
+    off0: (f32, f32),
+    off1: (f32, f32),
+    apex: (f32, f32),
+    clip_dist: f32,
+) {
+    // Corner bisector: unit vector from `cur` toward the apex.
+    let bx = apex.0 - cur.0;
+    let by = apex.1 - cur.1;
+    let blen = (bx * bx + by * by).sqrt();
+    if blen < 1e-6 {
+        out.push(off0);
+        out.push(off1);
+        return;
+    }
+    let ux = bx / blen;
+    let uy = by / blen;
+    // The clip line passes through `clip_pt` and is perpendicular to the
+    // bisector (normal = (ux, uy)). A point Q is clipped out when its
+    // signed distance along the bisector exceeds `clip_dist`.
+    let clip_x = cur.0 + ux * clip_dist;
+    let clip_y = cur.1 + uy * clip_dist;
+    // Intersect the segment off0→apex with the clip line.
+    let c0 = clip_segment(off0, apex, (clip_x, clip_y), (ux, uy));
+    let c1 = clip_segment(off1, apex, (clip_x, clip_y), (ux, uy));
+    out.push(off0);
+    out.push(c0);
+    out.push(c1);
+    out.push(off1);
+}
+
+/// Clip the segment `from → to` against the half-plane bounded by the
+/// line through `plane_pt` with unit `normal` (the kept side is
+/// `dot(P − plane_pt, normal) ≤ 0`). Returns the boundary crossing
+/// point, or `to` when the far endpoint is already inside the kept
+/// half-plane (no crossing within the span — the apex stands).
+fn clip_segment(
+    from: (f32, f32),
+    to: (f32, f32),
+    plane_pt: (f32, f32),
+    normal: (f32, f32),
+) -> (f32, f32) {
+    let d_from = (from.0 - plane_pt.0) * normal.0 + (from.1 - plane_pt.1) * normal.1;
+    let d_to = (to.0 - plane_pt.0) * normal.0 + (to.1 - plane_pt.1) * normal.1;
+    if d_to <= 0.0 || (d_to - d_from).abs() < 1e-9 {
+        // Far endpoint inside, or the segment runs parallel to the clip
+        // line: no crossing to compute, keep the far endpoint.
+        return to;
+    }
+    // Crossing parameter where the signed distance reaches zero, clamped
+    // into the segment span.
+    let t = ((0.0 - d_from) / (d_to - d_from)).clamp(0.0, 1.0);
+    (from.0 + (to.0 - from.0) * t, from.1 + (to.1 - from.1) * t)
 }
 
 /// Append a polyline approximating the short arc from `from` to `to`
@@ -745,6 +985,192 @@ mod tests {
         assert!(!geom.is_empty());
         for g in &geom {
             assert!(g.closed);
+        }
+    }
+
+    // ---- SVG 2 §13.5.5 extended joins (miter-clip / arcs) ----
+
+    /// A right-angle corner: incoming +x, vertex at origin, outgoing +y.
+    /// With half = 1 the outer offset apex sits at (1, -1) so the miter
+    /// length is √2 ≈ 1.414. Returns (prev, cur, nxt).
+    fn right_angle_corner() -> ((f32, f32), (f32, f32), (f32, f32)) {
+        ((-10.0, 0.0), (0.0, 0.0), (0.0, 10.0))
+    }
+
+    fn dist(a: (f32, f32), b: (f32, f32)) -> f32 {
+        ((a.0 - b.0).powi(2) + (a.1 - b.1).powi(2)).sqrt()
+    }
+
+    #[test]
+    fn from_core_round_trips_the_three_svg11_joins() {
+        assert_eq!(
+            ExtendedLineJoin::from_core(LineJoin::Miter),
+            ExtendedLineJoin::Miter
+        );
+        assert_eq!(
+            ExtendedLineJoin::from_core(LineJoin::Round),
+            ExtendedLineJoin::Round
+        );
+        assert_eq!(
+            ExtendedLineJoin::from_core(LineJoin::Bevel),
+            ExtendedLineJoin::Bevel
+        );
+    }
+
+    #[test]
+    fn miter_clip_equals_miter_within_the_limit() {
+        // miter_limit = 4 → clip distance 4·half = 4 ≥ √2, so both
+        // `Miter` and `MiterClip` emit the single apex vertex (1, -1).
+        let (p, c, n) = right_angle_corner();
+        let mut miter = Vec::new();
+        push_join_kind(&mut miter, p, c, n, 1.0, ExtendedLineJoin::Miter, 4.0, true);
+        let mut clip = Vec::new();
+        push_join_kind(
+            &mut clip,
+            p,
+            c,
+            n,
+            1.0,
+            ExtendedLineJoin::MiterClip,
+            4.0,
+            true,
+        );
+        assert_eq!(miter.len(), 1, "plain miter within limit = one apex");
+        assert!(dist(miter[0], (1.0, -1.0)) < 1e-4);
+        assert_eq!(clip, miter, "miter-clip within the limit equals miter");
+    }
+
+    #[test]
+    fn miter_clip_clips_the_apex_past_the_limit_instead_of_bevelling() {
+        // Set the limit between half (1) and the apex distance √2 so the
+        // limit is exceeded. clip distance = 1.2·1 = 1.2.
+        let (p, c, n) = right_angle_corner();
+        let limit = 1.2_f32;
+        let mut miter = Vec::new();
+        push_join_kind(
+            &mut miter,
+            p,
+            c,
+            n,
+            1.0,
+            ExtendedLineJoin::Miter,
+            limit,
+            true,
+        );
+        let mut clip = Vec::new();
+        push_join_kind(
+            &mut clip,
+            p,
+            c,
+            n,
+            1.0,
+            ExtendedLineJoin::MiterClip,
+            limit,
+            true,
+        );
+        // `miter` collapses to a bevel: two offset vertices, no apex.
+        assert_eq!(miter.len(), 2);
+        assert!(dist(miter[0], (0.0, -1.0)) < 1e-4);
+        assert!(dist(miter[1], (1.0, 0.0)) < 1e-4);
+        // `miter-clip` keeps the miter direction but trims the apex:
+        // off0 → c0 → c1 → off1 (four vertices).
+        assert_eq!(clip.len(), 4);
+        assert!(dist(clip[0], (0.0, -1.0)) < 1e-4, "starts at off0");
+        assert!(dist(clip[3], (1.0, 0.0)) < 1e-4, "ends at off1");
+        // The two clip points lie on the bisector-perpendicular line at
+        // distance `clip` from the vertex, strictly nearer than the
+        // √2 apex and farther than the bevel chord.
+        for cp in &clip[1..3] {
+            let d = dist(*cp, (0.0, 0.0));
+            assert!(d < std::f32::consts::SQRT_2, "clipped nearer than apex");
+            assert!(d > 1.0, "but past the offset ring (flat top, not bevel)");
+        }
+        // The clip line is perpendicular to the bisector: both clip
+        // points share the same bisector-projection = clip distance 1.2.
+        let (ux, uy) = (
+            1.0_f32 / std::f32::consts::SQRT_2,
+            -1.0 / std::f32::consts::SQRT_2,
+        );
+        for cp in &clip[1..3] {
+            let proj = cp.0 * ux + cp.1 * uy;
+            assert!((proj - 1.2).abs() < 1e-3, "clip point on the limit line");
+        }
+    }
+
+    #[test]
+    fn arcs_falls_through_to_miter_clip_on_polylines() {
+        // Per the spec, `arcs` with both edge curvatures zero falls
+        // through to miter-clip. Our flattened polylines always have
+        // zero curvature, so the two must be byte-identical here.
+        let (p, c, n) = right_angle_corner();
+        for limit in [4.0_f32, 1.2, 1.0] {
+            let mut clip = Vec::new();
+            push_join_kind(
+                &mut clip,
+                p,
+                c,
+                n,
+                1.0,
+                ExtendedLineJoin::MiterClip,
+                limit,
+                true,
+            );
+            let mut arcs = Vec::new();
+            push_join_kind(&mut arcs, p, c, n, 1.0, ExtendedLineJoin::Arcs, limit, true);
+            assert_eq!(arcs, clip, "arcs ≡ miter-clip at miter_limit {limit}");
+        }
+    }
+
+    #[test]
+    fn extended_path_matches_core_path_for_shared_joins() {
+        // stroke_to_fill_path_ext with a core-equivalent join must
+        // reproduce stroke_to_fill_path exactly.
+        let c = FlatContour {
+            points: vec![(2.0, 2.0), (8.0, 2.0), (8.0, 8.0), (2.0, 8.0)],
+            closed: true,
+        };
+        for (core, ext) in [
+            (LineJoin::Miter, ExtendedLineJoin::Miter),
+            (LineJoin::Round, ExtendedLineJoin::Round),
+            (LineJoin::Bevel, ExtendedLineJoin::Bevel),
+        ] {
+            let s = stroke_basic(2.0, LineCap::Butt, core);
+            let base = stroke_to_fill_path(&c, &s, 2.0);
+            let es = ExtendedStroke::with_join(s.clone(), ext);
+            let extended = stroke_to_fill_path_ext(&c, &es, 2.0);
+            assert_eq!(base.len(), extended.len());
+            for (a, b) in base.iter().zip(extended.iter()) {
+                assert_eq!(a.points, b.points, "{ext:?} matches {core:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn extended_stroke_new_lifts_core_join() {
+        let s = stroke_basic(2.0, LineCap::Round, LineJoin::Bevel);
+        let es = ExtendedStroke::new(s);
+        assert_eq!(es.join, ExtendedLineJoin::Bevel);
+        assert_eq!(es.base.cap, LineCap::Round);
+    }
+
+    #[test]
+    fn miter_clip_produces_a_well_formed_closed_outline() {
+        // Sharp corner on a real path; miter-clip must keep the outline
+        // closed and non-empty (no collapse, no NaN spike).
+        let c = FlatContour {
+            points: vec![(0.0, 0.0), (20.0, 0.0), (0.0, 2.0)],
+            closed: false,
+        };
+        let mut s = stroke_basic(4.0, LineCap::Butt, LineJoin::Miter);
+        s.miter_limit = 2.0;
+        let es = ExtendedStroke::with_join(s, ExtendedLineJoin::MiterClip);
+        let geom = stroke_to_fill_path_ext(&c, &es, 4.0);
+        assert!(!geom.is_empty());
+        for g in &geom {
+            assert!(g.closed);
+            for pt in &g.points {
+                assert!(pt.0.is_finite() && pt.1.is_finite());
+            }
         }
     }
 }

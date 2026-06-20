@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **SVG 2 `stroke-linejoin: miter-clip` and `arcs` corner joins**
+  (SVG 2 §13.5.5 / the stroke "line join shape" implementation notes).
+  `oxideav_core::LineJoin` only models the three SVG 1.1 / PDF 1.4 join
+  shapes (`Miter`, `Round`, `Bevel`); the two values **new in SVG 2**
+  have no core variant, so they are modelled crate-locally with the same
+  extension pattern `FocalRadialGradient` uses for the SVG 2 `fr` focal
+  radius. New public `ExtendedLineJoin` enum (the full five-value set),
+  `ExtendedStroke` wrapper (a `Stroke` whose `join` is overridden by an
+  `ExtendedLineJoin`), and `stroke_to_fill_path_ext` entry point that
+  honours the full value set; the existing `stroke_to_fill_path` is
+  unchanged and now lifts its core join through
+  `ExtendedLineJoin::from_core`. `miter-clip` keeps the miter direction
+  but, once `1/sin(θ/2) > stroke-miterlimit`, clips the apex with a line
+  perpendicular to the corner bisector at `stroke-miterlimit/2 ·
+  stroke-width` from the join — a flat-topped corner whose width stays
+  stable across a multi-join path, instead of `miter`'s collapse to a
+  bevel. `arcs` builds its corner from circles matching the incident
+  edge curvature; the curvatures are defined in user space "before any
+  transforms are applied", and the renderer flattens every curve to a
+  polyline (zero curvature) before stroking, so per the spec's "If both
+  curvatures are zero fall through to miter-clip" rule `arcs` evaluates
+  exactly as `miter-clip` on the flattened path. Seven new unit tests
+  cover the core round-trip, miter-clip-equals-miter within the limit,
+  the clipped-apex geometry (clip points on the limit line, nearer than
+  the apex, past the offset ring), arcs ≡ miter-clip, the
+  shared-join equivalence between the two entry points, and a
+  well-formed-outline guard.
+
 - **Top-level `preserveAspectRatio` viewport fitting** (SVG 1.1 §7.8 /
   §8.2 / §8.6). `Renderer::render` previously mapped a frame's `viewBox`
   onto the output canvas with an unconditional non-uniform stretch

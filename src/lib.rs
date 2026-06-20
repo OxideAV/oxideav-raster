@@ -265,7 +265,7 @@ pub use gradient::{
 pub use paint::{sample_paint, sample_paint_in};
 pub use pattern::{view_box_fit_transform, Pattern};
 pub use renderer::{rasterize, ImageFilter, Renderer, DEFAULT_CACHE_CAPACITY};
-pub use stroke::stroke_to_fill_path;
+pub use stroke::{stroke_to_fill_path, stroke_to_fill_path_ext, ExtendedLineJoin, ExtendedStroke};
 
 #[cfg(test)]
 use oxideav_core::Rgba;
