@@ -16,6 +16,7 @@ produces a packed `Rgba` `VideoFrame`.
 | Scanline AA fill (even-odd / NZ)          | done                 |
 | Configurable supersampling 1/2/4/8×       | done                 |
 | Stroke geometry (caps + joins)            | done                 |
+| SVG 2 `stroke-linejoin: miter-clip` / `arcs` (§13.5.5) | done — `ExtendedStroke` + `stroke_to_fill_path_ext`; miter-clip trims the apex at `miterlimit/2 · width` instead of bevelling; `arcs` falls through to miter-clip on flattened (zero-curvature) input per spec |
 | Dash patterns                             | done — closed-subpath seam dash joins continuously (SVG 1.1 §11.4 / SVG 2 §13.5.6) |
 | Linear + radial gradients                 | done                 |
 | Off-centre focal radial                   | done                 |
