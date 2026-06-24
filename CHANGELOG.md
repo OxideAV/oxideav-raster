@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Analytic horizontal anti-aliasing in the scanline fill.** The fill
+  rasterizer previously combined vertical supersampling with a *binary*
+  horizontal span fill: each pixel a span touched was set fully covered,
+  with the span boundaries rounded out to whole pixels (`floor`/`ceil`).
+  Vertical and near-vertical edges therefore received no horizontal
+  anti-aliasing within a scanline — only the Y supersample smoothed them,
+  and a perfectly vertical edge stayed hard-stepped at any supersample
+  factor. `fill_span` now accumulates **fractional** coverage: interior
+  pixels gain `1.0`, and the two boundary pixels gain the exact fraction
+  of their unit width the span overlaps. The supersample accumulator is
+  now `f32` coverage in `[0, 1]` rather than a 0/1 byte, and the
+  down-average takes the mean fractional coverage. The result is true 2D
+  anti-aliasing: a half-pixel-wide span reads ~128, a slanted edge shows
+  a graded ramp across its boundary column. Pixel-aligned fills are
+  unaffected (a whole-pixel span still yields exactly `1.0`). Three new
+  fill unit tests cover half-pixel coverage, split fractional boundaries,
+  and the near-vertical-edge ramp.
+
 - **Radius-adaptive round-join / round-cap tessellation.** Round line
   joins and round line caps previously flattened their circular arcs at a
   fixed angular step (~12° per chord for joins, a hardcoded 8 chords per

@@ -13,9 +13,9 @@ produces a packed `Rgba` `VideoFrame`.
 | ----------------------------------------- | -------------------- |
 | Path flattening (line/quad/cubic)         | done                 |
 | SVG elliptic-arc → cubic Bezier           | done                 |
-| Scanline AA fill (even-odd / NZ)          | done                 |
+| Scanline AA fill (even-odd / NZ)          | done — analytic horizontal coverage (fractional span boundaries) + vertical supersampling, so near-vertical edges anti-alias in X |
 | Configurable supersampling 1/2/4/8×       | done                 |
-| Stroke geometry (caps + joins)            | done                 |
+| Stroke geometry (caps + joins)            | done — round joins/caps tessellate with a radius-adaptive sagitta-bounded chord count (sub-pixel-smooth at every width) |
 | SVG 2 `stroke-linejoin: miter-clip` / `arcs` (§13.5.5) | done — `ExtendedStroke` + `stroke_to_fill_path_ext`; miter-clip trims the apex at `miterlimit/2 · width` instead of bevelling; `arcs` falls through to miter-clip on flattened (zero-curvature) input per spec |
 | Dash patterns                             | done — closed-subpath seam dash joins continuously (SVG 1.1 §11.4 / SVG 2 §13.5.6) |
 | Linear + radial gradients                 | done                 |

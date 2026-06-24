@@ -24,6 +24,13 @@
 //!    * Even-odd: every pair of crossings is a fill.
 //!    * Non-zero: track running winding sum; non-zero stretches are
 //!      filled.
+//!
+//!    Each filled span `[x0, x1)` contributes **fractional** horizontal
+//!    coverage: interior pixels gain `1.0`, and the two boundary pixels
+//!    gain the exact fraction of their area the span overlaps. This is
+//!    analytic coverage along the scanline, so near-vertical edges are
+//!    anti-aliased in X by the span geometry itself — the Y supersample
+//!    only has to resolve the vertical direction.
 //! 6. After all supersample rows for a destination row are accumulated,
 //!    average them down to one 0..255 alpha byte.
 
@@ -144,8 +151,10 @@ pub fn rasterize_fill(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
-    // One-bit-per-pixel coverage for the supersampled grid.
-    let mut coverage: Vec<u8> = vec![0; (width as usize) * (ss_h as usize)];
+    // Fractional coverage accumulator for the supersampled grid. Each
+    // cell holds the horizontal area coverage in `[0.0, 1.0]` for that
+    // supersample row (boundary pixels carry partial coverage).
+    let mut coverage: Vec<f32> = vec![0.0; (width as usize) * (ss_h as usize)];
 
     let mut active: Vec<ActiveEdge> = Vec::new();
     let mut next_edge = 0usize;
@@ -206,38 +215,64 @@ pub fn rasterize_fill(
         }
     }
 
-    // Average ss rows into one destination row.
+    // Average ss rows into one destination row. Each supersample cell is
+    // already a fractional [0, 1] horizontal coverage; the mean over the
+    // ss rows is the pixel's combined 2D coverage.
     let mut mask = AlphaMask::new(width, height);
+    let inv_ss = 1.0 / ss as f32;
     for y in 0..height {
         for x in 0..width {
-            let mut sum = 0u32;
+            let mut sum = 0.0f32;
             for s in 0..ss {
                 let row = (y * ss + s) as usize;
                 let idx = row * (width as usize) + (x as usize);
-                sum += coverage[idx] as u32;
+                sum += coverage[idx];
             }
-            let alpha = (sum * 255 + (ss / 2)) / ss;
-            mask.data[(y * width + x) as usize] = alpha.min(255) as u8;
+            // Mean coverage in [0, 1] → 0..255, rounded to nearest.
+            let alpha = (sum * inv_ss * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
+            mask.data[(y * width + x) as usize] = alpha;
         }
     }
     mask
 }
 
+/// Add the horizontal coverage of the span `[x0, x1)` to `row`.
+///
+/// Interior pixels — those wholly inside the span — gain `1.0`. The two
+/// boundary pixels (the ones the span partly overlaps) gain the exact
+/// fraction of their unit width the span covers. This is analytic
+/// scanline coverage: it anti-aliases near-vertical edges in X without
+/// any horizontal supersampling. Spans within one scanline are produced
+/// non-overlapping and left-to-right by the parity / winding walk, so
+/// the additive accumulation never double-counts a pixel.
 #[inline]
-fn fill_span(row: &mut [u8], x0: f32, x1: f32, width: u32) {
-    let lo = x0.max(0.0).floor() as i64;
-    let hi = x1.min(width as f32).ceil() as i64;
+fn fill_span(row: &mut [f32], x0: f32, x1: f32, width: u32) {
+    // Clip the span to the raster width.
+    let x0 = x0.max(0.0);
+    let x1 = x1.min(width as f32);
+    if x1 <= x0 {
+        return;
+    }
+    let lo = x0.floor() as usize;
+    // `hi` is the index of the last pixel the span touches.
+    let hi_f = x1.ceil();
+    let hi = (hi_f as usize).min(width as usize);
     if hi <= lo {
         return;
     }
-    let lo = lo.max(0) as usize;
-    let hi = (hi as usize).min(width as usize);
-    if hi <= lo {
+    if lo + 1 == hi {
+        // The whole span sits inside a single pixel column.
+        row[lo] += (x1 - x0).clamp(0.0, 1.0);
         return;
     }
-    for px in &mut row[lo..hi] {
-        *px = 1;
+    // Left boundary pixel `lo`: covered from x0 to its right edge (lo+1).
+    row[lo] += ((lo as f32 + 1.0) - x0).clamp(0.0, 1.0);
+    // Interior pixels are fully covered.
+    for px in &mut row[lo + 1..hi - 1] {
+        *px += 1.0;
     }
+    // Right boundary pixel `hi-1`: covered from its left edge (hi-1) to x1.
+    row[hi - 1] += (x1 - (hi as f32 - 1.0)).clamp(0.0, 1.0);
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -311,6 +346,71 @@ mod tests {
         let c = rect_contour(0.0, 0.0, 4.0, 4.0);
         let m = rasterize_fill(&[c], 4, 4, FillRule::NonZero, 7);
         assert_eq!(m.nonzero_pixel_count(), 16);
+    }
+
+    #[test]
+    fn half_pixel_span_yields_half_coverage() {
+        // A 1px-tall, 0.5px-wide rectangle covering the LEFT half of
+        // pixel column 0 on row 0. With analytic horizontal coverage the
+        // pixel must read ~128 (half of 255), not 0 or 255. The old
+        // binary fill_span rounded this to a full pixel.
+        let c = rect_contour(0.0, 0.0, 0.5, 1.0);
+        // supersampling = 1 isolates the *horizontal* coverage path (no
+        // vertical averaging in play).
+        let m = rasterize_fill(&[c], 4, 1, FillRule::NonZero, 1);
+        let v = m.get(0, 0);
+        assert!(
+            (120..=136).contains(&v),
+            "0.5px-wide span should give ~half coverage, got {v}"
+        );
+        // The neighbouring full-width column is untouched.
+        assert_eq!(m.get(1, 0), 0);
+    }
+
+    #[test]
+    fn fractional_span_boundaries_split_between_two_pixels() {
+        // Rectangle from x=0.75 to x=2.25 on a single row: pixel 0 gets
+        // 0.25 coverage, pixel 1 full, pixel 2 gets 0.25. Confirms the
+        // boundary fractions land on the correct pixels and the interior
+        // is solid.
+        let c = rect_contour(0.75, 0.0, 1.5, 1.0);
+        let m = rasterize_fill(&[c], 4, 1, FillRule::NonZero, 1);
+        let p0 = m.get(0, 0);
+        let p1 = m.get(1, 0);
+        let p2 = m.get(2, 0);
+        assert!((58..=70).contains(&p0), "left fraction ~64, got {p0}");
+        assert_eq!(p1, 255, "interior pixel full, got {p1}");
+        assert!((58..=70).contains(&p2), "right fraction ~64, got {p2}");
+        assert_eq!(m.get(3, 0), 0);
+    }
+
+    #[test]
+    fn near_vertical_edge_is_antialiased_in_x() {
+        // A tall thin parallelogram whose right edge slants by one pixel
+        // across its height. At a single supersample (ss=1) each row's
+        // right edge lands at a fractional x, so the boundary column must
+        // show a graded ramp of partial-coverage values rather than the
+        // hard 0/255 step the old binary fill produced.
+        let c = FlatContour {
+            points: vec![(0.0, 0.0), (4.0, 0.0), (5.0, 8.0), (0.0, 8.0)],
+            closed: true,
+        };
+        let m = rasterize_fill(&[c], 8, 8, FillRule::NonZero, 1);
+        // Collect coverage values in the slanted boundary column band.
+        let mut partials = 0;
+        for y in 0..8 {
+            for x in 4..6 {
+                let v = m.get(x, y);
+                if v > 0 && v < 255 {
+                    partials += 1;
+                }
+            }
+        }
+        assert!(
+            partials >= 4,
+            "slanted edge should produce several partial-coverage pixels, \
+             got {partials}"
+        );
     }
 
     #[test]
