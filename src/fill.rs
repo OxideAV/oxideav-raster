@@ -385,6 +385,30 @@ mod tests {
     }
 
     #[test]
+    fn adjacent_spans_sharing_a_fractional_boundary_do_not_over_cover() {
+        // Two contiguous spans that meet at a fractional x (the winding
+        // walk can emit a single nonzero region as two adjacent sub-spans
+        // when an interior edge sits inside it). The pixel straddling the
+        // shared boundary must total exactly 1.0 coverage, not more.
+        let mut row = vec![0.0f32; 8];
+        fill_span(&mut row, 2.3, 3.6, 8);
+        fill_span(&mut row, 3.6, 5.0, 8);
+        // Pixel 3 is fully inside the union [2.3, 5.0]; coverage = 1.0.
+        assert!(
+            (row[3] - 1.0).abs() < 1e-5,
+            "shared-boundary pixel over/under-covered: {}",
+            row[3]
+        );
+        // No pixel may ever exceed full coverage.
+        for (i, &v) in row.iter().enumerate() {
+            assert!(v <= 1.0 + 1e-5, "pixel {i} over-covered: {v}");
+        }
+        // End fractions land on the outer columns.
+        assert!((row[2] - 0.7).abs() < 1e-5);
+        assert!((row[4] - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
     fn near_vertical_edge_is_antialiased_in_x() {
         // A tall thin parallelogram whose right edge slants by one pixel
         // across its height. At a single supersample (ss=1) each row's
