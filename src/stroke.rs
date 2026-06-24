@@ -675,8 +675,50 @@ fn clip_segment(
     (from.0 + (to.0 - from.0) * t, from.1 + (to.1 - from.1) * t)
 }
 
+/// Maximum allowed deviation (sagitta), in output-pixel units, between a
+/// flattened arc chord and the true circular arc when tessellating round
+/// joins and caps. A value well below one pixel keeps the faceting under
+/// the anti-aliased edge: at 0.2 px the worst-case chord error is a fifth
+/// of a pixel, so the AA ramp absorbs it and the corner reads as smooth.
+const ARC_FLATTEN_TOLERANCE: f32 = 0.2;
+
+/// Number of chord subdivisions needed to flatten a circular arc of
+/// radius `r` sweeping `|delta|` radians while keeping the per-chord
+/// sagitta at or below [`ARC_FLATTEN_TOLERANCE`].
+///
+/// For an arc subtending `δ` radians per chord on radius `r`, the chord's
+/// maximum deviation from the arc (the sagitta) is `r·(1 − cos(δ/2))`.
+/// Bounding that by the tolerance `tol` gives the largest admissible
+/// per-chord angle `δ_max = 2·acos(1 − tol/r)`, and the chord count is
+/// `⌈|delta| / δ_max⌉`. Radius-adaptive: a hairline join needs one or two
+/// chords, a thick round cap many — each stays sub-pixel-smooth without
+/// over-tessellating the small case.
+fn arc_chord_count(r: f32, delta: f32) -> usize {
+    let sweep = delta.abs();
+    if sweep <= 1e-6 {
+        return 1;
+    }
+    // When the radius is so small the tolerance already exceeds it, a
+    // single chord is within tolerance (the whole arc fits inside one
+    // pixel of error).
+    if r <= ARC_FLATTEN_TOLERANCE {
+        return 1;
+    }
+    // δ_max = 2·acos(1 − tol/r). The argument is in (−1, 1] here because
+    // tol/r ∈ (0, 1), so acos is well defined.
+    let delta_max = 2.0 * (1.0 - ARC_FLATTEN_TOLERANCE / r).acos();
+    if delta_max <= 1e-6 {
+        // Degenerate guard (shouldn't trigger given the radius check
+        // above); fall back to a fine fixed subdivision.
+        return ((sweep / 0.05).ceil() as usize).max(1);
+    }
+    ((sweep / delta_max).ceil() as usize).max(1)
+}
+
 /// Append a polyline approximating the short arc from `from` to `to`
 /// on the circle of radius `r` centred at `c`. Excludes the endpoints.
+/// The chord count is chosen by [`arc_chord_count`] so the flattening
+/// stays sub-pixel-smooth at every stroke width.
 fn arc_polyline(
     out: &mut Vec<(f32, f32)>,
     c: (f32, f32),
@@ -694,7 +736,7 @@ fn arc_polyline(
     while delta < -std::f32::consts::PI {
         delta += std::f32::consts::TAU;
     }
-    let steps = ((delta.abs() / 0.21).ceil() as usize).max(1); // ~12° per step
+    let steps = arc_chord_count(r, delta);
     for i in 1..steps {
         let t = a0 + delta * (i as f32) / (steps as f32);
         out.push((c.0 + r * t.cos(), c.1 + r * t.sin()));
@@ -759,7 +801,11 @@ fn arc_polyline_long(
     if mid_neg > mid_pos {
         delta = -delta;
     }
-    let steps = 8usize;
+    // Radius-adaptive chord count: a round cap is a half-turn (π rad),
+    // so small caps stay cheap while wide caps subdivide enough to keep
+    // the silhouette sub-pixel-smooth (matches the round-join flattening
+    // criterion in [`arc_chord_count`]).
+    let steps = arc_chord_count(r, delta);
     for i in 1..steps {
         let t = a0 + delta * (i as f32) / (steps as f32);
         out.push((c.0 + r * t.cos(), c.1 + r * t.sin()));
@@ -986,6 +1032,94 @@ mod tests {
         for g in &geom {
             assert!(g.closed);
         }
+    }
+
+    // ---- radius-adaptive round join / cap tessellation ----
+
+    /// The flattened sagitta of every chord on a quarter-turn arc must
+    /// stay at or below the tolerance for a representative spread of
+    /// radii — that is the whole point of [`arc_chord_count`].
+    #[test]
+    fn arc_chord_count_respects_the_sagitta_tolerance() {
+        let quarter = std::f32::consts::FRAC_PI_2;
+        for &r in &[0.5_f32, 1.0, 2.0, 5.0, 20.0, 100.0, 400.0] {
+            let steps = arc_chord_count(r, quarter);
+            let per_chord = quarter / steps as f32;
+            let sagitta = r * (1.0 - (per_chord * 0.5).cos());
+            assert!(
+                sagitta <= ARC_FLATTEN_TOLERANCE + 1e-4,
+                "r={r}: sagitta {sagitta} exceeds tol {ARC_FLATTEN_TOLERANCE} \
+                 with {steps} chords"
+            );
+        }
+    }
+
+    /// The chord count must grow monotonically with radius for a fixed
+    /// sweep: a wider round join is subdivided more finely.
+    #[test]
+    fn arc_chord_count_grows_with_radius() {
+        let half_turn = std::f32::consts::PI;
+        let small = arc_chord_count(2.0, half_turn);
+        let medium = arc_chord_count(20.0, half_turn);
+        let large = arc_chord_count(200.0, half_turn);
+        assert!(small < medium, "{small} !< {medium}");
+        assert!(medium < large, "{medium} !< {large}");
+    }
+
+    /// A degenerate (sub-tolerance) radius or a zero sweep collapses to a
+    /// single chord rather than dividing by zero or spinning forever.
+    #[test]
+    fn arc_chord_count_handles_degenerate_inputs() {
+        assert_eq!(arc_chord_count(0.0, std::f32::consts::PI), 1);
+        assert_eq!(arc_chord_count(0.1, std::f32::consts::PI), 1);
+        assert_eq!(arc_chord_count(100.0, 0.0), 1);
+    }
+
+    /// End-to-end: a wide round join produces materially more outline
+    /// vertices than a hairline one, confirming the adaptive count
+    /// reaches the emitted geometry (not just the helper).
+    #[test]
+    fn wide_round_join_emits_more_vertices_than_hairline() {
+        let c = FlatContour {
+            points: vec![(0.0, 0.0), (100.0, 0.0), (100.0, 100.0)],
+            closed: false,
+        };
+        let thin = stroke_basic(2.0, LineCap::Butt, LineJoin::Round);
+        let thick = stroke_basic(60.0, LineCap::Butt, LineJoin::Round);
+        let thin_geom = stroke_to_fill_path(&c, &thin, 2.0);
+        let thick_geom = stroke_to_fill_path(&c, &thick, 60.0);
+        let thin_pts: usize = thin_geom.iter().map(|g| g.points.len()).sum();
+        let thick_pts: usize = thick_geom.iter().map(|g| g.points.len()).sum();
+        assert!(
+            thick_pts > thin_pts,
+            "thick round join ({thick_pts} pts) should out-tessellate \
+             thin ({thin_pts} pts)"
+        );
+    }
+
+    /// A wide round cap likewise tessellates the half-turn finely while a
+    /// hairline cap stays cheap.
+    #[test]
+    fn wide_round_cap_emits_more_vertices_than_hairline() {
+        let c = FlatContour {
+            points: vec![(0.0, 50.0), (100.0, 50.0)],
+            closed: false,
+        };
+        let thin = stroke_basic(2.0, LineCap::Round, LineJoin::Miter);
+        let thick = stroke_basic(80.0, LineCap::Round, LineJoin::Miter);
+        let thin_pts: usize = stroke_to_fill_path(&c, &thin, 2.0)
+            .iter()
+            .map(|g| g.points.len())
+            .sum();
+        let thick_pts: usize = stroke_to_fill_path(&c, &thick, 80.0)
+            .iter()
+            .map(|g| g.points.len())
+            .sum();
+        assert!(
+            thick_pts > thin_pts,
+            "thick round cap ({thick_pts} pts) should out-tessellate \
+             thin ({thin_pts} pts)"
+        );
     }
 
     // ---- SVG 2 §13.5.5 extended joins (miter-clip / arcs) ----

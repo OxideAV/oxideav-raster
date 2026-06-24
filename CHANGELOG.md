@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Radius-adaptive round-join / round-cap tessellation.** Round line
+  joins and round line caps previously flattened their circular arcs at a
+  fixed angular step (~12° per chord for joins, a hardcoded 8 chords per
+  half-turn cap), independent of the stroke width. At large widths the
+  fixed step left visible faceting under the anti-aliased silhouette; at
+  hairline widths it over-tessellated. Both arc emitters now choose the
+  chord count from a sagitta bound: for an arc of radius `r` flattened
+  into chords each subtending `δ` radians, the chord's worst-case
+  deviation from the true arc is `r·(1 − cos(δ/2))`, so the largest
+  admissible per-chord angle is `δ_max = 2·acos(1 − tol/r)` and the chord
+  count is `⌈|sweep| / δ_max⌉`. The tolerance is fixed at 0.2 output
+  pixels — a fifth of a pixel, comfortably inside the AA ramp — so a
+  hairline join collapses to one or two chords while a thick round cap
+  subdivides finely enough to read as smooth. New `arc_chord_count`
+  helper drives both `arc_polyline` (joins) and `arc_polyline_long`
+  (caps); five unit tests cover the sagitta bound, radius-monotone chord
+  growth, degenerate inputs, and end-to-end vertex-count growth on wide
+  vs. hairline strokes.
+
 ### Added
 
 - **SVG 2 `stroke-linejoin: miter-clip` and `arcs` corner joins**
