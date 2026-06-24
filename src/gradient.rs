@@ -71,8 +71,10 @@ pub enum InterpolationSpace {
 /// Built via [`StopsLut::build`]; queried via [`StopsLut::sample`].
 #[derive(Debug, Clone)]
 pub struct StopsLut {
-    /// 256 RGBA entries, indexed by `(t.clamp(0,1) * 255).round() as
-    /// u8`.
+    /// 256 RGBA entries sampled at `t = i / 255`. [`StopsLut::sample`]
+    /// linearly interpolates between the two bracketing entries, so the
+    /// table acts as a piecewise-linear approximation of the exact stop
+    /// ramp rather than a 256-step quantiser.
     entries: [Rgba; 256],
 }
 
@@ -98,13 +100,45 @@ impl StopsLut {
     /// clamped (`Pad`-equivalent at the LUT boundary — the caller is
     /// expected to have applied [`apply_spread`] before this call,
     /// which already normalises `t` into `[0, 1]`).
+    ///
+    /// The lookup **linearly interpolates between the two bracketing
+    /// entries** rather than snapping to the nearest one. A 256-entry
+    /// nearest-index LUT quantises the gradient into 256 visible colour
+    /// steps; over a large fill that bands. Blending the two neighbours
+    /// by the sub-entry fraction recovers a continuous ramp, matching the
+    /// exact (non-LUT) [`sample_stops_in`] path to within rounding while
+    /// keeping the LUT's per-pixel cost (one extra lerp, no stop scan).
+    /// The interpolation is component-wise in the LUT's stored space,
+    /// which is already the post-interpolation-space byte value, so no
+    /// gamma round-trip is reintroduced here.
     #[inline]
     pub fn sample(&self, t: f32) -> Rgba {
         if !t.is_finite() {
             return self.entries[0];
         }
-        let scaled = (t * 255.0).round().clamp(0.0, 255.0) as usize;
-        self.entries[scaled]
+        let pos = (t * 255.0).clamp(0.0, 255.0);
+        let i0 = pos.floor() as usize;
+        if i0 >= 255 {
+            return self.entries[255];
+        }
+        let frac = pos - i0 as f32;
+        if frac <= 0.0 {
+            return self.entries[i0];
+        }
+        let a = self.entries[i0];
+        let b = self.entries[i0 + 1];
+        let lerp = |x: u8, y: u8| -> u8 {
+            // Round-to-nearest blend of two bytes by `frac ∈ (0, 1)`.
+            (x as f32 + (y as f32 - x as f32) * frac)
+                .round()
+                .clamp(0.0, 255.0) as u8
+        };
+        Rgba::new(
+            lerp(a.r, b.r),
+            lerp(a.g, b.g),
+            lerp(a.b, b.b),
+            lerp(a.a, b.a),
+        )
     }
 }
 
@@ -936,6 +970,49 @@ mod tests {
         let lut = StopsLut::build(&stops, InterpolationSpace::Srgb);
         assert_eq!(lut.sample(0.0), Rgba::opaque(255, 0, 0));
         assert_eq!(lut.sample(1.0), Rgba::opaque(0, 0, 255));
+    }
+
+    #[test]
+    fn stops_lut_interpolates_between_entries() {
+        // A black→white ramp. The LUT entry spacing is 1/255, so a `t`
+        // landing exactly between entries i and i+1 must blend the two,
+        // not snap to one. Sample at t = (i + 0.5)/255 and confirm the
+        // result sits strictly between the two bracketing entries.
+        let stops = vec![
+            GradientStop::new(0.0, Rgba::opaque(0, 0, 0)),
+            GradientStop::new(1.0, Rgba::opaque(255, 255, 255)),
+        ];
+        let lut = StopsLut::build(&stops, InterpolationSpace::Srgb);
+        let i = 100usize;
+        let lo = lut.entries[i].r;
+        let hi = lut.entries[i + 1].r;
+        let mid = lut.sample((i as f32 + 0.5) / 255.0).r;
+        assert!(
+            mid >= lo && mid <= hi && (mid > lo || lo == hi),
+            "sub-entry sample {mid} should blend between {lo} and {hi}"
+        );
+    }
+
+    #[test]
+    fn stops_lut_sample_is_monotonic_and_smooth() {
+        // Densely sample the LUT across [0, 1]; with interpolation the
+        // red channel of a black→white ramp must be non-decreasing and
+        // every adjacent step must change by at most a couple of LSB
+        // (no 256-step quantisation jumps).
+        let stops = vec![
+            GradientStop::new(0.0, Rgba::opaque(0, 0, 0)),
+            GradientStop::new(1.0, Rgba::opaque(255, 255, 255)),
+        ];
+        let lut = StopsLut::build(&stops, InterpolationSpace::Srgb);
+        let mut prev = 0u8;
+        for k in 0..=1000u32 {
+            let t = k as f32 / 1000.0;
+            let v = lut.sample(t).r;
+            assert!(v >= prev, "non-monotonic at t={t}: {v} < {prev}");
+            assert!(v - prev <= 2, "quantisation jump at t={t}: {prev} -> {v}");
+            prev = v;
+        }
+        assert_eq!(prev, 255);
     }
 
     #[test]

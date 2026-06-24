@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Gradient stops LUT now interpolates between entries.** The 256-entry
+  pre-baked stops LUT (`StopsLut`) was queried by nearest-index rounding,
+  quantising every gradient that went through the fast path into 256
+  discrete colour steps — visible banding on a large fill, and a needless
+  divergence from the exact (non-LUT) `sample_stops_in` path that
+  interpolates continuously. `StopsLut::sample` now linearly blends the
+  two bracketing entries by the sub-entry fraction, turning the table
+  into a piecewise-linear approximation of the true stop ramp. The
+  per-pixel cost rises by one lerp (no stop scan); banding disappears and
+  the LUT output tracks the exact path to within rounding. The existing
+  ±1-LSB LUT-vs-exact agreement tests still hold (interpolation is
+  strictly closer); two new tests assert sub-entry blending and a smooth,
+  monotone, jump-free ramp across `[0, 1]`.
+
 - **Analytic horizontal anti-aliasing in the scanline fill.** The fill
   rasterizer previously combined vertical supersampling with a *binary*
   horizontal span fill: each pixel a span touched was set fully covered,
