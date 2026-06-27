@@ -27,11 +27,10 @@
 //! responsible for any pre-coverage modulation of the source alpha
 //! channel before the blend, just like the source-over path).
 //!
-//! Wall provenance: formulas transcribed from
-//! `docs/document/pdf/PDF32000_2008.pdf` §11.3.3–§11.3.5 (the public
-//! ISO 32000-1 PDF spec), including §11.3.5.3 Table 137 and the
-//! `Lum` / `SetLum` / `ClipColor` / `Sat` / `SetSat` definitions. No
-//! external blend implementation consulted.
+//! Formulas are transcribed from the public ISO 32000-1 PDF spec at
+//! `docs/document/pdf/PDF32000_2008.pdf` §11.3.3–§11.3.5, including
+//! §11.3.5.3 Table 137 and the `Lum` / `SetLum` / `ClipColor` / `Sat` /
+//! `SetSat` auxiliary-function definitions.
 
 use oxideav_core::Rgba;
 

@@ -56,8 +56,9 @@
 //!   clamped to that range, then re-quantised back to `u8`.
 //!
 //! * **Composite** — `feComposite` from SVG 1.1 §15.12. Combines two
-//!   equal-sized RGBA buffers pixel-wise. The five Porter–Duff
-//!   operators (`over` / `in` / `out` / `atop` / `xor`) are expressed
+//!   equal-sized RGBA buffers pixel-wise. The six Porter–Duff
+//!   operators (`over` / `in` / `out` / `atop` / `xor` / `lighter`)
+//!   are expressed
 //!   through the premultiplied-alpha blend-factor pair `(Fa, Fb)` —
 //!   `co = ca·Fa + cb·Fb`, `αo = αa·Fa + αb·Fb` — consistent with the
 //!   §14.2 simple-alpha-compositing formula (`Cr' = (1 − Ea)·Cr + Er`,
@@ -3344,13 +3345,14 @@ mod component_transfer_tests {
 // ---------------------------------------------------------------------------
 
 /// Operator selector for [`composite_filter`], mirroring the `operator`
-/// attribute of SVG 1.1 §15.12 `<feComposite>`
-/// (`"over" | "in" | "out" | "atop" | "xor" | "arithmetic"`).
+/// attribute of SVG 1.1 §15.12 / Filter Effects 1 §9.8 `<feComposite>`
+/// (`"over" | "in" | "out" | "atop" | "xor" | "lighter" | "arithmetic"`).
 ///
-/// The five non-arithmetic operators are the Porter–Duff compositing
-/// operations referenced by §15.12. They are expressed here through the
-/// standard premultiplied-alpha blend-factor pair `(Fa, Fb)` so that the
-/// per-channel result is
+/// The six non-arithmetic operators are the Porter–Duff compositing
+/// operations referenced by §15.12 (`lighter` is the Filter-Effects-1
+/// §9.8 addition pulled in from Compositing-1). They are expressed here
+/// through the standard premultiplied-alpha blend-factor pair `(Fa, Fb)`
+/// so that the per-channel result is
 ///
 /// ```text
 /// co = ca · Fa + cb · Fb        (premultiplied colour)
@@ -3375,6 +3377,13 @@ pub enum CompositeOp {
     Atop,
     /// Symmetric difference. `Fa = 1 − αb`, `Fb = 1 − αa`.
     Xor,
+    /// Additive (`plus` / `lighter`, Filter-Effects-1 §9.8 →
+    /// Compositing-1). `Fa = 1`, `Fb = 1`: premultiplied source and
+    /// backdrop add directly, with the per-channel and alpha sums
+    /// clamped to `[0, 1]`. Equal to the arithmetic operator with
+    /// `k2 = k3 = 1` (and `k1 = k4 = 0`), so disjoint opaque regions
+    /// union and overlapping regions saturate toward white.
+    Lighter,
     /// Component-wise arithmetic combination
     /// `result = k1·i1·i2 + k2·i1 + k3·i2 + k4` (§15.12), evaluated on
     /// premultiplied channels in `[0, 1]` and clamped to `[0, 1]`.
@@ -3391,7 +3400,7 @@ pub enum CompositeOp {
 }
 
 impl CompositeOp {
-    /// The Porter–Duff `(Fa, Fb)` blend factors for the five
+    /// The Porter–Duff `(Fa, Fb)` blend factors for the six
     /// non-arithmetic operators, given the premultiplied alphas
     /// `αa` (= `in`) and `αb` (= `in2`), both in `[0, 1]`.
     ///
@@ -3405,6 +3414,7 @@ impl CompositeOp {
             CompositeOp::Out => (1.0 - alpha_b, 0.0),
             CompositeOp::Atop => (alpha_b, 1.0 - alpha_a),
             CompositeOp::Xor => (1.0 - alpha_b, 1.0 - alpha_a),
+            CompositeOp::Lighter => (1.0, 1.0),
             CompositeOp::Arithmetic { .. } => return None,
         })
     }
@@ -4558,6 +4568,33 @@ mod composite_tests {
         assert_eq!(&out[0..4], &[255, 0, 0, 255]);
         // Pixel 1: both opaque → αo = 1*0 + 1*0 = 0 → transparent.
         assert_eq!(out[7], 0);
+    }
+
+    #[test]
+    fn lighter_adds_premultiplied_channels() {
+        // operator="lighter": Fa = Fb = 1. Premultiplied source and
+        // backdrop add, clamped to [0,1]. Two half-alpha greys add to a
+        // full-alpha mid grey: αo = 0.5+0.5 = 1; premultiplied colour
+        // 0.5·c + 0.5·c, un-premultiplied by α=1, recovers c.
+        let a = build(1, 1, |_, _| Rgba::new(120, 120, 120, 128));
+        let b = build(1, 1, |_, _| Rgba::new(120, 120, 120, 128));
+        let out = composite_filter(&a, &b, 1, 1, CompositeOp::Lighter);
+        assert_eq!(out[3], 255, "alpha sums to opaque");
+        for (ch, &v) in out.iter().take(3).enumerate() {
+            assert!((v as i32 - 120).abs() <= 1, "ch{ch} = {v}");
+        }
+    }
+
+    #[test]
+    fn lighter_clamps_alpha_to_one() {
+        // Two opaque inputs: αo = 1 + 1 clamps to 1, never overflows.
+        let a = build(1, 1, |_, _| Rgba::new(200, 0, 0, 255));
+        let b = build(1, 1, |_, _| Rgba::new(0, 0, 200, 255));
+        let out = composite_filter(&a, &b, 1, 1, CompositeOp::Lighter);
+        assert_eq!(out[3], 255);
+        // Premultiplied add: red 200 + blue 200 in straight space (α=1).
+        assert_eq!(out[0], 200);
+        assert_eq!(out[2], 200);
     }
 
     #[test]

@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`feComposite` `lighter` operator (Filter Effects 1 §9.8).** The
+  `<feComposite>` operator set referenced by SVG 1.1 §15.12 is extended
+  by Filter-Effects-1 §9.8 with the additive Porter-Duff `lighter`
+  (`plus`) operator pulled in from Compositing-1. `CompositeOp::Lighter`
+  uses the blend-factor pair `Fa = Fb = 1`, so premultiplied source and
+  backdrop add directly with the per-channel and alpha sums clamped to
+  `[0, 1]`: disjoint opaque regions union, identical-colour overlap
+  saturates, and the result equals the `arithmetic` operator with
+  `k2 = k3 = 1`. Commutative by construction. New unit + integration
+  tests cover union/saturation, the arithmetic equivalence, and
+  commutativity.
+
 ### Changed
 
 - **Gradient stops LUT now interpolates between entries.** The 256-entry

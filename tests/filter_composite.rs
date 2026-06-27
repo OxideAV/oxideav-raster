@@ -89,6 +89,67 @@ fn arithmetic_average_of_two_opaque_inputs() {
 }
 
 #[test]
+fn lighter_unions_disjoint_opaque_and_saturates_overlap() {
+    // Filter-Effects-1 §9.8 `lighter`: Fa = Fb = 1 (premultiplied add,
+    // clamped). Disjoint coverage unions; overlapping colour saturates.
+    // Pixel 0: opaque red over transparent → red unchanged.
+    // Pixel 1: opaque red over opaque green → premultiplied sum
+    //          (255,0,0) + (0,255,0) = (255,255,0) at clamped α = 1.
+    // Pixel 2: opaque red over opaque red → (255,0,0)+(255,0,0) =
+    //          channel sum 2.0 clamped to 1.0 = (255,0,0).
+    let a = build(3, 1, |_, _| Rgba::new(255, 0, 0, 255));
+    let b = build(3, 1, |x, _| match x {
+        0 => Rgba::new(0, 0, 0, 0),
+        1 => Rgba::new(0, 255, 0, 255),
+        _ => Rgba::new(255, 0, 0, 255),
+    });
+    let out = composite_filter(&a, &b, 3, 1, CompositeOp::Lighter);
+    assert_eq!(&out[0..4], &[255, 0, 0, 255], "disjoint pixel");
+    assert_eq!(&out[4..8], &[255, 255, 0, 255], "overlap unions to yellow");
+    assert_eq!(&out[8..12], &[255, 0, 0, 255], "same colour saturates");
+}
+
+#[test]
+fn lighter_matches_arithmetic_k2_k3_one() {
+    // `lighter` is the arithmetic operator with k2 = k3 = 1 (k1 = k4 = 0)
+    // — both evaluate the premultiplied sum clamped to [0, 1] per channel.
+    let a = build(5, 4, |x, y| {
+        Rgba::new((x * 40) as u8, (y * 50) as u8, 90, ((x + y) * 25) as u8)
+    });
+    let b = build(5, 4, |x, y| {
+        Rgba::new(60, (y * 40) as u8, (x * 30) as u8, (180 - x * 18) as u8)
+    });
+    let lighter = composite_filter(&a, &b, 5, 4, CompositeOp::Lighter);
+    let arith = composite_filter(
+        &a,
+        &b,
+        5,
+        4,
+        CompositeOp::Arithmetic {
+            k1: 0.0,
+            k2: 1.0,
+            k3: 1.0,
+            k4: 0.0,
+        },
+    );
+    assert_eq!(lighter, arith);
+}
+
+#[test]
+fn lighter_is_commutative() {
+    // Addition commutes, so `a lighter b` == `b lighter a`.
+    let a = build(4, 4, |x, y| {
+        Rgba::new((x * 33) as u8, 70, (y * 44) as u8, ((x * y) * 11) as u8)
+    });
+    let b = build(4, 4, |x, y| {
+        Rgba::new(20, (x * 25) as u8, (y * 35) as u8, (120 + x * 10) as u8)
+    });
+    let ab = composite_filter(&a, &b, 4, 4, CompositeOp::Lighter);
+    let ba = composite_filter(&b, &a, 4, 4, CompositeOp::Lighter);
+    assert_eq!(ab, ba);
+}
+
+#[test]
 fn typed_and_byte_paths_agree_across_operators() {
     let a_b = build(6, 5, |x, y| {
         Rgba::new(
@@ -115,6 +176,7 @@ fn typed_and_byte_paths_agree_across_operators() {
         CompositeOp::Out,
         CompositeOp::Atop,
         CompositeOp::Xor,
+        CompositeOp::Lighter,
         CompositeOp::Arithmetic {
             k1: 0.3,
             k2: 0.4,
