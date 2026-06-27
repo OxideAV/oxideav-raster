@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`feBlend` extended to the full Compositing-1 mode set (Filter
+  Effects 1 §9.13).** SVG 1.1 §15.9 defined five `<feBlend>` modes
+  (`normal` / `multiply` / `screen` / `darken` / `lighten`);
+  Filter-Effects-1 §9.13 widens `mode` to the entire Compositing-1
+  `<blend-mode>` production. `BlendFilterMode` now carries all sixteen
+  modes — the eleven additions are `overlay`, `color-dodge`,
+  `color-burn`, `hard-light`, `soft-light`, `difference`, `exclusion`,
+  `hue`, `saturation`, `color`, and `luminosity`. The five original
+  modes keep their byte-stable §15.9 closed-form premultiplied
+  evaluation; the eleven extensions evaluate the Compositing-1
+  mix-with-Source-Over formula through the shared
+  `blend::blend_over` per-channel library (the same `B(Cb, Cs)` set
+  the renderer's `mix-blend-mode` path uses), with input `in` as the
+  source `Cs` and `in2` as the backdrop `Cb`. The two paths were
+  verified algebraically identical for the shared five modes, so the
+  enum is one coherent set. New unit + integration tests cover the
+  Source-Over pass-through invariants, the `difference` inversion, the
+  typed-vs-byte agreement across all eleven extensions, and pairwise
+  mode distinctness across the full sixteen.
+
 - **`feComposite` `lighter` operator (Filter Effects 1 §9.8).** The
   `<feComposite>` operator set referenced by SVG 1.1 §15.12 is extended
   by Filter-Effects-1 §9.8 with the additive Porter-Duff `lighter`

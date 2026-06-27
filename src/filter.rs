@@ -144,13 +144,17 @@
 //!   value; integer-nearest and bilinear reconstruction are both
 //!   available.
 //!
-//! * **Blend** — `feBlend` from SVG 1.1 §15.9. Per-pixel
-//!   combination of two equally-sized inputs through one of five
-//!   spec-listed modes (`normal` / `multiply` / `screen` /
-//!   `darken` / `lighten`). Result alpha is the shared
-//!   `qr = 1 − (1 − qa)·(1 − qb)` formula; the mode-specific
-//!   colour formulas operate on the premultiplied colour pair
-//!   `(ca, cb)` per the §15.9 table.
+//! * **Blend** — `feBlend` from SVG 1.1 §15.9 + Filter Effects 1
+//!   §9.13. Per-pixel combination of two equally-sized inputs through
+//!   one of sixteen modes: the five SVG 1.1 modes (`normal` /
+//!   `multiply` / `screen` / `darken` / `lighten`) plus the eleven
+//!   Compositing-1 modes added by §9.13 (`overlay` / `color-dodge` /
+//!   `color-burn` / `hard-light` / `soft-light` / `difference` /
+//!   `exclusion` / `hue` / `saturation` / `color` / `luminosity`).
+//!   Result alpha is the shared `qr = 1 − (1 − qa)·(1 − qb)` formula;
+//!   the five original modes use the §15.9 premultiplied colour
+//!   formulas, the eleven extensions the Compositing-1 mix-with-Source-
+//!   Over evaluation with `in` as the source and `in2` the backdrop.
 //!
 //! * **Diffuse lighting** — `feDiffuseLighting` from SVG 1.1
 //!   §15.14. Phong-diffuse Sobel-normal bump-map illumination
@@ -7911,13 +7915,30 @@ mod displacement_map_tests {
 }
 
 // ----------------------------------------------------------------------
-// SVG 1.1 §15.9 `<feBlend>` — five-mode pixel-wise blend of two inputs.
+// `<feBlend>` — pixel-wise blend of two inputs. SVG 1.1 §15.9 five-mode
+// set + Filter Effects 1 §9.13 eleven-mode Compositing-1 extension.
 // ----------------------------------------------------------------------
 
-/// Mode selector for [`blend_filter`], mirroring the `mode` attribute
-/// of SVG 1.1 §15.9 `<feBlend>` (`"normal" | "multiply" | "screen" |
-/// "darken" | "lighten"`). The §15.9 attribute table gives `Normal` as
-/// the default.
+/// Mode selector for [`blend_filter`], the `mode` attribute of
+/// `<feBlend>`.
+///
+/// SVG 1.1 §15.9 defined five modes (`normal` / `multiply` / `screen` /
+/// `darken` / `lighten`) through closed-form premultiplied colour
+/// formulas. Filter Effects 1 §9.13 widens `mode` to the full
+/// `<blend-mode>` production of Compositing-1 — sixteen modes in total,
+/// with the first input (`in`) acting as the source `Cs` and the second
+/// input (`in2`) as the backdrop `Cb`, the blend then combined with the
+/// Source Over compositing operator.
+///
+/// The five original modes retain their byte-stable §15.9 closed-form
+/// evaluation; the eleven added modes evaluate the Compositing-1
+/// "mixing with compositing" formula via [`crate::blend::blend_over`]
+/// (the same per-channel `B(Cb, Cs)` library that backs the renderer's
+/// `mix-blend-mode` path). The two paths are algebraically identical for
+/// the shared five modes (`B = Cs`, `Cb·Cs`, screen, darken, lighten),
+/// so the enum is one coherent set rather than two dialects.
+///
+/// The §15.9 / §9.13 attribute tables give `Normal` as the default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BlendFilterMode {
     /// `cr = (1 − qa) · cb + ca`. §15.9 notes that this is the
@@ -7942,17 +7963,92 @@ pub enum BlendFilterMode {
     /// component-wise larger of the two source-over orderings, per
     /// the §15.9 table.
     Lighten,
+    /// Filter Effects 1 §9.13 / Compositing-1 `overlay`:
+    /// `HardLight(Cs, Cb)` — multiply for dark backdrops, screen for
+    /// light backdrops.
+    Overlay,
+    /// §9.13 / Compositing-1 `color-dodge`: brightens the backdrop to
+    /// reflect the source.
+    ColorDodge,
+    /// §9.13 / Compositing-1 `color-burn`: darkens the backdrop to
+    /// reflect the source.
+    ColorBurn,
+    /// §9.13 / Compositing-1 `hard-light`: multiply / screen switched on
+    /// the source — like a harsh spotlight.
+    HardLight,
+    /// §9.13 / Compositing-1 `soft-light`: a gentler `overlay` using the
+    /// polynomial-vs-sqrt `D(Cb)` switch.
+    SoftLight,
+    /// §9.13 / Compositing-1 `difference`: `|Cb − Cs|`.
+    Difference,
+    /// §9.13 / Compositing-1 `exclusion`: `Cb + Cs − 2·Cb·Cs`.
+    Exclusion,
+    /// §9.13 / Compositing-1 non-separable `hue`: source hue with
+    /// backdrop saturation + luminosity.
+    Hue,
+    /// §9.13 / Compositing-1 non-separable `saturation`: source
+    /// saturation with backdrop hue + luminosity.
+    Saturation,
+    /// §9.13 / Compositing-1 non-separable `color`: source hue +
+    /// saturation with backdrop luminosity.
+    Color,
+    /// §9.13 / Compositing-1 non-separable `luminosity`: source
+    /// luminosity with backdrop hue + saturation.
+    Luminosity,
 }
 
-/// SVG 1.1 §15.9 `<feBlend>` — combine two equally-sized packed-RGBA
-/// `u8` buffers pixel-wise through one of the five [`BlendFilterMode`]
-/// modes.
+impl BlendFilterMode {
+    /// For the eleven Filter-Effects-1 §9.13 extended modes, the
+    /// corresponding [`crate::blend::BlendMode`] used to evaluate the
+    /// Compositing-1 "mixing with compositing" formula via
+    /// [`crate::blend::blend_over`].
+    ///
+    /// Returns `None` for the five SVG 1.1 §15.9 modes, which keep their
+    /// byte-stable closed-form premultiplied evaluation in
+    /// [`blend_filter`]. (Those five are algebraically identical to the
+    /// `blend_over` path; the closed form is retained only to preserve
+    /// exact historical output bytes.)
+    #[inline]
+    fn extended_core_mode(self) -> Option<crate::blend::BlendMode> {
+        use crate::blend::BlendMode as B;
+        Some(match self {
+            BlendFilterMode::Normal
+            | BlendFilterMode::Multiply
+            | BlendFilterMode::Screen
+            | BlendFilterMode::Darken
+            | BlendFilterMode::Lighten => return None,
+            BlendFilterMode::Overlay => B::Overlay,
+            BlendFilterMode::ColorDodge => B::ColorDodge,
+            BlendFilterMode::ColorBurn => B::ColorBurn,
+            BlendFilterMode::HardLight => B::HardLight,
+            BlendFilterMode::SoftLight => B::SoftLight,
+            BlendFilterMode::Difference => B::Difference,
+            BlendFilterMode::Exclusion => B::Exclusion,
+            BlendFilterMode::Hue => B::Hue,
+            BlendFilterMode::Saturation => B::Saturation,
+            BlendFilterMode::Color => B::Color,
+            BlendFilterMode::Luminosity => B::Luminosity,
+        })
+    }
+}
+
+/// `<feBlend>` — combine two equally-sized packed-RGBA `u8` buffers
+/// pixel-wise through one of the sixteen [`BlendFilterMode`] modes
+/// (SVG 1.1 §15.9 five-mode set + Filter Effects 1 §9.13 eleven-mode
+/// Compositing-1 extension).
 ///
-/// `in1` maps to the spec's `in` operand (the `a` / `qa` / `ca`
-/// quantities in the §15.9 formulas) and `in2` maps to the `in2`
-/// operand (the `b` / `qb` / `cb` quantities). Both buffers must be
-/// exactly `width * height * 4` bytes in row-major straight-alpha RGBA
-/// order and describe the same `width × height` extent.
+/// `in1` maps to the spec's `in` operand (the source `Cs`; the
+/// `a` / `qa` / `ca` quantities in the §15.9 formulas) and `in2` maps to
+/// the `in2` operand (the backdrop `Cb`; the `b` / `qb` / `cb`
+/// quantities). Both buffers must be exactly `width * height * 4` bytes
+/// in row-major straight-alpha RGBA order and describe the same
+/// `width × height` extent.
+///
+/// The five SVG 1.1 modes evaluate the §15.9 closed-form premultiplied
+/// colour formulas below; the eleven Filter-Effects-1 §9.13 modes
+/// evaluate the Compositing-1 mix-with-Source-Over formula via
+/// [`crate::blend::blend_over`]. The result-alpha formula
+/// `qr = 1 − (1 − qa)·(1 − qb)` is shared by both paths.
 ///
 /// **Result alpha.** §15.9 specifies that *every* mode produces the
 /// same result opacity
@@ -8015,6 +8111,23 @@ pub fn blend_filter(
         return Vec::new();
     }
 
+    // Filter-Effects-1 §9.13 extended modes evaluate the Compositing-1
+    // "mixing with compositing" formula through `blend_over`, with the
+    // first input (`in`) as the source `Cs` and the second (`in2`) as
+    // the backdrop `Cb`. This is algebraically identical to the §15.9
+    // closed form for the shared five modes, so only the eleven added
+    // modes take this branch.
+    if let Some(core_mode) = mode.extended_core_mode() {
+        let mut out = Vec::with_capacity(expected);
+        for (pa, pb) in in1.chunks_exact(4).zip(in2.chunks_exact(4)) {
+            let cs = Rgba::new(pa[0], pa[1], pa[2], pa[3]);
+            let cb = Rgba::new(pb[0], pb[1], pb[2], pb[3]);
+            let r = crate::blend::blend_over(cb, cs, core_mode);
+            out.extend_from_slice(&[r.r, r.g, r.b, r.a]);
+        }
+        return out;
+    }
+
     let mut out = Vec::with_capacity(expected);
     for (pa, pb) in in1.chunks_exact(4).zip(in2.chunks_exact(4)) {
         // Straight-alpha bytes → premultiplied `[0, 1]` floats. §15.9
@@ -8062,6 +8175,10 @@ pub fn blend_filter(
                     let rhs = (1.0 - qb) * a + b;
                     lhs.max(rhs)
                 }
+                // The eleven Filter-Effects-1 §9.13 extended modes are
+                // handled by the early-return `blend_over` branch above
+                // and never reach this closed-form loop.
+                _ => unreachable!("extended blend mode handled above"),
             };
         }
 
@@ -8138,20 +8255,104 @@ mod blend_filter_tests {
         v
     }
 
+    const ALL_MODES: [BlendFilterMode; 16] = [
+        BlendFilterMode::Normal,
+        BlendFilterMode::Multiply,
+        BlendFilterMode::Screen,
+        BlendFilterMode::Darken,
+        BlendFilterMode::Lighten,
+        BlendFilterMode::Overlay,
+        BlendFilterMode::ColorDodge,
+        BlendFilterMode::ColorBurn,
+        BlendFilterMode::HardLight,
+        BlendFilterMode::SoftLight,
+        BlendFilterMode::Difference,
+        BlendFilterMode::Exclusion,
+        BlendFilterMode::Hue,
+        BlendFilterMode::Saturation,
+        BlendFilterMode::Color,
+        BlendFilterMode::Luminosity,
+    ];
+
     #[test]
     fn fully_transparent_inputs_produce_transparent_black() {
         // `qa = qb = 0` ⇒ `qr = 0`, so the §15.7.3 transparent-black
-        // rule kicks in regardless of which mode is selected.
+        // rule kicks in regardless of which of the sixteen modes is
+        // selected (both the §15.9 closed form and the §9.13
+        // `blend_over` path return transparent black on zero alpha).
         let zero = flat(3, 3, 200, 50, 100, 0);
-        for mode in [
-            BlendFilterMode::Normal,
-            BlendFilterMode::Multiply,
-            BlendFilterMode::Screen,
-            BlendFilterMode::Darken,
-            BlendFilterMode::Lighten,
-        ] {
+        for mode in ALL_MODES {
             let out = blend_filter(&zero, &zero, 3, 3, mode);
             assert!(out.iter().all(|&b| b == 0), "mode {mode:?} not fully zero");
+        }
+    }
+
+    #[test]
+    fn extended_modes_opaque_src_over_transparent_passes_src() {
+        // With an opaque source (`in`) over a fully transparent backdrop
+        // (`in2`), every blend mode reduces to the source colour: the
+        // backdrop contributes nothing and source-over keeps `Cs`.
+        let src = flat(2, 2, 180, 60, 240, 255);
+        let dst = flat(2, 2, 10, 20, 30, 0);
+        for mode in ALL_MODES {
+            let out = blend_filter(&src, &dst, 2, 2, mode);
+            assert_eq!(out, src, "mode {mode:?} did not pass opaque source");
+        }
+    }
+
+    #[test]
+    fn extended_modes_opaque_dst_under_transparent_keeps_dst() {
+        // Transparent source over an opaque backdrop keeps the backdrop
+        // unchanged for every mode (αs = 0 ⇒ the blend term vanishes).
+        let src = flat(2, 2, 180, 60, 240, 0);
+        let dst = flat(2, 2, 12, 34, 56, 255);
+        for mode in ALL_MODES {
+            let out = blend_filter(&src, &dst, 2, 2, mode);
+            assert_eq!(out, dst, "mode {mode:?} disturbed the backdrop");
+        }
+    }
+
+    #[test]
+    fn difference_of_white_over_colour_inverts() {
+        // `difference` B = |Cb − Cs|. Opaque white source over opaque
+        // colour backdrop inverts the backdrop: |Cb − 1| = 1 − Cb.
+        let src = flat(1, 1, 255, 255, 255, 255);
+        let dst = flat(1, 1, 40, 90, 200, 255);
+        let out = blend_filter(&src, &dst, 1, 1, BlendFilterMode::Difference);
+        assert_eq!(out[0], 255 - 40);
+        assert_eq!(out[1], 255 - 90);
+        assert_eq!(out[2], 255 - 200);
+        assert_eq!(out[3], 255);
+    }
+
+    #[test]
+    fn multiply_extended_matches_svg11_closed_form() {
+        // The §9.13 path is only taken for the eleven added modes; the
+        // five shared modes still use the §15.9 closed form. Confirm
+        // `Multiply` (a shared mode) is byte-identical to evaluating the
+        // same math through `blend_over` — i.e. the two dialects agree.
+        let src: Vec<Rgba> = (0..16)
+            .map(|i| Rgba::new((i * 15) as u8, 80, 200, (40 + i * 12) as u8))
+            .collect();
+        let dst: Vec<Rgba> = (0..16)
+            .map(|i| Rgba::new(50, (i * 14) as u8, (i * 9) as u8, (255 - i * 10) as u8))
+            .collect();
+        let closed = blend_filter_pixels(&src, &dst, 4, 4, BlendFilterMode::Multiply);
+        let via_over: Vec<Rgba> = src
+            .iter()
+            .zip(&dst)
+            .map(|(s, d)| crate::blend::blend_over(*d, *s, crate::blend::BlendMode::Multiply))
+            .collect();
+        for (i, (a, b)) in closed.iter().zip(&via_over).enumerate() {
+            // Allow ±1 LSB: the closed form rounds in premultiplied
+            // space, `blend_over` in straight space.
+            assert!(
+                (a.r as i32 - b.r as i32).abs() <= 1
+                    && (a.g as i32 - b.g as i32).abs() <= 1
+                    && (a.b as i32 - b.b as i32).abs() <= 1
+                    && (a.a as i32 - b.a as i32).abs() <= 1,
+                "pixel {i}: {a:?} vs {b:?}"
+            );
         }
     }
 

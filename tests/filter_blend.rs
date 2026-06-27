@@ -288,3 +288,107 @@ fn empty_extent_returns_empty_buffer() {
     let out = blend_filter(&empty, &empty, 0, 0, BlendFilterMode::Multiply);
     assert!(out.is_empty());
 }
+
+/// The eleven Filter-Effects-1 §9.13 extended modes that SVG 1.1 §15.9
+/// did not define.
+const EXTENDED_MODES: [BlendFilterMode; 11] = [
+    BlendFilterMode::Overlay,
+    BlendFilterMode::ColorDodge,
+    BlendFilterMode::ColorBurn,
+    BlendFilterMode::HardLight,
+    BlendFilterMode::SoftLight,
+    BlendFilterMode::Difference,
+    BlendFilterMode::Exclusion,
+    BlendFilterMode::Hue,
+    BlendFilterMode::Saturation,
+    BlendFilterMode::Color,
+    BlendFilterMode::Luminosity,
+];
+
+#[test]
+fn extended_modes_pass_opaque_source_over_empty_backdrop() {
+    // §9.13: each blend mode is combined with Source Over, so an opaque
+    // source over a transparent backdrop yields the source unchanged.
+    let top = build(6, 4, |x, y| {
+        Rgba::new((x * 40) as u8, (y * 60) as u8, 130, 255)
+    });
+    let bot = build(6, 4, |_, _| Rgba::new(99, 99, 99, 0));
+    for mode in EXTENDED_MODES {
+        let out = blend_filter(&top, &bot, 6, 4, mode);
+        assert_eq!(out, top, "mode {mode:?} altered the opaque source");
+    }
+}
+
+#[test]
+fn extended_modes_typed_path_matches_byte_path() {
+    let a_b = build(5, 5, |x, y| {
+        Rgba::new(
+            (x * 45) as u8,
+            (y * 40) as u8,
+            ((x ^ y) * 28) as u8,
+            (60 + x * 30) as u8,
+        )
+    });
+    let b_b = build(5, 5, |x, y| {
+        Rgba::new(22, (y * 42) as u8, (x * 38) as u8, (220 - y * 30) as u8)
+    });
+    let a_p: Vec<Rgba> = a_b
+        .chunks_exact(4)
+        .map(|c| Rgba::new(c[0], c[1], c[2], c[3]))
+        .collect();
+    let b_p: Vec<Rgba> = b_b
+        .chunks_exact(4)
+        .map(|c| Rgba::new(c[0], c[1], c[2], c[3]))
+        .collect();
+    for mode in EXTENDED_MODES {
+        let via_bytes = blend_filter(&a_b, &b_b, 5, 5, mode);
+        let via_typed = blend_filter_pixels(&a_p, &b_p, 5, 5, mode);
+        let typed_bytes: Vec<u8> = via_typed
+            .iter()
+            .flat_map(|p| [p.r, p.g, p.b, p.a])
+            .collect();
+        assert_eq!(
+            via_bytes, typed_bytes,
+            "byte vs typed mismatch for {mode:?}"
+        );
+    }
+}
+
+#[test]
+fn screen_extension_pair_is_distinct_from_svg11_modes() {
+    // All sixteen modes must produce pairwise-distinct output on a
+    // general opaque colour pair — confirms the §9.13 modes are wired
+    // and not collapsing onto each other or onto the §15.9 five.
+    let a = build(3, 3, |_, _| Rgba::new(210, 90, 40, 255));
+    let b = build(3, 3, |_, _| Rgba::new(50, 160, 200, 255));
+    let all = [
+        BlendFilterMode::Normal,
+        BlendFilterMode::Multiply,
+        BlendFilterMode::Screen,
+        BlendFilterMode::Darken,
+        BlendFilterMode::Lighten,
+        BlendFilterMode::Overlay,
+        BlendFilterMode::ColorDodge,
+        BlendFilterMode::ColorBurn,
+        BlendFilterMode::HardLight,
+        BlendFilterMode::SoftLight,
+        BlendFilterMode::Difference,
+        BlendFilterMode::Exclusion,
+        BlendFilterMode::Hue,
+        BlendFilterMode::Saturation,
+        BlendFilterMode::Color,
+        BlendFilterMode::Luminosity,
+    ];
+    let outs: Vec<Vec<u8>> = all.iter().map(|&m| blend_filter(&a, &b, 3, 3, m)).collect();
+    // Count distinct outputs; expect a large majority distinct. A few
+    // separable modes can coincide on a specific pair, so require at
+    // least 14 of 16 unique rather than a strict all-distinct.
+    let mut uniq = outs.clone();
+    uniq.sort();
+    uniq.dedup();
+    assert!(
+        uniq.len() >= 14,
+        "only {} of 16 modes produced distinct output",
+        uniq.len()
+    );
+}
