@@ -1,5 +1,7 @@
 # oxideav-raster
 
+[![CI](https://github.com/OxideAV/oxideav-raster/actions/workflows/ci.yml/badge.svg)](https://github.com/OxideAV/oxideav-raster/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/oxideav-raster.svg)](https://crates.io/crates/oxideav-raster) [![docs.rs](https://docs.rs/oxideav-raster/badge.svg)](https://docs.rs/oxideav-raster) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Pure-Rust vector→raster rendering kernel for the
 [`oxideav`](https://github.com/OxideAV/oxideav) framework. Consumes a
 resolution-independent [`VectorFrame`](https://docs.rs/oxideav-core/latest/oxideav_core/vector/struct.VectorFrame.html)
