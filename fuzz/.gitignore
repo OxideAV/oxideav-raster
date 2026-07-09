@@ -4,6 +4,9 @@ coverage
 fuzz-*.log
 
 # libfuzzer-generated corpus entries (40-hex-named) are machine output
-# and regrow on every run; only the curated, human-named seeds are
-# tracked (they were `git add`-ed before this ignore and stay tracked).
-corpus/
+# and regrow on every run; only the curated, human-named `.txt` seeds
+# are tracked. The pattern must NOT ignore the tracked seeds themselves:
+# release-plz refuses to run when a file is both committed and ignored,
+# so ignore per-file and re-include the seed extension.
+corpus/*/*
+!corpus/*/*.txt
