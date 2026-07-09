@@ -2026,7 +2026,9 @@ fn box_sizes_for_std(std: f32) -> [BoxKind; 3] {
         [
             BoxKind::OffsetLeft(d),
             BoxKind::OffsetRight(d),
-            BoxKind::Centered(d + 1),
+            // `saturating_add` guards the hostile-`std` regime where
+            // the f32→u32 cast above already saturated `d`.
+            BoxKind::Centered(d.saturating_add(1)),
         ]
     }
 }
@@ -2062,13 +2064,15 @@ fn box_blur_three_pass(
     }
 }
 
-/// Run one box-blur pass along `axis` on the packed-RGBA buffer using
-/// a rolling-sum O(W·H) per pass (per channel). Boundary handling
-/// follows `edge` ([`ConvolveEdgeMode`]): out-of-line samples are the
-/// duplicated edge pixel, the opposite-edge pixel (wrap), or zero
-/// (none). The window width stays a fixed `n` samples in every mode, so
-/// the divisor is always `n` and `none`-mode edge windows average the
-/// in-range pixels against the implicit zero border.
+/// Run one box-blur pass along `axis` on the packed-RGBA buffer in
+/// O(W·H) per pass — **independent of the window width** — by reading
+/// each fixed-width window sum out of a per-line prefix-sum table.
+/// Boundary handling follows `edge` ([`ConvolveEdgeMode`]): out-of-line
+/// samples are the duplicated edge pixel, the opposite-edge pixel
+/// (wrap), or zero (none). The window width stays a fixed `n` samples
+/// in every mode, so the divisor is always `n` and `none`-mode edge
+/// windows average the in-range pixels against the implicit zero
+/// border.
 fn box_blur_pass(
     buf: &mut [u8],
     w: usize,
@@ -2103,6 +2107,14 @@ fn box_blur_pass(
     };
     let mut line_in = vec![0u8; primary * 4];
     let mut line_out = vec![0u8; primary * 4];
+    // Per-line exclusive prefix sums: `prefix[i][c]` is the sum of
+    // channel `c` over `line_in[0..i]`. Every edge-mode arm below reads
+    // window sums out of this table in O(1) *independent of the window
+    // width `n`*, so a hostile `stdDeviation` (whose derived box width
+    // saturates at `u32::MAX`) costs the same as a small one. `u64`
+    // accumulators cannot overflow: `255 · n` fits for any `n` this
+    // function can see.
+    let mut prefix = vec![[0u64; 4]; primary + 1];
     let imax = primary as isize - 1;
     let inv_n = 1.0f32 / n as f32;
     for s in 0..secondary {
@@ -2114,71 +2126,96 @@ fn box_blur_pass(
             let off = start + i * stride;
             line_in[i * 4..i * 4 + 4].copy_from_slice(&buf[off..off + 4]);
         }
+        for i in 0..primary {
+            let p = &line_in[i * 4..i * 4 + 4];
+            for c in 0..4 {
+                prefix[i + 1][c] = prefix[i][c] + p[c] as u64;
+            }
+        }
+        // Sum over in-range indices `[a, b)`, per channel.
+        let range_sum = |a: usize, b: usize| -> [u64; 4] {
+            [
+                prefix[b][0] - prefix[a][0],
+                prefix[b][1] - prefix[a][1],
+                prefix[b][2] - prefix[a][2],
+                prefix[b][3] - prefix[a][3],
+            ]
+        };
 
         match edge {
             ConvolveEdgeMode::Duplicate => {
-                // Rolling sum: prime the accumulator with the window at
-                // i=0, then for each subsequent i add the new right edge
-                // and subtract the old left edge. Clamp-to-edge means
-                // out-of-line indices reuse 0 / imax, so the window
-                // always holds exactly `n` (possibly duplicated)
-                // samples. Byte-identical to the prior behaviour.
-                let mut acc = [0u32; 4];
-                for k_off in lo_off..=hi_off {
-                    let pi = k_off.clamp(0, imax) as usize;
-                    let p = &line_in[pi * 4..pi * 4 + 4];
-                    acc[0] += p[0] as u32;
-                    acc[1] += p[1] as u32;
-                    acc[2] += p[2] as u32;
-                    acc[3] += p[3] as u32;
-                }
-
+                // Clamp-to-edge: the window at `i` covers logical
+                // indices `[i + lo_off, i + hi_off]`; indices below 0
+                // read `line[0]`, indices above `imax` read
+                // `line[imax]`. Counting the clamped duplicates and
+                // reading the interior from the prefix table gives the
+                // exact fixed-width-`n` sum without iterating the
+                // window — the same value the historical rolling-sum
+                // computed, for any `n`.
+                let p0 = &line_in[..4];
+                let pm = &line_in[imax as usize * 4..imax as usize * 4 + 4];
                 for i in 0..primary {
+                    let lo = i as isize + lo_off;
+                    let hi = i as isize + hi_off;
+                    // Window samples clamped to line[0]: the k ∈
+                    // [lo, hi] with k < 0. Clamped to line[imax]: the
+                    // k with k > imax.
+                    let cnt_lo = (hi.min(-1) - lo + 1).max(0) as u64;
+                    let cnt_hi = (hi - lo.max(imax + 1) + 1).max(0) as u64;
+                    let a = lo.clamp(0, imax + 1) as usize;
+                    let b = (hi + 1).clamp(0, imax + 1) as usize;
+                    let interior = range_sum(a, b.max(a));
                     let off = i * 4;
-                    line_out[off] = (acc[0] as f32 * inv_n + 0.5) as u8;
-                    line_out[off + 1] = (acc[1] as f32 * inv_n + 0.5) as u8;
-                    line_out[off + 2] = (acc[2] as f32 * inv_n + 0.5) as u8;
-                    line_out[off + 3] = (acc[3] as f32 * inv_n + 0.5) as u8;
-
-                    if i + 1 < primary {
-                        let next_i = (i + 1) as isize;
-                        let in_idx = (next_i + hi_off).clamp(0, imax) as usize;
-                        let out_idx = (next_i + lo_off - 1).clamp(0, imax) as usize;
-                        let p_in = &line_in[in_idx * 4..in_idx * 4 + 4];
-                        let p_out = &line_in[out_idx * 4..out_idx * 4 + 4];
-                        acc[0] = acc[0] + p_in[0] as u32 - p_out[0] as u32;
-                        acc[1] = acc[1] + p_in[1] as u32 - p_out[1] as u32;
-                        acc[2] = acc[2] + p_in[2] as u32 - p_out[2] as u32;
-                        acc[3] = acc[3] + p_in[3] as u32 - p_out[3] as u32;
+                    for c in 0..4 {
+                        let acc = interior[c] + cnt_lo * p0[c] as u64 + cnt_hi * pm[c] as u64;
+                        line_out[off + c] = (acc as f32 * inv_n + 0.5) as u8;
                     }
                 }
             }
-            ConvolveEdgeMode::Wrap | ConvolveEdgeMode::None => {
-                // The rolling-sum subtract/add trick assumes the leaving
-                // and entering samples can be read back exactly; under
-                // `wrap` the window indices are non-monotone and under
-                // `none` they may be absent, so we sum each fixed-width
-                // window directly. The divisor stays `n` (a `none`
-                // out-of-line sample contributes 0 value but still
-                // counts toward the fixed window width, exactly like a
-                // zero-padded border pixel).
+            ConvolveEdgeMode::Wrap => {
+                // Toroidal addressing: `n` consecutive logical indices
+                // hit every residue class `⌊n / primary⌋` times, plus
+                // one extra visit for the `n mod primary` residues
+                // starting at `(i + lo_off) mod primary`. Whole cycles
+                // read the full-line sum; the partial run splits into
+                // at most two prefix ranges.
+                let full = (n / primary) as u64;
+                let rem = n % primary;
+                let total = range_sum(0, primary);
                 for i in 0..primary {
-                    let mut acc = [0u32; 4];
-                    let base = i as isize;
-                    for k_off in lo_off..=hi_off {
-                        if let Some(pi) = resolve_line_index(base + k_off, primary, edge) {
-                            let p = &line_in[pi * 4..pi * 4 + 4];
-                            acc[0] += p[0] as u32;
-                            acc[1] += p[1] as u32;
-                            acc[2] += p[2] as u32;
-                            acc[3] += p[3] as u32;
-                        }
-                    }
+                    let start_res = (i as isize + lo_off).rem_euclid(primary as isize) as usize;
+                    let partial = if start_res + rem <= primary {
+                        range_sum(start_res, start_res + rem)
+                    } else {
+                        let head = range_sum(start_res, primary);
+                        let tail = range_sum(0, start_res + rem - primary);
+                        [
+                            head[0] + tail[0],
+                            head[1] + tail[1],
+                            head[2] + tail[2],
+                            head[3] + tail[3],
+                        ]
+                    };
                     let off = i * 4;
-                    line_out[off] = (acc[0] as f32 * inv_n + 0.5) as u8;
-                    line_out[off + 1] = (acc[1] as f32 * inv_n + 0.5) as u8;
-                    line_out[off + 2] = (acc[2] as f32 * inv_n + 0.5) as u8;
-                    line_out[off + 3] = (acc[3] as f32 * inv_n + 0.5) as u8;
+                    for c in 0..4 {
+                        let acc = full * total[c] + partial[c];
+                        line_out[off + c] = (acc as f32 * inv_n + 0.5) as u8;
+                    }
+                }
+            }
+            ConvolveEdgeMode::None => {
+                // Zero border: only the in-range part of the window
+                // contributes value, but the divisor stays the fixed
+                // window width `n` (an out-of-line sample counts as a
+                // zero-valued border pixel).
+                for i in 0..primary {
+                    let a = (i as isize + lo_off).clamp(0, imax + 1) as usize;
+                    let b = (i as isize + hi_off + 1).clamp(0, imax + 1) as usize;
+                    let acc = range_sum(a, b.max(a));
+                    let off = i * 4;
+                    for c in 0..4 {
+                        line_out[off + c] = (acc[c] as f32 * inv_n + 0.5) as u8;
+                    }
                 }
             }
         }
@@ -2200,6 +2237,144 @@ mod gaussian_blur_tests {
             v.extend_from_slice(&[c.r, c.g, c.b, c.a]);
         }
         v
+    }
+
+    /// Reference box pass: sums each window sample by sample through
+    /// [`resolve_line_index`] — the direct transcription of the
+    /// fixed-width-window definition, O(n) per pixel. The production
+    /// [`box_blur_pass`] must match it byte for byte.
+    fn naive_box_pass(
+        buf: &mut [u8],
+        w: usize,
+        h: usize,
+        kind: BoxKind,
+        axis: Axis,
+        edge: ConvolveEdgeMode,
+    ) {
+        let (n, lo_off, hi_off) = match kind {
+            BoxKind::Centered(n) => {
+                let half = (n / 2) as isize;
+                (n as usize, -half, half)
+            }
+            BoxKind::OffsetLeft(n) => {
+                let half = (n / 2) as isize;
+                (n as usize, -half, half - 1)
+            }
+            BoxKind::OffsetRight(n) => {
+                let half = (n / 2) as isize;
+                (n as usize, -half + 1, half)
+            }
+        };
+        let (stride, primary, secondary) = match axis {
+            Axis::X => (4usize, w, h),
+            Axis::Y => (w * 4, h, w),
+        };
+        let inv_n = 1.0f32 / n as f32;
+        let mut line_in = vec![0u8; primary * 4];
+        let mut line_out = vec![0u8; primary * 4];
+        for s in 0..secondary {
+            let start = match axis {
+                Axis::X => s * w * 4,
+                Axis::Y => s * 4,
+            };
+            for i in 0..primary {
+                let off = start + i * stride;
+                line_in[i * 4..i * 4 + 4].copy_from_slice(&buf[off..off + 4]);
+            }
+            for i in 0..primary {
+                let mut acc = [0u64; 4];
+                for k_off in lo_off..=hi_off {
+                    if let Some(pi) = resolve_line_index(i as isize + k_off, primary, edge) {
+                        let p = &line_in[pi * 4..pi * 4 + 4];
+                        for c in 0..4 {
+                            acc[c] += p[c] as u64;
+                        }
+                    }
+                }
+                for c in 0..4 {
+                    line_out[i * 4 + c] = (acc[c] as f32 * inv_n + 0.5) as u8;
+                }
+            }
+            for i in 0..primary {
+                let off = start + i * stride;
+                buf[off..off + 4].copy_from_slice(&line_out[i * 4..i * 4 + 4]);
+            }
+        }
+    }
+
+    #[test]
+    fn prefix_sum_box_pass_matches_naive_reference_exactly() {
+        // Deterministic LCG image, all three edge modes, all three
+        // window kinds, window widths from smaller-than-line through
+        // several-times-the-line (the wrap full-cycle + partial-run
+        // paths and the duplicate all-clamped paths all get hit).
+        let (w, h) = (13u32, 7u32);
+        let mut state = 0x9E3779B9_u64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as u8
+        };
+        let src: Vec<u8> = (0..w * h * 4).map(|_| next()).collect();
+
+        for edge in [
+            ConvolveEdgeMode::Duplicate,
+            ConvolveEdgeMode::Wrap,
+            ConvolveEdgeMode::None,
+        ] {
+            // Centered boxes are odd-width, offset boxes even-width
+            // (the box_sizes_for_std invariant); widths run from
+            // smaller-than-line to several-times-the-line.
+            let kinds: Vec<BoxKind> = [3u32, 5, 13, 27, 97]
+                .iter()
+                .map(|&n| BoxKind::Centered(n))
+                .chain(
+                    [2u32, 4, 8, 14, 40]
+                        .iter()
+                        .flat_map(|&n| [BoxKind::OffsetLeft(n), BoxKind::OffsetRight(n)]),
+                )
+                .collect();
+            {
+                for kind in kinds {
+                    for axis in [Axis::X, Axis::Y] {
+                        let mut fast = src.clone();
+                        box_blur_pass(&mut fast, w as usize, h as usize, kind, axis, edge);
+                        let mut slow = src.clone();
+                        naive_box_pass(&mut slow, w as usize, h as usize, kind, axis, edge);
+                        assert_eq!(
+                            fast, slow,
+                            "prefix-sum pass diverged: {edge:?} {kind:?} {axis:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hostile_stddev_terminates_and_stays_in_gamut() {
+        // A stdDeviation of 1e30 derives a box width that saturates at
+        // u32::MAX. Before the prefix-sum rewrite this hung (the
+        // window-priming loop was O(n)) and overflowed the u32
+        // accumulator past n ≈ 16.8M; now it costs the same as a small
+        // width. A solid image must also stay solid under
+        // clamp-to-edge, whatever the width.
+        let img = solid(16, 12, Rgba::new(80, 120, 200, 255));
+        for edge in [
+            ConvolveEdgeMode::Duplicate,
+            ConvolveEdgeMode::Wrap,
+            ConvolveEdgeMode::None,
+        ] {
+            let out = gaussian_blur_edge(&img, 16, 12, 1e30, 1e30, edge);
+            assert_eq!(out.len(), img.len());
+            if edge == ConvolveEdgeMode::Duplicate {
+                assert_eq!(out, img, "solid image must survive clamp-to-edge");
+            }
+        }
+        // The u32-overflow regime (16.8M < n < u32::MAX) specifically.
+        let out = gaussian_blur_edge(&img, 16, 12, 2e7, 0.0, ConvolveEdgeMode::Duplicate);
+        assert_eq!(out, img);
     }
 
     #[test]

@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Hostile `stdDeviation` hardening: box-blur passes are now O(1) in
+  the window width (prefix sums), byte-exact.** The three-box Gaussian
+  approximation derived its box width `d` from `stdDeviation`
+  saturating at `u32::MAX`; the clamp-to-edge arm primed its rolling
+  sum with an O(d) loop, the wrap / none arm summed O(d) **per
+  pixel**, and the `u32` accumulator overflowed past `d ≈ 16.8M` — so
+  a parsed `blur(1e30px)` was an effective hang. Each edge-mode arm
+  now reads its fixed-width window sum out of a per-line `u64` prefix
+  table: clamp-to-edge counts the duplicated border samples in closed
+  form, wrap decomposes the window into whole-line cycles plus at most
+  two prefix ranges, and none takes the in-range prefix slice. Proven
+  byte-identical to a direct per-sample reference across all three
+  edge modes × both axes × centred/offset kinds × widths from
+  sub-line to several-times-the-line, and `stdDeviation = 1e30` now
+  completes instantly (`Centered(d + 1)` also no longer overflows at
+  the saturation point).
+
 ### Added
 
 - **Filter primitive tree evaluation (Filter Effects 1 §9.2 / §9.3).**
