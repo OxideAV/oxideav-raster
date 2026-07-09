@@ -2,3 +2,8 @@ target
 artifacts
 coverage
 fuzz-*.log
+
+# libfuzzer-generated corpus entries (40-hex-named) are machine output
+# and regrow on every run; only the curated, human-named seeds are
+# tracked (they were `git add`-ed before this ignore and stay tracked).
+corpus/
