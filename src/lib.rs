@@ -235,6 +235,7 @@ mod cache;
 mod composite;
 mod fill;
 mod filter;
+mod filter_css;
 mod filter_function;
 mod filter_graph;
 mod flatten;
@@ -263,6 +264,9 @@ pub use filter::{
     DisplacementChannel, DisplacementSampling, FilterColorSpace, ImageSourceSampling, LightSource,
     MeetOrSlice, MorphologyOp, OffsetSampling, PreserveAspectRatio, SpecularLighting, StitchTiles,
     Subregion, TransferFunc, Turbulence, TurbulenceType, GAUSSIAN_BLUR_BOX_THRESHOLD,
+};
+pub use filter_css::{
+    parse_filter_value_list, parse_filter_value_list_with_color, FilterParseError,
 };
 pub use filter_function::{apply_filter_functions, FilterFunction};
 pub use filter_graph::{FilterGraph, FilterInput, FilterPrimitive, FilterStep};

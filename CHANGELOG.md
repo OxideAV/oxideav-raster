@@ -29,6 +29,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   gets the anchored §9.20 semantics (tiles at `(x + i·w, y + j·h)`)
   via a Euclidean-remainder sampler. Both §9.3 worked examples are
   reproduced verbatim as golden integration tests.
+- **CSS `filter` property value parser (Filter Effects 1 §5 / §6.1).**
+  `parse_filter_value_list` (and the `_with_color` variant that
+  substitutes `currentColor` into a colour-less `drop-shadow()`, per
+  §6.1) parses a `<filter-value-list>` into `FilterFunction`s: all ten
+  functions with their §6.1 omitted-value defaults (`grayscale()` /
+  `sepia()` / `invert()` → 1 per the spec note; `blur()` → 0px;
+  `hue-rotate()` → 0deg), `<number-percentage>` with negative-value
+  rejection, `<angle>` in deg/grad/rad/turn plus the `<zero>`
+  production (negative angles legal, never normalised), pixel
+  `<length>`s (unresolvable CSS units rejected, unitless non-zero
+  rejected), `drop-shadow()`'s `<color>? && <length>{2,3}` combinator
+  (colour before or after the length run; hex / rgb[a]() / keyword
+  colours), `none`, and `url()` reported as unresolvable at buffer
+  level. Hostile-input hardening: no panics on arbitrary input
+  (20 000-string deterministic byte-soup sweep + structured
+  paren-bomb / 10 000-function / overflow cases), every number checked
+  finite (`1e999` and `NaN`/`inf` spellings rejected — Rust's
+  `f32::from_str` accepts them, the CSS grammar does not), and all
+  errors carry byte offsets.
 - **CSS filter shorthand functions (Filter Effects 1 §6 / §13.1).**
   New `FilterFunction` enum covering all ten `<filter-function>`s
   (`grayscale` / `sepia` / `saturate` / `hue-rotate` / `invert` /
