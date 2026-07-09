@@ -363,7 +363,7 @@ mod tests {
             FilterFunction::Invert(0.0),
             FilterFunction::Blur(0.0),
         ] {
-            let out = apply_filter_functions(&[f.clone()], &src, 4, 4);
+            let out = apply_filter_functions(std::slice::from_ref(&f), &src, 4, 4);
             for (o, s) in out.iter().zip(src.iter()) {
                 assert!(
                     (*o as i32 - *s as i32).abs() <= 1,
@@ -378,7 +378,7 @@ mod tests {
             FilterFunction::Contrast(1.0),
             FilterFunction::Opacity(1.0),
         ] {
-            let out = apply_filter_functions(&[f.clone()], &src, 4, 4);
+            let out = apply_filter_functions(std::slice::from_ref(&f), &src, 4, 4);
             for (o, s) in out.iter().zip(src.iter()) {
                 assert!(
                     (*o as i32 - *s as i32).abs() <= 1,
