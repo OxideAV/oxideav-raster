@@ -15,3 +15,22 @@ categories = ["graphics", "rendering", "multimedia::images"]
 [dependencies]
 oxideav-core = "0.1"
 oxideav-pixfmt = "0.1"
+
+[dev-dependencies]
+# Round 401 (depth-mode benchmarks): Criterion drives the two bench
+# harnesses (`filter`, `render`) so future optimisation rounds can A/B
+# changes to the kernel hot loops. Pinned to the same 0.5 line the
+# other OxideAV crates with benches track.
+criterion = "0.5"
+
+# Round 401 benches. Each binary lives in `benches/<name>.rs` and is
+# self-contained (LCG pixel soup + procedural scenes — no fixtures).
+# Run with:
+#     cargo bench -p oxideav-raster --bench <name>
+[[bench]]
+name = "filter"
+harness = false
+
+[[bench]]
+name = "render"
+harness = false

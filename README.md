@@ -48,6 +48,7 @@ produces a packed `Rgba` `VideoFrame`.
 | Filter primitive tree (Filter Effects 1 §9.2 / §9.3) | done — `FilterGraph` evaluates ordered primitives with `in`/`in2` resolution (`SourceGraphic` / `SourceAlpha` / named `result` back-references, closest-preceding rule, forward-reference degradation), per-step §9.4 subregion clip, one-pass linearRGB working space, anchored §9.20 `feTile` |
 | CSS filter shorthand functions (Filter Effects 1 §6 / §13.1) | done — all 10 `<filter-function>`s expanded to their §13.1 primitive equivalents (exact grayscale/sepia matrices, table/linear transfer forms, blur with `edgeMode` `none`); `apply_filter_functions` runs a `<filter-value-list>` pinned to sRGB per §10 |
 | CSS `filter` value parser (Filter Effects 1 §5 / §6.1) | done — `<filter-value-list>` → `FilterFunction`s with §6.1 defaults, negative/unit/overflow rejection, `drop-shadow()` `<color>? && <length>{2,3}`, `currentColor` substitution; panic-free on hostile input, byte-offset errors |
+| Fuzz + benches                            | done — cargo-fuzz targets on the CSS parser (~16M execs) + filter graph (~3.6M execs) with daily CI; Criterion baselines on both Gaussian branches, morphology, per-pixel kernels, graph chain, fill/flatten/full-scene render |
 | Full ICC color-managed pipeline           | not yet              |
 
 ## Usage

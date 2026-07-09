@@ -40,6 +40,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Criterion benchmarks (`benches/filter.rs`, `benches/render.rs`).**
+  Self-contained A/B baselines for the kernel hot loops (LCG pixel
+  soup + procedural scenes, no fixtures). Filter side: both Gaussian
+  branches, morphology, colour-matrix, component-transfer, composite,
+  soft-light blend, turbulence, the §9.3 example chain through
+  `FilterGraph::evaluate`, and CSS parse→apply. Render side: de
+  Casteljau flattening, scanline fill at 1×/4× supersampling, and an
+  end-to-end `Renderer::render` scene. Landing baselines
+  (aarch64-darwin): `gaussian_box_256` 1.72 ms vs
+  `gaussian_box_huge_std_256` (stdDeviation 1e6) 2.27 ms — the
+  prefix-sum rewrite's cost-independent-of-window-width property,
+  measured; `render_scene_256` 3.79 ms; `css_parse_apply_64` 225 µs.
 - **cargo-fuzz harness (`fuzz/`) with two targets.**
   `parse_filter_css` feeds arbitrary bytes through
   `parse_filter_value_list` and, when they parse, on through
