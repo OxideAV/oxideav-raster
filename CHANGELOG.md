@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Filter primitive tree evaluation (Filter Effects 1 §9.2 / §9.3).**
+  New `FilterGraph` / `FilterStep` / `FilterPrimitive` / `FilterInput`
+  types connect the crate's standalone filter primitives into the
+  spec's filter structure: ordered steps mirror a `filter` element's
+  primitive children, `in` / `in2` resolve per §9.2 (`SourceGraphic`,
+  `SourceAlpha`, named `result` back-references with the
+  closest-preceding rule, forward/dangling references degrading to the
+  unspecified-`in` rule, and unspecified `in` reading the previous
+  result — or `SourceGraphic` on the first step). The graph returns
+  the last step's result (the §9.3 primary filter primitive tree); an
+  empty graph renders nothing (transparent black). Each step can carry
+  a §9.4 subregion hard-clip and the graph runs in one
+  `color-interpolation-filters` working space — `SourceGraphic` is
+  linearised once on entry, intermediates stay linear, the final
+  result is re-encoded, and specified sRGB colours entering mid-chain
+  (`feFlood` / `feDropShadow` flood colour, `feImage` pixels) are
+  linearised at the step that introduces them. `feTile` inside a graph
+  gets the anchored §9.20 semantics (tiles at `(x + i·w, y + j·h)`)
+  via a Euclidean-remainder sampler. Both §9.3 worked examples are
+  reproduced verbatim as golden integration tests.
+- **`gaussian_blur_edge` re-exported.** The §9.14 `edgeMode`-aware
+  blur entry point was `pub` in the private `filter` module but
+  missing from the crate-root re-export list, making it unreachable
+  for downstream users; it now sits alongside `gaussian_blur`.
 - **`feBlend` extended to the full Compositing-1 mode set (Filter
   Effects 1 §9.13).** SVG 1.1 §15.9 defined five `<feBlend>` modes
   (`normal` / `multiply` / `screen` / `darken` / `lighten`);
