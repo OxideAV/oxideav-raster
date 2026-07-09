@@ -235,6 +235,7 @@ mod cache;
 mod composite;
 mod fill;
 mod filter;
+mod filter_function;
 mod filter_graph;
 mod flatten;
 mod gradient;
@@ -263,6 +264,7 @@ pub use filter::{
     MeetOrSlice, MorphologyOp, OffsetSampling, PreserveAspectRatio, SpecularLighting, StitchTiles,
     Subregion, TransferFunc, Turbulence, TurbulenceType, GAUSSIAN_BLUR_BOX_THRESHOLD,
 };
+pub use filter_function::{apply_filter_functions, FilterFunction};
 pub use filter_graph::{FilterGraph, FilterInput, FilterPrimitive, FilterStep};
 pub use flatten::{flatten_arc_to_cubics, flatten_path, FlatContour};
 pub use gradient::{

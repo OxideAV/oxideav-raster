@@ -46,6 +46,7 @@ produces a packed `Rgba` `VideoFrame`.
 | `feComposite` Porter-Duff operators (Filter Effects 1 §9.8) | done — `over` / `in` / `out` / `atop` / `xor` / `lighter` + `arithmetic`; `lighter` (`Fa=Fb=1`) unions disjoint coverage and saturates overlap |
 | `feBlend` extended mode set (Filter Effects 1 §9.13) | done — all 16 Compositing-1 `<blend-mode>` values; the 5 SVG 1.1 modes keep their byte-stable §15.9 closed form, the 11 extensions (overlay / color-dodge / color-burn / hard-light / soft-light / difference / exclusion / hue / saturation / color / luminosity) route through the shared `blend_over` mix-with-Source-Over path with `in`=Cs, `in2`=Cb |
 | Filter primitive tree (Filter Effects 1 §9.2 / §9.3) | done — `FilterGraph` evaluates ordered primitives with `in`/`in2` resolution (`SourceGraphic` / `SourceAlpha` / named `result` back-references, closest-preceding rule, forward-reference degradation), per-step §9.4 subregion clip, one-pass linearRGB working space, anchored §9.20 `feTile` |
+| CSS filter shorthand functions (Filter Effects 1 §6 / §13.1) | done — all 10 `<filter-function>`s expanded to their §13.1 primitive equivalents (exact grayscale/sepia matrices, table/linear transfer forms, blur with `edgeMode` `none`); `apply_filter_functions` runs a `<filter-value-list>` pinned to sRGB per §10 |
 | Full ICC color-managed pipeline           | not yet              |
 
 ## Usage

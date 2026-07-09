@@ -29,6 +29,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   gets the anchored §9.20 semantics (tiles at `(x + i·w, y + j·h)`)
   via a Euclidean-remainder sampler. Both §9.3 worked examples are
   reproduced verbatim as golden integration tests.
+- **CSS filter shorthand functions (Filter Effects 1 §6 / §13.1).**
+  New `FilterFunction` enum covering all ten `<filter-function>`s
+  (`grayscale` / `sepia` / `saturate` / `hue-rotate` / `invert` /
+  `opacity` / `brightness` / `contrast` / `blur` / `drop-shadow`),
+  each expanded to its §13.1 filter-element equivalent as
+  `FilterGraph` steps — the §13.1.1 / §13.1.2 grayscale and sepia
+  matrices are transcribed exactly (rows built from `x = 1 − amount`),
+  invert/opacity use the spec's two-entry `table` transfer functions,
+  brightness/contrast the `linear` slope/intercept forms, and blur
+  runs `feGaussianBlur` with `edgeMode` `none` per §13.1.9.
+  `apply_filter_functions` evaluates a `<filter-value-list>` in
+  document order pinned to the sRGB working space (§10: the
+  `color-interpolation-filters` property "has no affect on Filter
+  Functions, which operate in the sRGB color space"). §6.1 value
+  handling: over-100% amounts clamp to 1 for grayscale / sepia /
+  invert / opacity and pass through for saturate / brightness /
+  contrast; `hue-rotate` is not normalised; hostile non-finite
+  amounts are defensively collapsed so they cannot reach the
+  primitives.
 - **`gaussian_blur_edge` re-exported.** The §9.14 `edgeMode`-aware
   blur entry point was `pub` in the private `filter` module but
   missing from the crate-root re-export list, making it unreachable
