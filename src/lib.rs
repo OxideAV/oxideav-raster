@@ -208,8 +208,6 @@
 //!
 //! Deferred to a later round:
 //!
-//! * `feDropShadow` (the W3C Filter Effects Module Level 1 spec is not
-//!   staged under `docs/`),
 //! * a `Paint`-level pattern variant (pending an `oxideav-core` IR
 //!   addition — patterns currently paint through the direct
 //!   [`Renderer`] endpoints),

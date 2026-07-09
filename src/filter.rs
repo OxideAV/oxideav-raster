@@ -196,13 +196,6 @@
 //!   §15.18 note that "high quality viewers make use of appropriate
 //!   interpolation techniques, for example bilinear or bicubic".
 //!
-//! # Deferred
-//!
-//! Drop shadow (`feDropShadow`) — its normative definition lives in
-//! the W3C Filter Effects Module Level 1, which is not currently
-//! staged under `docs/image/svg/` (the staged SVG 2 CR only links
-//! out to it).
-//!
 //! # Wall provenance
 //!
 //! Math transcribed from `docs/image/svg/svg11-second-edition.pdf`
