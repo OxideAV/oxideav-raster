@@ -1,0 +1,57 @@
+[package]
+name = "oxideav-raster-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# oxideav-raster's richest hostile-input surface is the CSS `filter`
+# property value parser (Filter Effects 1 §5 / §6.1): a text grammar
+# with function names, numbers (incl. exponents), percentages, angle /
+# length units, nested rgb()/rgba() colours inside drop-shadow(), and
+# the `none` / url() special forms — every token attacker-controlled.
+# The second surface is the Filter Effects 1 §9.2/§9.3 filter primitive
+# tree evaluator, whose named-result reference resolution, subregion
+# clips, and per-primitive parameter ranges all feed buffer maths.
+#
+# The clean-room wall bars any external implementation as an oracle, so
+# both harnesses are panic-only: arbitrary input must always come back
+# as a `Result` / correctly-sized buffer, never a panic / abort / OOM /
+# hang.
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.oxideav-raster]
+path = ".."
+
+# Prevent this from interfering with the umbrella workspace.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+# Text-grammar target — arbitrary bytes through parse_filter_value_list
+# and, when they parse, straight on through apply_filter_functions on a
+# small canvas. Closes the parse→evaluate loop so numeric edge cases the
+# parser admits (huge-but-finite lengths, extreme angles, 10k-function
+# lists) also exercise the §13.1 shorthand expansion and the primitive
+# kernels behind it.
+[[bin]]
+name = "parse_filter_css"
+path = "fuzz_targets/parse_filter_css.rs"
+test = false
+doc = false
+
+# Structured filter-primitive-tree target — fuzzer bytes become a
+# FilterGraph (primitive selector, in/in2/result wiring including
+# dangling and duplicate names, subregion rectangles from raw f32 bits,
+# working colour space) evaluated on a small canvas. Asserts the output
+# buffer is always exactly width×height×4.
+[[bin]]
+name = "filter_graph"
+path = "fuzz_targets/filter_graph.rs"
+test = false
+doc = false

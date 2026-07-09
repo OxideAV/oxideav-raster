@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Fuzzer-found: extreme `feOffset` / `feDropShadow` /
+  `feDisplacementMap` shifts overflowed integer arithmetic.** A CSS
+  `drop-shadow()` offset around `-7.1e32px` — finite, so the parser
+  correctly admits it — rounds to `i64::MIN` in `offset`'s nearest
+  path, and `x - idx` then overflowed (debug panic / UB-adjacent wrap
+  in release). The bilinear paths in `offset` and `displacement_map`
+  had the matching `x0 + 1` overflow after their saturating
+  `f32 → i64` floor casts. All three now use saturating arithmetic so
+  an out-of-extent shift lands on the §15.7.3 transparent-black rule
+  like any other; the crashing input is pinned as a corpus seed and a
+  unit regression.
+
 - **Hostile `stdDeviation` hardening: box-blur passes are now O(1) in
   the window width (prefix sums), byte-exact.** The three-box Gaussian
   approximation derived its box width `d` from `stdDeviation`
@@ -28,6 +40,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **cargo-fuzz harness (`fuzz/`) with two targets.**
+  `parse_filter_css` feeds arbitrary bytes through
+  `parse_filter_value_list` and, when they parse, on through
+  `apply_filter_functions` on an 8×8 canvas — closing the
+  parse→evaluate loop so §6.1-legal numeric extremes reach the §13.1
+  shorthand expansion and the kernels behind it (this target found the
+  extreme-offset overflow above within its first minutes).
+  `filter_graph` drives structured `FilterGraph` construction:
+  fuzzer-chosen primitives, `in`/`in2` wiring including dangling /
+  forward / duplicate-`result` references, raw-f32-bit subregion
+  rectangles into the §9.4 disabled-region logic, and all three
+  working colour spaces. ~16M parse + ~3.6M graph executions clean at
+  landing; daily CI job added.
 - **Filter primitive tree evaluation (Filter Effects 1 §9.2 / §9.3).**
   New `FilterGraph` / `FilterStep` / `FilterPrimitive` / `FilterInput`
   types connect the crate's standalone filter primitives into the

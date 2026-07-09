@@ -6025,12 +6025,15 @@ fn offset_nearest(src: &[u8], width: u32, height: u32, dx: f32, dy: f32) -> Vec<
 
     let mut out = vec![0u8; (w * h * 4) as usize];
     for y in 0..h {
-        let sy = y - idy;
+        // Saturating: an extreme shift (the `f32 → i64` cast above
+        // saturates at the i64 limits) must land outside the bounds
+        // check, not overflow `y - i64::MIN` in the subtraction.
+        let sy = y.saturating_sub(idy);
         if !(0..h).contains(&sy) {
             continue;
         }
         for x in 0..w {
-            let sx = x - idx;
+            let sx = x.saturating_sub(idx);
             if !(0..w).contains(&sx) {
                 continue;
             }
@@ -6074,10 +6077,15 @@ fn offset_bilinear(src: &[u8], width: u32, height: u32, dx: f32, dy: f32) -> Vec
             let y0 = fy.floor() as i64;
             let tx = fx - x0 as f32;
             let ty = fy - y0 as f32;
+            // Saturating: a shift so large that the `f32 → i64` floor
+            // cast saturated at the i64 limits must stay out of range
+            // for `fetch`, not overflow the +1 neighbour step.
+            let x1 = x0.saturating_add(1);
+            let y1 = y0.saturating_add(1);
             let c00 = fetch(x0, y0);
-            let c10 = fetch(x0 + 1, y0);
-            let c01 = fetch(x0, y0 + 1);
-            let c11 = fetch(x0 + 1, y0 + 1);
+            let c10 = fetch(x1, y0);
+            let c01 = fetch(x0, y1);
+            let c11 = fetch(x1, y1);
             for c in 0..4 {
                 let top = c00[c] + (c10[c] - c00[c]) * tx;
                 let bot = c01[c] + (c11[c] - c01[c]) * tx;
@@ -6817,6 +6825,39 @@ pub fn tile_pixels(
 mod flood_offset_merge_tests {
     use super::*;
 
+    #[test]
+    fn extreme_offsets_saturate_to_transparent_black() {
+        // Fuzzer-found (parse_filter_css → drop-shadow with a
+        // ~-7.1e32px offset): dx.round() as i64 saturates at i64::MIN,
+        // and `x - idx` then overflowed in offset_nearest; the
+        // bilinear paths (offset_bilinear, displacement_map) had the
+        // matching `x0 + 1` overflow after the saturated floor cast.
+        // Any finite shift beyond the source extent must simply yield
+        // transparent black.
+        let src = vec![255u8; 4 * 3 * 4];
+        for &d in &[-7.1e32f32, 7.1e32, f32::MAX, f32::MIN, -3.0e38] {
+            for sampling in [OffsetSampling::Nearest, OffsetSampling::Bilinear] {
+                let out = offset(&src, 4, 3, d, d, sampling);
+                assert!(
+                    out.iter().all(|&b| b == 0),
+                    "shift {d:e} ({sampling:?}) must be transparent black"
+                );
+            }
+        }
+        // displacement_map with an extreme scale on an opaque map.
+        let out = displacement_map(
+            &src,
+            &src,
+            4,
+            3,
+            3.0e38,
+            DisplacementChannel::R,
+            DisplacementChannel::G,
+            DisplacementSampling::Bilinear,
+        );
+        assert_eq!(out.len(), src.len());
+    }
+
     // -------------------- flood --------------------
 
     #[test]
@@ -7521,10 +7562,15 @@ pub fn displacement_map(
                             in1[p + 3] as f32,
                         ]
                     };
+                    // Saturating: a displacement large enough that the
+                    // `f32 → i64` floor cast saturated must stay out of
+                    // range for `fetch`, not overflow the +1 neighbour.
+                    let x1 = x0.saturating_add(1);
+                    let y1 = y0.saturating_add(1);
                     let c00 = fetch(x0, y0);
-                    let c10 = fetch(x0 + 1, y0);
-                    let c01 = fetch(x0, y0 + 1);
-                    let c11 = fetch(x0 + 1, y0 + 1);
+                    let c10 = fetch(x1, y0);
+                    let c01 = fetch(x0, y1);
+                    let c11 = fetch(x1, y1);
                     for c in 0..4 {
                         let top = c00[c] + (c10[c] - c00[c]) * tx;
                         let bot = c01[c] + (c11[c] - c01[c]) * tx;
