@@ -7,6 +7,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/OxideAV/oxideav-raster/compare/v0.1.2...v0.2.0) - 2026-08-20
+
+### Fixed
+
+- *(release-plz)* stop ignoring the tracked fuzz corpus seeds
+- *(clippy)* use slice::from_ref in shorthand identity tests
+- *(clippy)* avoid doc_lazy_continuation in lib.rs provenance note
+
+### Other
+
+- baselines for the remaining unbenched filter kernels
+- r449 before/after benchmark tables + README round summary
+- *(pattern+mask)* axis-aligned tile-tap caching; soft-mask composite bounded by content-and-mask alpha bbox — byte-exact
+- *(filter)* LUT component-transfer, O(1)-radius morphology, byte-LUT colorspace, gaussian interior loop — byte-exact
+- *(image)* per-axis tap caching for axis-aligned separable sampling — byte-exact
+- *(fill)* row-block coverage, touched-bounds composite scan, opaque-pixel overwrite — byte-exact
+- r449 baselines for resampling, pattern, stroke, soft-mask, gradient, cache paths
+- Criterion baselines for filter kernels + rasteriser hot loops
+- track only curated corpus seeds, not the generated corpus
+- cargo-fuzz harness (parse + graph targets); fix fuzzer-found extreme-shift overflows
+- box-blur passes O(1) in window width via prefix sums (hostile-stdDeviation hardening)
+- CSS filter property value parser (Filter Effects 1 §5 / §6.1)
+- CSS filter shorthand functions (Filter Effects 1 §6 / §13.1)
+- filter primitive tree evaluation (Filter Effects 1 §9.2 / §9.3)
+- drop the stale feDropShadow Deferred entries
+- add CI / crates.io / docs.rs / MIT-license badges
+- extend to full Compositing-1 16-mode set (Filter Effects 1 §9.13)
+- add Porter-Duff `lighter` operator (Filter Effects 1 §9.8)
+- regression test — adjacent fractional-boundary spans stay exact
+- interpolate between stops-LUT entries instead of nearest-index
+- analytic horizontal anti-aliasing in the scanline rasterizer
+- radius-adaptive round-join / round-cap arc tessellation
+- end-to-end tests + README for SVG 2 miter-clip / arcs joins
+- SVG 2 miter-clip + arcs line joins (§13.5.5)
+- property-based rendering-invariant suite (dependency-free LCG)
+- top-level viewBox preserveAspectRatio viewport fitting (SVG 1.1 §7.8 / §8.2 / §8.6)
+- group opacity is an isolated offscreen composite (SVG 2 §3.4)
+- filter primitive subregion hard-clip (Filter Effects 1 §9.4)
+- color-interpolation-filters working space (Filter Effects 1 §10)
+- feGaussianBlur edgeMode (Filter Effects 1 §9.14): duplicate/wrap/none
+- refresh to current status, drop per-round changelog cruft
+- join dashed closed-subpath dashes across the start/end seam (SVG 1.1 §11.4 / SVG 2 §13.5.6)
+- two-circle radial gradient with focal radius fr (SVG 2 §13.2.4 / CSS Images 3)
+- restate lib.rs provenance note from first principles
+- feDropShadow shorthand drop-shadow primitive (Filter Effects 1 §9.12)
+- pattern viewBox + preserveAspectRatio tile fitting (SVG 2 §14.3.2 / §8.2)
+- <pattern> tiled fill/stroke paint server (SVG 2 §14.3)
+- feImage raster placement + §7.8 preserveAspectRatio fitting (SVG 1.1 §15.18)
+- feSpecularLighting Phong-specular + 3 light sources (SVG 1.1 §15.22)
+- drop release-plz.toml — use release-plz defaults across the workspace
+- feDiffuseLighting + 3 light sources (SVG 1.1 §15.14 / §15.8)
+- feBlend 5-mode pixel-wise blend (SVG 1.1 §15.9)
+- feDisplacementMap channel-driven warp (SVG 1.1 §15.15)
+- feTile periodic tiled-pattern primitive (SVG 1.1 §15.23)
+- feFlood / feOffset / feMerge (SVG 1.1 §15.16 / §15.21 / §15.19)
+- feTurbulence Perlin / fractalNoise (SVG 1.1 §15.24)
+- move feConvolveMatrix out of the # Deferred header
+- feConvolveMatrix general 2-D convolution (SVG 1.1 §15.13)
+
 ### Added
 
 - **Benchmark coverage for the previously unbenched hot surfaces**
