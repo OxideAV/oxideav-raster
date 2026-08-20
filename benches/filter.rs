@@ -29,6 +29,18 @@
 //!     `apply_filter_functions` on a representative five-function
 //!     `filter` value.
 //!
+//! Round 449 additions (previously unbenched primitive kernels):
+//!
+//!   - **convolve_matrix_3x3_256**: general §15.13 convolution with an
+//!     edge-detect 3×3 kernel, `duplicate` edges.
+//!   - **displacement_map_bilinear_256**: §15.15 channel-driven warp,
+//!     bilinear reconstruction.
+//!   - **diffuse_lighting_distant_256 / specular_lighting_point_256**:
+//!     the §15.14 / §15.22 Phong lighting kernels (Sobel surface
+//!     normals + per-pixel light vector).
+//!   - **drop_shadow_256**: the §9.12 equivalent chain (alpha blur →
+//!     offset → flood → composite-in → merge) end-to-end.
+//!
 //! Run with: `cargo bench -p oxideav-raster --bench filter`
 
 use criterion::{criterion_group, criterion_main, Criterion};
@@ -36,10 +48,12 @@ use std::hint::black_box;
 
 use oxideav_raster::{
     apply_filter_functions, blend_filter, color_matrix_op, component_transfer, composite_filter,
-    gaussian_blur_edge, morphology, parse_filter_value_list, turbulence_filter, BlendFilterMode,
-    ColorMatrix, ColorMatrixOp, ComponentTransfer, CompositeOp, ConvolveEdgeMode, FilterColorSpace,
-    FilterGraph, FilterPrimitive, FilterStep, MorphologyOp, OffsetSampling, TransferFunc,
-    Turbulence,
+    convolve_matrix, diffuse_lighting, displacement_map, drop_shadow, gaussian_blur_edge,
+    morphology, parse_filter_value_list, specular_lighting, turbulence_filter, BlendFilterMode,
+    ColorMatrix, ColorMatrixOp, ComponentTransfer, CompositeOp, ConvolveEdgeMode, ConvolveMatrix,
+    DiffuseLighting, DisplacementChannel, DisplacementSampling, FilterColorSpace, FilterGraph,
+    FilterPrimitive, FilterStep, LightSource, MorphologyOp, OffsetSampling, SpecularLighting,
+    TransferFunc, Turbulence,
 };
 
 fn lcg_image(width: u32, height: u32, seed: u64) -> Vec<u8> {
@@ -171,6 +185,75 @@ fn bench_filters(c: &mut Criterion) {
             edge: ConvolveEdgeMode::default(),
         }));
         b.iter(|| g.evaluate(black_box(&small), 128, 128))
+    });
+    #[rustfmt::skip]
+    let edge_detect = ConvolveMatrix::new(3, 3, vec![
+        -1.0, -1.0, -1.0,
+        -1.0,  8.0, -1.0,
+        -1.0, -1.0, -1.0,
+    ]);
+    c.bench_function("convolve_matrix_3x3_256", |b| {
+        b.iter(|| convolve_matrix(black_box(&img), 256, 256, &edge_detect))
+    });
+    c.bench_function("displacement_map_bilinear_256", |b| {
+        b.iter(|| {
+            displacement_map(
+                black_box(&img),
+                black_box(&img_b),
+                256,
+                256,
+                12.5,
+                DisplacementChannel::R,
+                DisplacementChannel::G,
+                DisplacementSampling::Bilinear,
+            )
+        })
+    });
+    let diffuse = DiffuseLighting {
+        surface_scale: 3.0,
+        diffuse_constant: 1.0,
+        kernel_unit_length: (1.0, 1.0),
+        light_color: [255, 200, 150],
+        light_source: LightSource::Distant {
+            azimuth_deg: 45.0,
+            elevation_deg: 30.0,
+        },
+    };
+    c.bench_function("diffuse_lighting_distant_256", |b| {
+        b.iter(|| diffuse_lighting(black_box(&img), 256, 256, &diffuse))
+    });
+    let specular = SpecularLighting {
+        surface_scale: 3.0,
+        specular_constant: 1.0,
+        specular_exponent: 20.0,
+        kernel_unit_length: (1.0, 1.0),
+        light_color: [255, 255, 255],
+        light_source: LightSource::Point {
+            x: 64.0,
+            y: 64.0,
+            z: 40.0,
+        },
+    };
+    c.bench_function("specular_lighting_point_256", |b| {
+        b.iter(|| specular_lighting(black_box(&img), 256, 256, &specular))
+    });
+    c.bench_function("drop_shadow_256", |b| {
+        b.iter(|| {
+            drop_shadow(
+                black_box(&img),
+                256,
+                256,
+                3.0,
+                3.0,
+                4.0,
+                4.0,
+                0,
+                0,
+                0,
+                0.8,
+                OffsetSampling::Nearest,
+            )
+        })
     });
     c.bench_function("css_parse_apply_64", |b| {
         let src = lcg_image(64, 64, 0xf00d);

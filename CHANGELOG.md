@@ -15,8 +15,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Lanczos3 at 2× minification, and pattern fill through both tile
   samplers) plus six `render`-harness scenarios (stroke geometry,
   caption-density 400-blob scene, luminance soft mask, linear/radial
-  gradient fills through the stops LUT, warm bitmap-cache hit).
-  Baselines recorded in `BENCHMARKS.md`.
+  gradient fills through the stops LUT, warm bitmap-cache hit), and
+  five `filter`-harness baselines for the previously unbenched
+  primitive kernels (general convolve-matrix, bilinear displacement
+  map, diffuse + specular lighting, drop shadow). Baselines recorded
+  in `BENCHMARKS.md`.
 
 ### Changed
 

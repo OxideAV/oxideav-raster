@@ -78,6 +78,17 @@ orders of magnitude.
 | `graph_chain_128` | 643.4 µs | 475.4 µs | 1.35× |
 | `css_parse_apply_64` | 224.9 µs | 214.7 µs | 1.05× |
 
+New r449 baselines for the previously unbenched primitive kernels
+(no "before" column — these exist so the next depth round can A/B):
+
+| bench | r449 baseline |
+|---|---|
+| `convolve_matrix_3x3_256` | 1.131 ms |
+| `displacement_map_bilinear_256` | 518.5 µs |
+| `diffuse_lighting_distant_256` | 851.6 µs |
+| `specular_lighting_point_256` | 2.175 ms |
+| `drop_shadow_256` | 2.669 ms |
+
 ## What changed (r449)
 
 1. **Scanline fill**: coverage accumulates in one
