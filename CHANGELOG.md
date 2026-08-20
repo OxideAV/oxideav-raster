@@ -41,6 +41,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `render_scene_256` 3.74 ms → 0.40 ms, `render_softmask_256`
   0.95 ms → 0.49 ms, `render_cached_group_hit_256` 148 µs → 53 µs.
 
+- **Axis-aligned `Node::Image` sampling caches per-axis filter taps —
+  output bytes identical.** When the image transform has no rotation /
+  shear component (`b == c == 0`), the texture coordinate `u` depends
+  only on the destination column and `v` only on the row, so the
+  clamped tap positions and (re-normalised) kernel weights of the
+  separable samplers are now computed once per column / row instead of
+  once per covered pixel — eliminating the per-pixel kernel
+  evaluations (including the Lanczos `sin` calls) and the redundant
+  per-pixel frame validation. The cached values are produced by the
+  same arithmetic in the same order as the per-pixel samplers, and the
+  W×W accumulation walks taps identically; rotated / sheared
+  transforms keep the original per-pixel path (which also no longer
+  deep-copies the source frame per draw). Proven identical by the
+  existing per-filter suites plus the 31-scene whole-frame hash A/B
+  (all seven filters, axis-aligned + fractionally-scaled + rotated).
+  Measured on the `sampling` harness: Lanczos3 6.56 ms → 3.48 ms
+  (up-scale) / 7.79 ms → 3.28 ms (down-scale), Lanczos2 4.04 ms →
+  1.71 ms, BC cubics ~1.6×, bilinear 1.31 ms → 0.95 ms, nearest
+  0.73 ms → 0.56 ms; pattern fills gain 1.7–2.0× from the
+  touched-bounds composite scan.
+
 ### Fixed
 
 - **Fuzzer-found: extreme `feOffset` / `feDropShadow` /

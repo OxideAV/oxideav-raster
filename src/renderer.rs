@@ -711,6 +711,30 @@ impl Renderer {
         let frame: &VideoFrame = &img.frame;
         let filter = self.image_filter;
         let blend = self.blend_mode;
+        // Axis-aligned fast path: when the image transform has no
+        // rotation / shear component, the texture coordinate `u`
+        // depends only on the destination column and `v` only on the
+        // destination row, so the per-axis filter taps (positions +
+        // weights) can be computed once per column / row instead of
+        // once per pixel. The cached values are produced by the exact
+        // arithmetic the per-pixel samplers use, and the 2-D
+        // accumulation walks the taps in the same order, so the
+        // output bytes are identical — only the redundant per-pixel
+        // weight recomputation (including the `sin` evaluations of
+        // the Lanczos kernels) is eliminated.
+        if local.b == 0.0 && local.c == 0.0 {
+            self.composite_image_axis_aligned(
+                buf,
+                stride,
+                &mask,
+                (bx0, by0, bx1, by1),
+                group_opacity,
+                frame,
+                &bounds,
+                &inv,
+            );
+            return;
+        }
         composite_rgba_premultiplied_blend_rect(
             buf,
             stride,
@@ -735,6 +759,297 @@ impl Renderer {
                     }
                     ImageFilter::BSpline => sample_image_b_spline(frame, &bounds, user.x, user.y),
                 }
+            },
+        );
+    }
+
+    /// Axis-aligned `Node::Image` composite: per-axis tap caching for
+    /// the separable sampling kernels (see the call site in
+    /// [`Self::draw_image`] for the bit-exactness argument).
+    #[allow(clippy::too_many_arguments)]
+    fn composite_image_axis_aligned(
+        &self,
+        buf: &mut [u8],
+        stride: usize,
+        mask: &AlphaMask,
+        rect: (u32, u32, u32, u32),
+        group_opacity: f32,
+        frame: &VideoFrame,
+        bounds: &Rect,
+        inv: &Transform2D,
+    ) {
+        // Hoisted frame validation — identical checks to
+        // `prepare_image_sample`; an invalid frame means every sample
+        // is transparent, i.e. the composite writes nothing.
+        if bounds.width <= 0.0 || bounds.height <= 0.0 {
+            return;
+        }
+        let Some(plane) = frame.planes.first() else {
+            return;
+        };
+        let tex_stride = plane.stride;
+        if tex_stride < 4 {
+            return;
+        }
+        let tex_w = (tex_stride / 4) as u32;
+        let tex_h = (plane.data.len() / tex_stride) as u32;
+        if tex_w == 0 || tex_h == 0 {
+            return;
+        }
+        let data: &[u8] = &plane.data;
+        let blend = self.blend_mode;
+
+        // Per-column texture coordinate `u` (independent of y because
+        // `local.c == 0`, hence `inv.c == 0`) and per-row `v`
+        // (independent of x). The fixed 0.5 stand-in for the other
+        // coordinate multiplies a (signed) zero matrix entry exactly
+        // like any other positive in-canvas coordinate would, so the
+        // result is the bit-identical `u` / `v` the per-pixel path
+        // computes.
+        let (bx0, by0, bx1, by1) = rect;
+        let col_t = |x: u32| -> Option<f32> {
+            let user = inv.apply(oxideav_core::Point::new(x as f32 + 0.5, 0.5));
+            let u = (user.x - bounds.x) / bounds.width;
+            if !(0.0..=1.0).contains(&u) {
+                return None;
+            }
+            Some(u * tex_w as f32 - 0.5)
+        };
+        let row_t = |y: u32| -> Option<f32> {
+            let user = inv.apply(oxideav_core::Point::new(0.5, y as f32 + 0.5));
+            let v = (user.y - bounds.y) / bounds.height;
+            if !(0.0..=1.0).contains(&v) {
+                return None;
+            }
+            Some(v * tex_h as f32 - 0.5)
+        };
+
+        match self.image_filter {
+            ImageFilter::Nearest => {
+                // Nearest keeps its own (simpler) pixel fetch: cache
+                // the clamped texel index per column / row.
+                let cols: Vec<Option<usize>> = (bx0..=bx1)
+                    .map(|x| {
+                        let user = inv.apply(oxideav_core::Point::new(x as f32 + 0.5, 0.5));
+                        let u = (user.x - bounds.x) / bounds.width;
+                        if !(0.0..=1.0).contains(&u) {
+                            return None;
+                        }
+                        Some(
+                            ((u * tex_w as f32).floor() as i64).clamp(0, tex_w as i64 - 1) as usize,
+                        )
+                    })
+                    .collect();
+                let rows: Vec<Option<usize>> = (by0..=by1)
+                    .map(|y| {
+                        let user = inv.apply(oxideav_core::Point::new(0.5, y as f32 + 0.5));
+                        let v = (user.y - bounds.y) / bounds.height;
+                        if !(0.0..=1.0).contains(&v) {
+                            return None;
+                        }
+                        Some(
+                            ((v * tex_h as f32).floor() as i64).clamp(0, tex_h as i64 - 1) as usize,
+                        )
+                    })
+                    .collect();
+                composite_rgba_premultiplied_blend_rect(
+                    buf,
+                    stride,
+                    self.width,
+                    self.height,
+                    mask,
+                    0,
+                    0,
+                    group_opacity,
+                    blend,
+                    rect,
+                    move |x, y| {
+                        let (Some(px), Some(py)) =
+                            (cols[(x - bx0) as usize], rows[(y - by0) as usize])
+                        else {
+                            return Rgba::new(0, 0, 0, 0);
+                        };
+                        let i = py * tex_stride + px * 4;
+                        Rgba::new(data[i], data[i + 1], data[i + 2], data[i + 3])
+                    },
+                );
+            }
+            ImageFilter::Bilinear => self.composite_image_separable::<2>(
+                buf,
+                stride,
+                mask,
+                rect,
+                group_opacity,
+                data,
+                tex_stride,
+                &col_t,
+                &row_t,
+                &|t, extent| {
+                    let x0 = t.floor() as i64;
+                    let x1 = x0 + 1;
+                    let w1 = (t - x0 as f32).clamp(0.0, 1.0);
+                    (
+                        [
+                            x0.clamp(0, extent as i64 - 1) as usize,
+                            x1.clamp(0, extent as i64 - 1) as usize,
+                        ],
+                        [1.0 - w1, w1],
+                    )
+                },
+                (tex_w, tex_h),
+                false,
+            ),
+            ImageFilter::Lanczos2 => self.composite_image_separable::<4>(
+                buf,
+                stride,
+                mask,
+                rect,
+                group_opacity,
+                data,
+                tex_stride,
+                &col_t,
+                &row_t,
+                &|t, extent| kernel_taps::<4>(t, extent, 2, lanczos2),
+                (tex_w, tex_h),
+                true,
+            ),
+            ImageFilter::Lanczos3 => self.composite_image_separable::<6>(
+                buf,
+                stride,
+                mask,
+                rect,
+                group_opacity,
+                data,
+                tex_stride,
+                &col_t,
+                &row_t,
+                &|t, extent| kernel_taps::<6>(t, extent, 3, lanczos3),
+                (tex_w, tex_h),
+                true,
+            ),
+            ImageFilter::Mitchell => self.composite_image_separable::<4>(
+                buf,
+                stride,
+                mask,
+                rect,
+                group_opacity,
+                data,
+                tex_stride,
+                &col_t,
+                &row_t,
+                &|t, extent| kernel_taps::<4>(t, extent, 2, mitchell_netravali),
+                (tex_w, tex_h),
+                true,
+            ),
+            ImageFilter::CatmullRom => self.composite_image_separable::<4>(
+                buf,
+                stride,
+                mask,
+                rect,
+                group_opacity,
+                data,
+                tex_stride,
+                &col_t,
+                &row_t,
+                &|t, extent| kernel_taps::<4>(t, extent, 2, catmull_rom),
+                (tex_w, tex_h),
+                true,
+            ),
+            ImageFilter::BSpline => self.composite_image_separable::<4>(
+                buf,
+                stride,
+                mask,
+                rect,
+                group_opacity,
+                data,
+                tex_stride,
+                &col_t,
+                &row_t,
+                &|t, extent| kernel_taps::<4>(t, extent, 2, b_spline),
+                (tex_w, tex_h),
+                true,
+            ),
+        }
+    }
+
+    /// Shared axis-aligned separable sampler: builds per-column and
+    /// per-row tap caches with `taps`, then accumulates the W×W
+    /// premultiplied-alpha footprint per covered pixel in the same
+    /// `j`-outer / `i`-inner order (and with the same `wx * wy`
+    /// product order) as the per-pixel samplers.
+    ///
+    /// `clamp_alpha` selects the accumulator tail: the windowed-sinc /
+    /// BC-cubic kernels clamp the accumulated alpha into `[0, 255]`
+    /// before the un-premultiply (their negative side-lobes can
+    /// overshoot), while bilinear uses the raw accumulated alpha —
+    /// matching each original sampler exactly.
+    #[allow(clippy::too_many_arguments)]
+    fn composite_image_separable<const W: usize>(
+        &self,
+        buf: &mut [u8],
+        stride: usize,
+        mask: &AlphaMask,
+        rect: (u32, u32, u32, u32),
+        group_opacity: f32,
+        data: &[u8],
+        tex_stride: usize,
+        col_t: &dyn Fn(u32) -> Option<f32>,
+        row_t: &dyn Fn(u32) -> Option<f32>,
+        taps: &dyn Fn(f32, u32) -> ([usize; W], [f32; W]),
+        tex_extent: (u32, u32),
+        clamp_alpha: bool,
+    ) {
+        let (bx0, by0, bx1, by1) = rect;
+        let (tex_w, tex_h) = tex_extent;
+        let cols: Vec<Option<([usize; W], [f32; W])>> =
+            (bx0..=bx1).map(|x| Some(taps(col_t(x)?, tex_w))).collect();
+        let rows: Vec<Option<([usize; W], [f32; W])>> =
+            (by0..=by1).map(|y| Some(taps(row_t(y)?, tex_h))).collect();
+        composite_rgba_premultiplied_blend_rect(
+            buf,
+            stride,
+            self.width,
+            self.height,
+            mask,
+            0,
+            0,
+            group_opacity,
+            self.blend_mode,
+            rect,
+            move |x, y| {
+                let (Some((cpos, cw)), Some((rpos, rw))) =
+                    (&cols[(x - bx0) as usize], &rows[(y - by0) as usize])
+                else {
+                    return Rgba::new(0, 0, 0, 0);
+                };
+                let mut acc = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+                for j in 0..W {
+                    let py = rpos[j];
+                    let wy = rw[j];
+                    for i in 0..W {
+                        let w = cw[i] * wy;
+                        let (r, g, b, a) = fetch_premul(data, tex_stride, cpos[i], py);
+                        acc.0 += r * w;
+                        acc.1 += g * w;
+                        acc.2 += b * w;
+                        acc.3 += a * w;
+                    }
+                }
+                let pa = if clamp_alpha {
+                    acc.3.clamp(0.0, 255.0)
+                } else {
+                    acc.3
+                };
+                if pa <= 0.5 {
+                    return Rgba::new(0, 0, 0, 0);
+                }
+                let inv_a = 255.0 / pa;
+                Rgba::new(
+                    (acc.0 * inv_a).round().clamp(0.0, 255.0) as u8,
+                    (acc.1 * inv_a).round().clamp(0.0, 255.0) as u8,
+                    (acc.2 * inv_a).round().clamp(0.0, 255.0) as u8,
+                    pa.round().clamp(0.0, 255.0) as u8,
+                )
             },
         );
     }
@@ -1658,6 +1973,41 @@ fn lanczos3(x: f32) -> f32 {
     let s = pix.sin() / pix;
     let s3 = pix3.sin() / pix3;
     s * s3
+}
+
+/// Build one axis's `W` filter taps (clamped texel positions +
+/// re-normalised weights) for the continuous texture coordinate `t`,
+/// exactly as the per-pixel windowed-sinc / BC-cubic samplers do:
+/// `W` kernel evaluations at offsets `-(half-1) ..= half` from
+/// `floor(t)`, summed in tap order, re-normalised to a partition of
+/// unity when the sum is non-negligible (`|sum| > 1e-6`), positions
+/// clamped to the texture extent.
+#[inline]
+fn kernel_taps<const W: usize>(
+    t: f32,
+    extent: u32,
+    half: i64,
+    kernel: fn(f32) -> f32,
+) -> ([usize; W], [f32; W]) {
+    debug_assert_eq!(W as i64, 2 * half);
+    let c = t.floor() as i64;
+    let mut w = [0.0f32; W];
+    let mut sum = 0.0f32;
+    for (k, wk) in w.iter_mut().enumerate() {
+        let off = (k as i64) - (half - 1);
+        *wk = kernel(t - (c + off) as f32);
+        sum += *wk;
+    }
+    if sum.abs() > 1e-6 {
+        for wk in w.iter_mut() {
+            *wk /= sum;
+        }
+    }
+    let mut pos = [0usize; W];
+    for (k, pk) in pos.iter_mut().enumerate() {
+        *pk = (c + (k as i64) - (half - 1)).clamp(0, extent as i64 - 1) as usize;
+    }
+    (pos, w)
 }
 
 /// Fetch a single texel and convert to premultiplied-alpha floats.
