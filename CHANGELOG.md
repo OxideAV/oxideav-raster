@@ -79,6 +79,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Gaussian convolution walks interior pixels without per-tap edge
   resolution.
 
+- **Axis-aligned pattern sampling caches per-axis wrap taps, and the
+  soft-mask composite is restricted to the content∩mask alpha
+  bounding box — output bytes identical.** The pattern paint's
+  inverse-transform, tile-coordinate, and wrap/tap arithmetic moves
+  from per-pixel to per-column/row under an axis-aligned
+  `transform ∘ patternTransform` (same expressions, same order;
+  rotated / skewed transforms keep the per-pixel path):
+  `pattern_fill_256_bilinear` 1.57 ms → 0.65 ms, `_nearest` 0.83 ms →
+  0.29 ms. The soft-mask path scans both offscreen buffers for their
+  touched-alpha boxes and converts coverage / blits only inside the
+  intersection — outside it either the content alpha or the coverage
+  is provably zero, so the full scan skipped those pixels anyway;
+  small masked content on a large canvas no longer pays
+  canvas-proportional coverage conversion.
+
 ### Fixed
 
 - **Fuzzer-found: extreme `feOffset` / `feDropShadow` /

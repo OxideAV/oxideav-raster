@@ -253,7 +253,7 @@ pub fn view_box_fit_transform(
 
 /// Extract `(width, height, stride, data)` of a packed-RGBA tile
 /// buffer. Returns `None` for an empty / degenerate frame.
-fn tile_dims(frame: &VideoFrame) -> Option<(usize, usize, usize, &[u8])> {
+pub(crate) fn tile_dims(frame: &VideoFrame) -> Option<(usize, usize, usize, &[u8])> {
     let p = frame.planes.first()?;
     let w = p.stride / 4;
     let h = p.data.len().checked_div(p.stride).unwrap_or(0);
@@ -301,6 +301,78 @@ pub(crate) fn sample_tile_bilinear_wrap(frame: &VideoFrame, u: f32, v: f32) -> R
     let x1 = (x0 + 1) % w;
     let y1 = (y0 + 1) % h;
     // Premultiplied fetch.
+    let fetch = |x: usize, y: usize| -> (f32, f32, f32, f32) {
+        let i = y * stride + x * 4;
+        let a = data[i + 3] as f32;
+        let s = a / 255.0;
+        (
+            data[i] as f32 * s,
+            data[i + 1] as f32 * s,
+            data[i + 2] as f32 * s,
+            a,
+        )
+    };
+    let p00 = fetch(x0, y0);
+    let p10 = fetch(x1, y0);
+    let p01 = fetch(x0, y1);
+    let p11 = fetch(x1, y1);
+    let w00 = (1.0 - wx) * (1.0 - wy);
+    let w10 = wx * (1.0 - wy);
+    let w01 = (1.0 - wx) * wy;
+    let w11 = wx * wy;
+    let lerp4 = |a: f32, b: f32, c: f32, d: f32| a * w00 + b * w10 + c * w01 + d * w11;
+    let pr = lerp4(p00.0, p10.0, p01.0, p11.0);
+    let pg = lerp4(p00.1, p10.1, p01.1, p11.1);
+    let pb = lerp4(p00.2, p10.2, p01.2, p11.2);
+    let pa = lerp4(p00.3, p10.3, p01.3, p11.3);
+    if pa <= 0.5 {
+        return Rgba::new(0, 0, 0, 0);
+    }
+    let inv = 255.0 / pa;
+    Rgba::new(
+        (pr * inv).round().clamp(0.0, 255.0) as u8,
+        (pg * inv).round().clamp(0.0, 255.0) as u8,
+        (pb * inv).round().clamp(0.0, 255.0) as u8,
+        pa.round().clamp(0.0, 255.0) as u8,
+    )
+}
+
+/// One axis's wrapped nearest-neighbour texel index for the normalised
+/// tile coordinate `u` — the exact index arithmetic of
+/// [`sample_tile_nearest_wrap`], factored out so an axis-aligned
+/// pattern transform can cache it per destination column / row.
+#[inline]
+pub(crate) fn tile_nearest_axis(u: f32, extent: usize) -> usize {
+    ((u * extent as f32).floor() as i64).rem_euclid(extent as i64) as usize
+}
+
+/// One axis's wrapped bilinear taps `(i0, i1, w1)` for the normalised
+/// tile coordinate `u` — the exact tap/weight arithmetic of
+/// [`sample_tile_bilinear_wrap`], factored out so an axis-aligned
+/// pattern transform can cache it per destination column / row.
+#[inline]
+pub(crate) fn tile_bilinear_axis(u: f32, extent: usize) -> (usize, usize, f32) {
+    let t = u * extent as f32 - 0.5;
+    let f = t.floor();
+    let w1 = (t - f).clamp(0.0, 1.0);
+    let i0 = (f as i64).rem_euclid(extent as i64) as usize;
+    let i1 = (i0 + 1) % extent;
+    (i0, i1, w1)
+}
+
+/// Bilinear tile sample from pre-resolved per-axis taps — the
+/// fetch / weight-combination / un-premultiply tail of
+/// [`sample_tile_bilinear_wrap`], byte-identical given taps produced
+/// by [`tile_bilinear_axis`] from the same coordinates.
+#[inline]
+pub(crate) fn sample_tile_bilinear_taps(
+    data: &[u8],
+    stride: usize,
+    col: (usize, usize, f32),
+    row: (usize, usize, f32),
+) -> Rgba {
+    let (x0, x1, wx) = col;
+    let (y0, y1, wy) = row;
     let fetch = |x: usize, y: usize| -> (f32, f32, f32, f32) {
         let i = y * stride + x * 4;
         let a = data[i + 3] as f32;

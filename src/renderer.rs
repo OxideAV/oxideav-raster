@@ -514,17 +514,53 @@ impl Renderer {
         // Rasterise the content subtree.
         let mut content_buf = vec![0u8; cap];
         self.draw_node(content, transform, 1.0, &mut content_buf, off_stride, None);
-        // Build a coverage AlphaMask from the mask buffer.
-        let cov = mask_buffer_to_alpha(&mask_buf, self.width, self.height, off_stride, kind);
-        // Intersect with any inherited clip.
+        // Restrict the coverage conversion + blit to the intersection
+        // of the content's and the mask's touched-alpha bounding
+        // boxes: outside the content box the blit skips every pixel
+        // (source alpha 0) no matter what the coverage says, and
+        // outside the mask box the coverage is provably 0 (both mask
+        // kinds multiply by / read the mask pixel's alpha), so the
+        // blit skips there too — the skipped pixels are exactly the
+        // ones the full scan would have skipped, and the output bytes
+        // are unchanged.
+        let Some((cx0, cy0, cx1, cy1)) =
+            alpha_bbox(&content_buf, off_stride, self.width, self.height)
+        else {
+            return; // fully-transparent content — the blit would no-op
+        };
+        let Some((mx0, my0, mx1, my1)) = alpha_bbox(&mask_buf, off_stride, self.width, self.height)
+        else {
+            return; // fully-transparent mask — zero coverage everywhere
+        };
+        let bbox = (cx0.max(mx0), cy0.max(my0), cx1.min(mx1), cy1.min(my1));
+        if bbox.0 > bbox.2 || bbox.1 > bbox.3 {
+            return; // disjoint content / mask — nothing is composited
+        }
+        // Build a coverage AlphaMask from the mask buffer (inside the
+        // content bbox only; everywhere else it stays 0, unread).
+        let cov =
+            mask_buffer_to_alpha_rect(&mask_buf, self.width, self.height, off_stride, kind, bbox);
+        // Intersect with any inherited clip (again only inside the
+        // bbox — the per-pixel min is only ever read there).
         let cov = match clip_mask {
-            Some(c) => intersect_masks(c, &cov),
+            Some(c) => {
+                let mut out = AlphaMask::new(self.width, self.height);
+                let (bx0, by0, bx1, by1) = bbox;
+                for y in by0..=by1 {
+                    let row = (y * self.width) as usize;
+                    for x in bx0..=bx1 {
+                        let i = row + x as usize;
+                        out.data[i] = c.data[i].min(cov.data[i]);
+                    }
+                }
+                out
+            }
             None => cov,
         };
         // Blit content_buf onto buf, modulated by cov (soft-mask
         // coverage, treated as a per-pixel alpha multiplier exactly
         // like a clip mask) + group_opacity.
-        blit_rgba_over(
+        blit_rgba_over_rect(
             buf,
             stride,
             self.width,
@@ -536,6 +572,7 @@ impl Renderer {
             0,
             Some(&cov),
             group_opacity,
+            bbox,
         );
     }
 
@@ -1167,6 +1204,79 @@ impl Renderer {
         let (ox, oy, pw, ph) = (pattern.x, pattern.y, pattern.width, pattern.height);
         let nearest = matches!(self.image_filter, ImageFilter::Nearest);
         let blend = self.blend_mode;
+        // Axis-aligned fast path (same argument as the image sampler:
+        // with no rotation / shear the tile coordinate `u` depends only
+        // on the destination column and `v` only on the row, and the
+        // per-axis wrap/tap arithmetic is cached from the identical
+        // expressions, so output bytes are unchanged).
+        if pat_to_dev.b == 0.0 && pat_to_dev.c == 0.0 {
+            let Some((tw_px, th_px, tile_stride, data)) = crate::pattern::tile_dims(&tile) else {
+                return; // degenerate tile — every sample is transparent
+            };
+            let (rx0, ry0, rx1, ry1) = rect;
+            let col_u = |x: u32| -> f32 {
+                let q = inv.apply(oxideav_core::Point::new(x as f32 + 0.5, 0.5));
+                (q.x - ox) / pw
+            };
+            let row_v = |y: u32| -> f32 {
+                let q = inv.apply(oxideav_core::Point::new(0.5, y as f32 + 0.5));
+                (q.y - oy) / ph
+            };
+            if nearest {
+                let cols: Vec<usize> = (rx0..=rx1)
+                    .map(|x| crate::pattern::tile_nearest_axis(col_u(x), tw_px))
+                    .collect();
+                let rows: Vec<usize> = (ry0..=ry1)
+                    .map(|y| crate::pattern::tile_nearest_axis(row_v(y), th_px))
+                    .collect();
+                composite_rgba_premultiplied_blend_rect(
+                    buf,
+                    stride,
+                    self.width,
+                    self.height,
+                    mask,
+                    0,
+                    0,
+                    group_opacity,
+                    blend,
+                    rect,
+                    move |x, y| {
+                        let px = cols[(x - rx0) as usize];
+                        let py = rows[(y - ry0) as usize];
+                        let i = py * tile_stride + px * 4;
+                        Rgba::new(data[i], data[i + 1], data[i + 2], data[i + 3])
+                    },
+                );
+            } else {
+                let cols: Vec<(usize, usize, f32)> = (rx0..=rx1)
+                    .map(|x| crate::pattern::tile_bilinear_axis(col_u(x), tw_px))
+                    .collect();
+                let rows: Vec<(usize, usize, f32)> = (ry0..=ry1)
+                    .map(|y| crate::pattern::tile_bilinear_axis(row_v(y), th_px))
+                    .collect();
+                composite_rgba_premultiplied_blend_rect(
+                    buf,
+                    stride,
+                    self.width,
+                    self.height,
+                    mask,
+                    0,
+                    0,
+                    group_opacity,
+                    blend,
+                    rect,
+                    move |x, y| {
+                        crate::pattern::sample_tile_bilinear_taps(
+                            data,
+                            tile_stride,
+                            cols[(x - rx0) as usize],
+                            rows[(y - ry0) as usize],
+                        )
+                    },
+                );
+            }
+            return;
+        }
         composite_rgba_premultiplied_blend_rect(
             buf,
             stride,
@@ -1287,6 +1397,44 @@ fn blit_rgba_over(
     if src_width == 0 || src_height == 0 {
         return;
     }
+    blit_rgba_over_rect(
+        dst,
+        dst_stride,
+        dst_width,
+        dst_height,
+        src,
+        src_width,
+        src_height,
+        offset_x,
+        offset_y,
+        clip_mask,
+        extra_alpha,
+        (0, 0, src_width - 1, src_height - 1),
+    )
+}
+
+/// [`blit_rgba_over`] restricted to the inclusive **source**-coordinate
+/// rectangle `src_rect = (x0, y0, x1, y1)`. Callers pass a rectangle
+/// outside which every source pixel has zero alpha, so the skipped
+/// pixels are exactly the ones the full scan would have skipped.
+#[allow(clippy::too_many_arguments)]
+fn blit_rgba_over_rect(
+    dst: &mut [u8],
+    dst_stride: usize,
+    dst_width: u32,
+    dst_height: u32,
+    src: &[u8],
+    src_width: u32,
+    src_height: u32,
+    offset_x: u32,
+    offset_y: u32,
+    clip_mask: Option<&AlphaMask>,
+    extra_alpha: f32,
+    src_rect: (u32, u32, u32, u32),
+) {
+    if src_width == 0 || src_height == 0 {
+        return;
+    }
     if offset_x >= dst_width || offset_y >= dst_height {
         return;
     }
@@ -1298,10 +1446,15 @@ fn blit_rgba_over(
     let w = src_width.min(dst_width - offset_x) as usize;
     let h = src_height.min(dst_height - offset_y) as usize;
     let src_stride = (src_width as usize) * 4;
-    for y in 0..h {
+    let (rx0, ry0, rx1, ry1) = src_rect;
+    let y_lo = (ry0 as usize).min(h);
+    let y_hi = ((ry1 as usize) + 1).min(h);
+    let x_lo = (rx0 as usize).min(w);
+    let x_hi = ((rx1 as usize) + 1).min(w);
+    for y in y_lo..y_hi {
         let dst_row = (offset_y as usize + y) * dst_stride;
         let src_row = y * src_stride;
-        for x in 0..w {
+        for x in x_lo..x_hi {
             let si = src_row + x * 4;
             let sa_raw = src[si + 3] as u32;
             if sa_raw == 0 {
@@ -1461,17 +1614,28 @@ fn crop_to_bbox(
 ///   `/Luminosity` semantics.
 /// * [`MaskKind::Alpha`]: the pixel's own alpha channel verbatim.
 ///   Matches SVG `<mask mask-type="alpha">` and PDF `SMask` `/Alpha`.
-fn mask_buffer_to_alpha(
+///
+/// Restricted to the inclusive pixel rectangle `rect`; everything
+/// outside stays `0`. Callers pair the result with a blit restricted
+/// to the same rectangle, so the unconverted pixels are never read.
+fn mask_buffer_to_alpha_rect(
     buf: &[u8],
     width: u32,
     height: u32,
     stride: usize,
     kind: MaskKind,
+    rect: (u32, u32, u32, u32),
 ) -> AlphaMask {
     let mut out = AlphaMask::new(width, height);
-    for y in 0..height {
+    let (rx0, ry0, rx1, ry1) = rect;
+    let rx1 = rx1.min(width.saturating_sub(1));
+    let ry1 = ry1.min(height.saturating_sub(1));
+    if width == 0 || height == 0 || rx0 > rx1 || ry0 > ry1 {
+        return out;
+    }
+    for y in ry0..=ry1 {
         let row = (y as usize) * stride;
-        for x in 0..width {
+        for x in rx0..=rx1 {
             let i = row + (x as usize) * 4;
             let cov = match kind {
                 MaskKind::Alpha => buf[i + 3],
@@ -1488,6 +1652,36 @@ fn mask_buffer_to_alpha(
         }
     }
     out
+}
+
+/// Scan a packed-RGBA buffer for the inclusive bounding box of every
+/// pixel with non-zero alpha. Returns `None` when no pixel is touched.
+fn alpha_bbox(buf: &[u8], stride: usize, width: u32, height: u32) -> Option<(u32, u32, u32, u32)> {
+    let mut min_x = width;
+    let mut max_x = 0u32;
+    let mut min_y = height;
+    let mut max_y = 0u32;
+    let mut any = false;
+    let w = width as usize;
+    for y in 0..height {
+        let row = (y as usize) * stride;
+        // Short-circuit per row: first touched column from the left,
+        // last touched column from the right. Dense rows resolve in a
+        // few probes; empty rows cost one full scan.
+        let Some(first) = (0..w).find(|&x| buf[row + x * 4 + 3] != 0) else {
+            continue;
+        };
+        let last = (first..w)
+            .rev()
+            .find(|&x| buf[row + x * 4 + 3] != 0)
+            .unwrap_or(first);
+        any = true;
+        min_x = min_x.min(first as u32);
+        max_x = max_x.max(last as u32);
+        min_y = min_y.min(y);
+        max_y = y;
+    }
+    any.then_some((min_x, min_y, max_x, max_y))
 }
 
 /// Intersect two alpha masks (per-pixel min). Both must have the same
