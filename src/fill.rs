@@ -88,8 +88,24 @@ pub fn rasterize_fill(
     fill_rule: FillRule,
     supersampling: u8,
 ) -> AlphaMask {
+    rasterize_fill_with_bounds(contours, width, height, fill_rule, supersampling).0
+}
+
+/// Like [`rasterize_fill`], but additionally reports the inclusive
+/// destination-pixel bounding box `(min_x, min_y, max_x, max_y)` of
+/// every pixel column/row any span touched, or `None` when no span was
+/// emitted at all. Every pixel outside the reported box is guaranteed
+/// to be `0` in the mask, so downstream compositors can restrict their
+/// scan to the box without changing any output byte.
+pub(crate) fn rasterize_fill_with_bounds(
+    contours: &[FlatContour],
+    width: u32,
+    height: u32,
+    fill_rule: FillRule,
+    supersampling: u8,
+) -> (AlphaMask, Option<(u32, u32, u32, u32)>) {
     if width == 0 || height == 0 || contours.is_empty() {
-        return AlphaMask::new(width, height);
+        return (AlphaMask::new(width, height), None);
     }
     let ss = match supersampling {
         0 | 1 => 1u32,
@@ -99,10 +115,10 @@ pub fn rasterize_fill(
     };
     let ss_h = height.saturating_mul(ss);
     if ss_h == 0 {
-        return AlphaMask::new(width, height);
+        return (AlphaMask::new(width, height), None);
     }
 
-    let mut edges: Vec<Edge> = Vec::new();
+    let mut edges: Vec<Edge> = Vec::with_capacity(contours.iter().map(|c| c.points.len()).sum());
     for c in contours {
         if c.points.len() < 2 {
             continue;
@@ -142,7 +158,7 @@ pub fn rasterize_fill(
     }
 
     if edges.is_empty() {
-        return AlphaMask::new(width, height);
+        return (AlphaMask::new(width, height), None);
     }
 
     edges.sort_by(|a, b| {
@@ -151,89 +167,137 @@ pub fn rasterize_fill(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
-    // Fractional coverage accumulator for the supersampled grid. Each
-    // cell holds the horizontal area coverage in `[0.0, 1.0]` for that
+    // Fractional coverage accumulator for ONE destination row's block
+    // of `ss` supersample rows (row-major, stride = width). Each cell
+    // holds the horizontal area coverage in `[0.0, 1.0]` for that
     // supersample row (boundary pixels carry partial coverage).
-    let mut coverage: Vec<f32> = vec![0.0; (width as usize) * (ss_h as usize)];
+    //
+    // Working one destination-row block at a time (instead of a full
+    // `width × height × ss` grid) keeps the accumulator resident in
+    // cache and makes the allocation O(width) — the per-supersample-row
+    // fills and the `s = 0..ss` averaging below visit the exact same
+    // values in the exact same order as the full-grid formulation, so
+    // the output bytes are identical.
+    let w = width as usize;
+    let mut block: Vec<f32> = vec![0.0; w * (ss as usize)];
+
+    let mut mask = AlphaMask::new(width, height);
+    let inv_ss = 1.0 / ss as f32;
 
     let mut active: Vec<ActiveEdge> = Vec::new();
     let mut next_edge = 0usize;
 
-    for ss_y in 0..ss_h {
-        let y = ss_y as f32 + 0.5;
+    // Union of every span's touched pixel-column/row range, in
+    // destination pixels (inclusive).
+    let mut bounds: Option<(u32, u32, u32, u32)> = None;
 
-        while next_edge < edges.len() && edges[next_edge].y_min <= y {
-            let e = &edges[next_edge];
-            if e.y_max > y {
-                let x = e.x_at_y_min + (y - e.y_min) * e.dxdy;
-                active.push(ActiveEdge {
-                    x,
-                    y_max: e.y_max,
-                    dxdy: e.dxdy,
-                    winding: e.winding,
-                });
-            }
-            next_edge += 1;
-        }
-        active.retain(|e| e.y_max > y);
+    for dest_y in 0..height {
+        // Touched column range within this block (inclusive), tracked
+        // so the averaging + re-zeroing pass below only walks columns a
+        // span actually wrote. Untouched columns hold coverage 0.0,
+        // which averages to alpha 0 — the value the mask already holds.
+        let mut block_lo = w;
+        let mut block_hi = 0usize;
 
-        if active.is_empty() {
-            continue;
-        }
+        for s in 0..ss {
+            let ss_y = dest_y * ss + s;
+            let y = ss_y as f32 + 0.5;
 
-        active.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal));
-
-        let row = &mut coverage
-            [(ss_y as usize) * (width as usize)..(ss_y as usize + 1) * (width as usize)];
-
-        match fill_rule {
-            FillRule::EvenOdd => {
-                let n = active.len();
-                let mut i = 0;
-                while i + 1 < n {
-                    fill_span(row, active[i].x, active[i + 1].x, width);
-                    i += 2;
+            while next_edge < edges.len() && edges[next_edge].y_min <= y {
+                let e = &edges[next_edge];
+                if e.y_max > y {
+                    let x = e.x_at_y_min + (y - e.y_min) * e.dxdy;
+                    active.push(ActiveEdge {
+                        x,
+                        y_max: e.y_max,
+                        dxdy: e.dxdy,
+                        winding: e.winding,
+                    });
                 }
+                next_edge += 1;
             }
-            FillRule::NonZero => {
-                // Walk the active edges left-to-right. After crossing
-                // edge `w`, the winding number on the right side of
-                // that edge is `winding + active[w].winding`. A span
-                // is filled when that running sum is non-zero.
-                let mut winding = 0i32;
-                for w in 0..active.len().saturating_sub(1) {
-                    winding += active[w].winding;
-                    if winding != 0 {
-                        fill_span(row, active[w].x, active[w + 1].x, width);
+            active.retain(|e| e.y_max > y);
+
+            if active.is_empty() {
+                continue;
+            }
+
+            active.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal));
+
+            let row = &mut block[(s as usize) * w..(s as usize + 1) * w];
+
+            let mut touched = |range: Option<(usize, usize)>| {
+                if let Some((lo, hi)) = range {
+                    block_lo = block_lo.min(lo);
+                    block_hi = block_hi.max(hi);
+                }
+            };
+
+            match fill_rule {
+                FillRule::EvenOdd => {
+                    let n = active.len();
+                    let mut i = 0;
+                    while i + 1 < n {
+                        touched(fill_span(row, active[i].x, active[i + 1].x, width));
+                        i += 2;
+                    }
+                }
+                FillRule::NonZero => {
+                    // Walk the active edges left-to-right. After
+                    // crossing edge `w`, the winding number on the
+                    // right side of that edge is
+                    // `winding + active[w].winding`. A span is filled
+                    // when that running sum is non-zero.
+                    let mut winding = 0i32;
+                    for e in 0..active.len().saturating_sub(1) {
+                        winding += active[e].winding;
+                        if winding != 0 {
+                            touched(fill_span(row, active[e].x, active[e + 1].x, width));
+                        }
                     }
                 }
             }
+
+            for e in &mut active {
+                e.x += e.dxdy;
+            }
         }
 
-        for e in &mut active {
-            e.x += e.dxdy;
+        if block_lo > block_hi {
+            continue; // no span touched this destination row
         }
-    }
 
-    // Average ss rows into one destination row. Each supersample cell is
-    // already a fractional [0, 1] horizontal coverage; the mean over the
-    // ss rows is the pixel's combined 2D coverage.
-    let mut mask = AlphaMask::new(width, height);
-    let inv_ss = 1.0 / ss as f32;
-    for y in 0..height {
-        for x in 0..width {
+        // Average the ss supersample rows into the destination row over
+        // the touched column range, then re-zero the block for reuse.
+        // Each supersample cell is already a fractional [0, 1]
+        // horizontal coverage; the mean over the ss rows is the pixel's
+        // combined 2D coverage.
+        let mask_row = (dest_y as usize) * w;
+        for x in block_lo..=block_hi {
             let mut sum = 0.0f32;
             for s in 0..ss {
-                let row = (y * ss + s) as usize;
-                let idx = row * (width as usize) + (x as usize);
-                sum += coverage[idx];
+                sum += block[(s as usize) * w + x];
             }
             // Mean coverage in [0, 1] → 0..255, rounded to nearest.
             let alpha = (sum * inv_ss * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
-            mask.data[(y * width + x) as usize] = alpha;
+            mask.data[mask_row + x] = alpha;
         }
+        for s in 0..ss {
+            block[(s as usize) * w + block_lo..(s as usize) * w + block_hi + 1].fill(0.0);
+        }
+
+        bounds = Some(match bounds {
+            None => (block_lo as u32, dest_y, block_hi as u32, dest_y),
+            Some((bx0, by0, bx1, by1)) => (
+                bx0.min(block_lo as u32),
+                by0.min(dest_y),
+                bx1.max(block_hi as u32),
+                by1.max(dest_y),
+            ),
+        });
     }
-    mask
+
+    (mask, bounds)
 }
 
 /// Add the horizontal coverage of the span `[x0, x1)` to `row`.
@@ -245,25 +309,28 @@ pub fn rasterize_fill(
 /// any horizontal supersampling. Spans within one scanline are produced
 /// non-overlapping and left-to-right by the parity / winding walk, so
 /// the additive accumulation never double-counts a pixel.
+///
+/// Returns the inclusive `(first, last)` pixel-column range the span
+/// touched, or `None` when the clipped span was empty.
 #[inline]
-fn fill_span(row: &mut [f32], x0: f32, x1: f32, width: u32) {
+fn fill_span(row: &mut [f32], x0: f32, x1: f32, width: u32) -> Option<(usize, usize)> {
     // Clip the span to the raster width.
     let x0 = x0.max(0.0);
     let x1 = x1.min(width as f32);
     if x1 <= x0 {
-        return;
+        return None;
     }
     let lo = x0.floor() as usize;
     // `hi` is the index of the last pixel the span touches.
     let hi_f = x1.ceil();
     let hi = (hi_f as usize).min(width as usize);
     if hi <= lo {
-        return;
+        return None;
     }
     if lo + 1 == hi {
         // The whole span sits inside a single pixel column.
         row[lo] += (x1 - x0).clamp(0.0, 1.0);
-        return;
+        return Some((lo, lo));
     }
     // Left boundary pixel `lo`: covered from x0 to its right edge (lo+1).
     row[lo] += ((lo as f32 + 1.0) - x0).clamp(0.0, 1.0);
@@ -273,6 +340,7 @@ fn fill_span(row: &mut [f32], x0: f32, x1: f32, width: u32) {
     }
     // Right boundary pixel `hi-1`: covered from its left edge (hi-1) to x1.
     row[hi - 1] += (x1 - (hi as f32 - 1.0)).clamp(0.0, 1.0);
+    Some((lo, hi - 1))
 }
 
 #[derive(Debug, Clone, Copy)]

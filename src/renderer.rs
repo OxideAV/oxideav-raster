@@ -10,8 +10,8 @@ use oxideav_core::{
 
 use crate::blend::BlendMode;
 use crate::cache::{composite_key, CacheStats, RasterizedSubtree, SharedCache};
-use crate::composite::composite_rgba_premultiplied_blend;
-use crate::fill::{rasterize_fill, AlphaMask};
+use crate::composite::composite_rgba_premultiplied_blend_rect;
+use crate::fill::{rasterize_fill, rasterize_fill_with_bounds, AlphaMask};
 use crate::filter::PreserveAspectRatio;
 use crate::flatten::{flatten_path, FlatContour};
 use crate::gradient::InterpolationSpace;
@@ -551,7 +551,7 @@ impl Renderer {
         // Fill pass.
         if let Some(fill) = &node.fill {
             let contours = flatten_path(&node.path.commands, &transform);
-            let mask = rasterize_fill(
+            let (mask, bounds) = rasterize_fill_with_bounds(
                 &contours,
                 self.width,
                 self.height,
@@ -562,12 +562,12 @@ impl Renderer {
                 Some(c) => intersect_masks(c, &mask),
                 None => mask,
             };
-            self.composite_with_paint(buf, stride, &mask, fill, group_opacity);
+            self.composite_with_paint(buf, stride, &mask, bounds, fill, group_opacity);
         }
         // Stroke pass.
         if let Some(stroke) = &node.stroke {
             let stroke_geom = build_stroke_geometry(&node.path, &transform, stroke);
-            let mask = rasterize_fill(
+            let (mask, bounds) = rasterize_fill_with_bounds(
                 &stroke_geom,
                 self.width,
                 self.height,
@@ -578,7 +578,7 @@ impl Renderer {
                 Some(c) => intersect_masks(c, &mask),
                 None => mask,
             };
-            self.composite_with_paint(buf, stride, &mask, &stroke.paint, group_opacity);
+            self.composite_with_paint(buf, stride, &mask, bounds, &stroke.paint, group_opacity);
         }
     }
 
@@ -587,19 +587,26 @@ impl Renderer {
         buf: &mut [u8],
         stride: usize,
         mask: &AlphaMask,
+        bounds: Option<(u32, u32, u32, u32)>,
         paint: &Paint,
         group_opacity: f32,
     ) {
         if mask.is_empty() {
             return;
         }
+        // No span was rasterised: the mask is all-zero, so the
+        // composite scan would skip every pixel anyway.
+        let Some((bx0, by0, bx1, by1)) = bounds else {
+            return;
+        };
+        let rect = (bx0, by0, bx1, by1);
         // Clone gradient-bearing paints so the per-pixel sampler
         // doesn't have to re-resolve at each call.
         let blend = self.blend_mode;
         match paint {
             Paint::Solid(c) => {
                 let c = *c;
-                composite_rgba_premultiplied_blend(
+                composite_rgba_premultiplied_blend_rect(
                     buf,
                     stride,
                     self.width,
@@ -609,6 +616,7 @@ impl Renderer {
                     0,
                     group_opacity,
                     blend,
+                    rect,
                     move |_x, _y| c,
                 );
             }
@@ -629,7 +637,7 @@ impl Renderer {
                 let lut = build_paint_lut(other, space);
                 let other = other.clone();
                 match lut {
-                    Some(lut) => composite_rgba_premultiplied_blend(
+                    Some(lut) => composite_rgba_premultiplied_blend_rect(
                         buf,
                         stride,
                         self.width,
@@ -639,11 +647,12 @@ impl Renderer {
                         0,
                         group_opacity,
                         blend,
+                        rect,
                         move |x, y| {
                             sample_paint_with_lut(&other, x as f32 + 0.5, y as f32 + 0.5, &lut)
                         },
                     ),
-                    None => composite_rgba_premultiplied_blend(
+                    None => composite_rgba_premultiplied_blend_rect(
                         buf,
                         stride,
                         self.width,
@@ -653,6 +662,7 @@ impl Renderer {
                         0,
                         group_opacity,
                         blend,
+                        rect,
                         move |x, y| sample_paint_in(&other, x as f32 + 0.5, y as f32 + 0.5, space),
                     ),
                 }
@@ -678,7 +688,7 @@ impl Renderer {
         let rect_path = rect_to_path(img.bounds);
         let local = transform.compose(&img.transform);
         let contours = flatten_path(&rect_path.commands, &local);
-        let mask = rasterize_fill(
+        let (mask, fill_bounds) = rasterize_fill_with_bounds(
             &contours,
             self.width,
             self.height,
@@ -689,16 +699,19 @@ impl Renderer {
             Some(c) => intersect_masks(c, &mask),
             None => mask,
         };
+        let Some((bx0, by0, bx1, by1)) = fill_bounds else {
+            return;
+        };
         // Inverse transform pixel → user-space → image local UV.
         let inv = match invert_2d(&local) {
             Some(t) => t,
             None => return,
         };
         let bounds = img.bounds;
-        let frame = img.frame.clone();
+        let frame: &VideoFrame = &img.frame;
         let filter = self.image_filter;
         let blend = self.blend_mode;
-        composite_rgba_premultiplied_blend(
+        composite_rgba_premultiplied_blend_rect(
             buf,
             stride,
             self.width,
@@ -708,18 +721,19 @@ impl Renderer {
             0,
             group_opacity,
             blend,
+            (bx0, by0, bx1, by1),
             move |x, y| {
                 let user = inv.apply(oxideav_core::Point::new(x as f32 + 0.5, y as f32 + 0.5));
                 match filter {
-                    ImageFilter::Nearest => sample_image_nearest(&frame, &bounds, user.x, user.y),
-                    ImageFilter::Bilinear => sample_image_bilinear(&frame, &bounds, user.x, user.y),
-                    ImageFilter::Lanczos2 => sample_image_lanczos2(&frame, &bounds, user.x, user.y),
-                    ImageFilter::Lanczos3 => sample_image_lanczos3(&frame, &bounds, user.x, user.y),
-                    ImageFilter::Mitchell => sample_image_mitchell(&frame, &bounds, user.x, user.y),
+                    ImageFilter::Nearest => sample_image_nearest(frame, &bounds, user.x, user.y),
+                    ImageFilter::Bilinear => sample_image_bilinear(frame, &bounds, user.x, user.y),
+                    ImageFilter::Lanczos2 => sample_image_lanczos2(frame, &bounds, user.x, user.y),
+                    ImageFilter::Lanczos3 => sample_image_lanczos3(frame, &bounds, user.x, user.y),
+                    ImageFilter::Mitchell => sample_image_mitchell(frame, &bounds, user.x, user.y),
                     ImageFilter::CatmullRom => {
-                        sample_image_catmull_rom(&frame, &bounds, user.x, user.y)
+                        sample_image_catmull_rom(frame, &bounds, user.x, user.y)
                     }
-                    ImageFilter::BSpline => sample_image_b_spline(&frame, &bounds, user.x, user.y),
+                    ImageFilter::BSpline => sample_image_b_spline(frame, &bounds, user.x, user.y),
                 }
             },
         );
@@ -749,14 +763,14 @@ impl Renderer {
         let stride = (self.width as usize) * 4;
         let mut buf = vec![0u8; stride * (self.height as usize)];
         let contours = flatten_path(&path.commands, &transform);
-        let mask = rasterize_fill(
+        let (mask, bounds) = rasterize_fill_with_bounds(
             &contours,
             self.width,
             self.height,
             fill_rule,
             self.supersampling,
         );
-        self.composite_with_pattern(&mut buf, stride, &mask, pattern, transform, 1.0);
+        self.composite_with_pattern(&mut buf, stride, &mask, bounds, pattern, transform, 1.0);
         VideoFrame {
             pts: None,
             planes: vec![VideoPlane { stride, data: buf }],
@@ -781,14 +795,14 @@ impl Renderer {
         let stride = (self.width as usize) * 4;
         let mut buf = vec![0u8; stride * (self.height as usize)];
         let geom = build_stroke_geometry(path, &transform, stroke);
-        let mask = rasterize_fill(
+        let (mask, bounds) = rasterize_fill_with_bounds(
             &geom,
             self.width,
             self.height,
             FillRule::NonZero,
             self.supersampling,
         );
-        self.composite_with_pattern(&mut buf, stride, &mask, pattern, transform, 1.0);
+        self.composite_with_pattern(&mut buf, stride, &mask, bounds, pattern, transform, 1.0);
         VideoFrame {
             pts: None,
             planes: vec![VideoPlane { stride, data: buf }],
@@ -809,6 +823,7 @@ impl Renderer {
         buf: &mut [u8],
         stride: usize,
         mask: &AlphaMask,
+        bounds: Option<(u32, u32, u32, u32)>,
         pattern: &Pattern,
         transform: Transform2D,
         group_opacity: f32,
@@ -816,6 +831,9 @@ impl Renderer {
         if mask.is_empty() || pattern.is_degenerate() {
             return;
         }
+        let Some(rect) = bounds else {
+            return; // all-zero mask — nothing to composite
+        };
         // Pattern space → device space: patternTransform is
         // post-multiplied (inserted to the right, §14.3.1).
         let pat_to_dev = transform.compose(&pattern.transform);
@@ -834,7 +852,7 @@ impl Renderer {
         let (ox, oy, pw, ph) = (pattern.x, pattern.y, pattern.width, pattern.height);
         let nearest = matches!(self.image_filter, ImageFilter::Nearest);
         let blend = self.blend_mode;
-        composite_rgba_premultiplied_blend(
+        composite_rgba_premultiplied_blend_rect(
             buf,
             stride,
             self.width,
@@ -844,6 +862,7 @@ impl Renderer {
             0,
             group_opacity,
             blend,
+            rect,
             move |x, y| {
                 let q = inv.apply(oxideav_core::Point::new(x as f32 + 0.5, y as f32 + 0.5));
                 // Normalised tile coordinates; the samplers wrap, so no
@@ -985,6 +1004,19 @@ fn blit_rgba_over(
             // src_alpha = sa_raw * cov * extra / (255 * 255)
             let combined = (sa_raw * cov * extra_q + (255 * 255 / 2)) / (255 * 255);
             if combined == 0 {
+                continue;
+            }
+            if combined == 255 {
+                // Fully-opaque source pixel: the over operator reduces
+                // to a plain overwrite (with `sa = 255` the premultiply
+                // is exact, `inv = 0` zeroes every destination term,
+                // and the final un-premultiply divides by 255 giving
+                // the source bytes back verbatim).
+                let pidx = dst_row + (offset_x as usize + x) * 4;
+                dst[pidx] = src[si];
+                dst[pidx + 1] = src[si + 1];
+                dst[pidx + 2] = src[si + 2];
+                dst[pidx + 3] = 255;
                 continue;
             }
             let sa = combined;

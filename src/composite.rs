@@ -79,6 +79,46 @@ pub fn composite_rgba_premultiplied_blend(
     offset_y: i32,
     extra_alpha: f32,
     blend: BlendMode,
+    paint_at: impl FnMut(u32, u32) -> Rgba,
+) {
+    if mask.is_empty() {
+        return;
+    }
+    composite_rgba_premultiplied_blend_rect(
+        dst,
+        dst_stride,
+        dst_width,
+        dst_height,
+        mask,
+        offset_x,
+        offset_y,
+        extra_alpha,
+        blend,
+        (0, 0, mask.width - 1, mask.height - 1),
+        paint_at,
+    )
+}
+
+/// [`composite_rgba_premultiplied_blend`] restricted to the inclusive
+/// mask-coordinate rectangle `(x0, y0, x1, y1)`.
+///
+/// Every mask pixel outside the rectangle is treated as if its
+/// coverage were zero — callers pass the touched-pixel bounding box
+/// reported by the rasteriser, whose contract guarantees exactly that,
+/// so restricting the scan changes no output byte while skipping the
+/// all-zero border of a small shape on a large canvas.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn composite_rgba_premultiplied_blend_rect(
+    dst: &mut [u8],
+    dst_stride: usize,
+    dst_width: u32,
+    dst_height: u32,
+    mask: &AlphaMask,
+    offset_x: i32,
+    offset_y: i32,
+    extra_alpha: f32,
+    blend: BlendMode,
+    rect: (u32, u32, u32, u32),
     mut paint_at: impl FnMut(u32, u32) -> Rgba,
 ) {
     if mask.is_empty() {
@@ -89,7 +129,13 @@ pub fn composite_rgba_premultiplied_blend(
     if extra_q == 0 {
         return;
     }
-    for my in 0..mask.height {
+    let (rx0, ry0, rx1, ry1) = rect;
+    let rx1 = rx1.min(mask.width - 1);
+    let ry1 = ry1.min(mask.height - 1);
+    if rx0 > rx1 || ry0 > ry1 {
+        return;
+    }
+    for my in ry0..=ry1 {
         let dy = offset_y + my as i32;
         if dy < 0 || dy as u32 >= dst_height {
             continue;
@@ -97,7 +143,7 @@ pub fn composite_rgba_premultiplied_blend(
         let row_off = (dy as usize) * dst_stride;
         let mask_row = &mask.data
             [(my as usize) * (mask.width as usize)..((my as usize) + 1) * (mask.width as usize)];
-        for mx in 0..mask.width {
+        for mx in rx0..=rx1 {
             let cov = mask_row[mx as usize];
             if cov == 0 {
                 continue;
@@ -116,6 +162,20 @@ pub fn composite_rgba_premultiplied_blend(
                 continue;
             }
             if blend.is_normal() {
+                if combined == 255 {
+                    // Fully-opaque source pixel: the over operator
+                    // reduces to a plain overwrite. Algebraically
+                    // identical to the general path below — with
+                    // `sa = 255` the premultiply `(c·255 + 127) / 255`
+                    // is exact, `inv = 0` zeroes every destination
+                    // term, and the final un-premultiply divides by
+                    // `oa = 255` returning the source bytes verbatim.
+                    dst[pidx] = src.r;
+                    dst[pidx + 1] = src.g;
+                    dst[pidx + 2] = src.b;
+                    dst[pidx + 3] = 255;
+                    continue;
+                }
                 // Fast path: standard premultiplied source-over.
                 let sa = combined;
                 let sr = ((src.r as u32) * sa + 127) / 255;

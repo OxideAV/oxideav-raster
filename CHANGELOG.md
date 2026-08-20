@@ -18,6 +18,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   gradient fills through the stops LUT, warm bitmap-cache hit).
   Baselines recorded in `BENCHMARKS.md`.
 
+### Changed
+
+- **Scanline fill + composite pipeline made allocation- and
+  scan-proportional to the shape, not the canvas — output bytes
+  identical.** Three coordinated changes, each proven byte-exact:
+  the fill rasteriser accumulates coverage in a single
+  `width × supersample`-row block (reused per destination row) instead
+  of materialising the full `width × height × supersample` grid, and
+  reports the touched-pixel bounding box; the renderer's paint /
+  image / pattern composites restrict their mask scan to that box
+  (outside it the mask is all-zero by construction); and the
+  source-over composite / cached-bitmap blit take a plain-overwrite
+  shortcut for fully-opaque source pixels (algebraically the general
+  path collapses to the source bytes when the combined alpha is 255).
+  Proven identical by a new 1600-case randomised differential test
+  against the full-grid reference formulation
+  (`tests/fill_reference_equivalence.rs`), the existing
+  pixel-pinning suites, and a 31-scene whole-frame hash A/B against
+  the previous commit. Representative wins on the Criterion
+  harnesses: `render_glyphlike_400_256` 58.9 ms → 1.80 ms,
+  `render_scene_256` 3.74 ms → 0.40 ms, `render_softmask_256`
+  0.95 ms → 0.49 ms, `render_cached_group_hit_256` 148 µs → 53 µs.
+
 ### Fixed
 
 - **Fuzzer-found: extreme `feOffset` / `feDropShadow` /
