@@ -62,6 +62,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   0.73 ms → 0.56 ms; pattern fills gain 1.7–2.0× from the
   touched-bounds composite scan.
 
+- **Filter-kernel hot loops sped up with byte-exact rewrites** (all
+  pinned by new differential tests in
+  `tests/filter_kernel_equivalence.rs` plus the existing suites):
+  `feComponentTransfer` builds four 256-entry LUTs with the exact
+  per-pixel normalise → apply → quantise pipeline (548 µs → 131 µs on
+  the 256² bench); `feMorphology`'s 1-D passes use the block
+  prefix/suffix extremum decomposition (van Herk 1992 / Gil & Werman
+  1993) for `O(1)`-per-pixel cost independent of radius (dilate r=15:
+  2.28 ms → 0.64 ms) — which also bounds a hostile radius at `O(len)`
+  per line (the effective radius is clamped to `len − 1`, past which
+  the clamp-to-edge window already covers the whole line); the
+  linearRGB entry/exit transforms use byte→byte LUTs built with the
+  identical transfer-function + quantiser pipeline (graph chain in
+  linearRGB: 643 µs → 488 µs); and the direct small-`stdDeviation`
+  Gaussian convolution walks interior pixels without per-tap edge
+  resolution.
+
 ### Fixed
 
 - **Fuzzer-found: extreme `feOffset` / `feDropShadow` /

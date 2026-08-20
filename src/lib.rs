@@ -83,8 +83,10 @@
 //!   [`morphology_pixels`] functions selectable via [`MorphologyOp`].
 //!   Implemented via the separable-rectangle decomposition
 //!   `f ⊖ B = (f ⊖ Bx) ⊖ By`, `f ⊕ B = (f ⊕ Bx) ⊕ By` (Serra 1982
-//!   §I.4 Theorem 4.1 / Gonzalez & Woods 2008 §9.4.1) so the
-//!   per-pixel work scales as `O(rx + ry)` instead of `O(rx · ry)`.
+//!   §I.4 Theorem 4.1 / Gonzalez & Woods 2008 §9.4.1), with each 1-D
+//!   pass running the block prefix/suffix extremum decomposition
+//!   (van Herk 1992 / Gil & Werman 1993) so the per-pixel work is
+//!   `O(1)` — independent of `rx` and `ry` — instead of `O(rx · ry)`.
 //! * `<feColorMatrix>` (SVG 1.1 §15.10) per-pixel 4×5 colour-matrix
 //!   transform, exposed as [`color_matrix`] (with a typed-pixel
 //!   wrapper [`color_matrix_pixels`]) and the [`color_matrix_op`]

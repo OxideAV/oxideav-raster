@@ -376,19 +376,51 @@ fn srgb_to_linear_lut() -> &'static [f32; 256] {
     })
 }
 
+/// 256-entry sRGB-byte → linear-light **byte** lookup table: each
+/// entry is the corresponding [`srgb_to_linear_lut`] float pushed
+/// through the same `· 255 → round → clamp` quantiser the per-pixel
+/// path used, so the mapping is byte-identical while the per-pixel
+/// work collapses to a single table read.
+fn srgb_to_linear_lut_u8() -> &'static [u8; 256] {
+    use std::sync::OnceLock;
+    static LUT: OnceLock<[u8; 256]> = OnceLock::new();
+    LUT.get_or_init(|| {
+        let float = srgb_to_linear_lut();
+        let mut t = [0u8; 256];
+        for (i, slot) in t.iter_mut().enumerate() {
+            *slot = (float[i] * 255.0).round().clamp(0.0, 255.0) as u8;
+        }
+        t
+    })
+}
+
+/// 256-entry linear-light-byte → sRGB **byte** lookup table — the
+/// exit-transform counterpart of [`srgb_to_linear_lut_u8`], built with
+/// the identical `linear_to_srgb_f32` + quantiser pipeline the
+/// per-pixel path used (the input domain is one byte, so the table is
+/// byte-exact by construction and eliminates the per-pixel `powf`).
+fn linear_to_srgb_lut_u8() -> &'static [u8; 256] {
+    use std::sync::OnceLock;
+    static LUT: OnceLock<[u8; 256]> = OnceLock::new();
+    LUT.get_or_init(|| {
+        let mut t = [0u8; 256];
+        for (i, slot) in t.iter_mut().enumerate() {
+            *slot = (linear_to_srgb_f32(i as f32 / 255.0) * 255.0)
+                .round()
+                .clamp(0.0, 255.0) as u8;
+        }
+        t
+    })
+}
+
 /// Convert one straight-alpha sRGB pixel into the linearRGB working
 /// space. Only the colour channels pass through the transfer curve;
 /// **alpha is coverage, not colour, and is left untouched** (Filter
 /// Effects 1 §10 — the property governs *colour* operations only).
 #[inline]
 fn pixel_srgb_to_linear(p: Rgba) -> Rgba {
-    let lut = srgb_to_linear_lut();
-    Rgba::new(
-        (lut[p.r as usize] * 255.0).round().clamp(0.0, 255.0) as u8,
-        (lut[p.g as usize] * 255.0).round().clamp(0.0, 255.0) as u8,
-        (lut[p.b as usize] * 255.0).round().clamp(0.0, 255.0) as u8,
-        p.a,
-    )
+    let lut = srgb_to_linear_lut_u8();
+    Rgba::new(lut[p.r as usize], lut[p.g as usize], lut[p.b as usize], p.a)
 }
 
 /// Re-encode one straight-alpha linearRGB pixel back to sRGB. The
@@ -396,18 +428,8 @@ fn pixel_srgb_to_linear(p: Rgba) -> Rgba {
 /// unchanged.
 #[inline]
 fn pixel_linear_to_srgb(p: Rgba) -> Rgba {
-    Rgba::new(
-        (linear_to_srgb_f32(p.r as f32 / 255.0) * 255.0)
-            .round()
-            .clamp(0.0, 255.0) as u8,
-        (linear_to_srgb_f32(p.g as f32 / 255.0) * 255.0)
-            .round()
-            .clamp(0.0, 255.0) as u8,
-        (linear_to_srgb_f32(p.b as f32 / 255.0) * 255.0)
-            .round()
-            .clamp(0.0, 255.0) as u8,
-        p.a,
-    )
+    let lut = linear_to_srgb_lut_u8();
+    Rgba::new(lut[p.r as usize], lut[p.g as usize], lut[p.b as usize], p.a)
 }
 
 /// Convert an sRGB filter buffer into the linearRGB working space
@@ -441,11 +463,11 @@ pub fn to_srgb_pixels(buf: &mut [Rgba]) {
 /// six codes in the very dark range. Use [`srgb_to_linear_f32`] when
 /// full precision is required.
 pub fn to_linear_rgb(buf: &mut [u8]) {
-    let lut = srgb_to_linear_lut();
+    let lut = srgb_to_linear_lut_u8();
     for px in buf.chunks_exact_mut(4) {
-        px[0] = (lut[px[0] as usize] * 255.0).round().clamp(0.0, 255.0) as u8;
-        px[1] = (lut[px[1] as usize] * 255.0).round().clamp(0.0, 255.0) as u8;
-        px[2] = (lut[px[2] as usize] * 255.0).round().clamp(0.0, 255.0) as u8;
+        px[0] = lut[px[0] as usize];
+        px[1] = lut[px[1] as usize];
+        px[2] = lut[px[2] as usize];
         // px[3] (alpha) unchanged.
     }
 }
@@ -455,16 +477,11 @@ pub fn to_linear_rgb(buf: &mut [u8]) {
 /// in place, leaving alpha untouched. `buf.len()` must be a multiple
 /// of 4.
 pub fn to_srgb(buf: &mut [u8]) {
+    let lut = linear_to_srgb_lut_u8();
     for px in buf.chunks_exact_mut(4) {
-        px[0] = (linear_to_srgb_f32(px[0] as f32 / 255.0) * 255.0)
-            .round()
-            .clamp(0.0, 255.0) as u8;
-        px[1] = (linear_to_srgb_f32(px[1] as f32 / 255.0) * 255.0)
-            .round()
-            .clamp(0.0, 255.0) as u8;
-        px[2] = (linear_to_srgb_f32(px[2] as f32 / 255.0) * 255.0)
-            .round()
-            .clamp(0.0, 255.0) as u8;
+        px[0] = lut[px[0] as usize];
+        px[1] = lut[px[1] as usize];
+        px[2] = lut[px[2] as usize];
         // px[3] (alpha) unchanged.
     }
 }
@@ -564,13 +581,15 @@ pub enum MorphologyOp {
 /// (Serra 1982 §I.4 Theorem 4.1; Gonzalez & Woods 2008 §9.4.1
 /// eq. 9.4-1). The implementation therefore runs a horizontal 1-D pass
 /// across each row, then a vertical 1-D pass down each column. Each
-/// pass is a naive sliding-window min/max with **clamp-to-edge**
-/// boundary handling (extending the image by its border pixels so the
-/// kernel is always full at the corners — the same SVG default the
-/// rest of the filter pipeline uses for missing samples).
+/// pass is a sliding-window min/max with **clamp-to-edge** boundary
+/// handling (extending the image by its border pixels so the kernel is
+/// always full at the corners — the same SVG default the rest of the
+/// filter pipeline uses for missing samples), evaluated with the block
+/// prefix/suffix extremum decomposition (van Herk 1992 / Gil & Werman
+/// 1993) so each pass costs `O(1)` per pixel regardless of radius.
 ///
-/// Complexity: `O(W · H · (rx + ry))` instead of the
-/// `O(W · H · rx · ry)` naive 2-D scan.
+/// Complexity: `O(W · H)` — independent of `rx` / `ry` — instead of
+/// the `O(W · H · rx · ry)` naive 2-D scan.
 ///
 /// # Panics
 ///
@@ -659,9 +678,24 @@ pub fn morphology(
 ///
 /// `src` and `dst` must be `len * 4` bytes. Boundary handling is
 /// clamp-to-edge: window samples outside `[0, len)` reuse the nearest
-/// in-bounds pixel. Naive `O(len · radius)` scan — chosen for
-/// clarity; a van Herk / Gil-Werman `O(len)` formulation is a future
-/// optimisation.
+/// in-bounds pixel — realised below by padding with the operator's
+/// neutral element (255 for erode-min, 0 for dilate-max), which
+/// contributes nothing to the window extremum, exactly like excluding
+/// the out-of-range samples.
+///
+/// Runs the block prefix/suffix extremum decomposition (van Herk 1992 /
+/// Gil & Werman 1993): with window width `W = 2·radius + 1`, the padded
+/// line is cut into blocks of `W`; `pre[j]` is the running extremum
+/// from the block start and `suf[j]` the running extremum to the block
+/// end, so every window `[a, a + W - 1]` is `op(suf[a], pre[a+W-1])` —
+/// `O(len)` total instead of the naive `O(len · radius)`. Because min /
+/// max over a fixed sample set is independent of evaluation order, the
+/// output bytes are identical to the naive scan's.
+///
+/// The effective radius is clamped to `len - 1` first: any radius that
+/// large already covers the whole (edge-clamped) line for every output
+/// pixel, so the clamp changes nothing while bounding a hostile
+/// radius's cost (previously `O(len · radius)` time) at `O(len)`.
 fn morphology_1d_horizontal(
     src: &[u8],
     dst: &mut [u8],
@@ -671,50 +705,53 @@ fn morphology_1d_horizontal(
 ) {
     debug_assert_eq!(src.len(), len * 4);
     debug_assert_eq!(dst.len(), len * 4);
-    let imax = len as isize - 1;
-    for i in 0..len {
-        let lo = (i as isize - radius as isize).max(0) as usize;
-        let hi = (i as isize + radius as isize).min(imax) as usize;
-        let mut acc = [
-            src[lo * 4],
-            src[lo * 4 + 1],
-            src[lo * 4 + 2],
-            src[lo * 4 + 3],
-        ];
-        for j in (lo + 1)..=hi {
-            let p = &src[j * 4..j * 4 + 4];
-            match op {
-                MorphologyOp::Erode => {
-                    if p[0] < acc[0] {
-                        acc[0] = p[0];
-                    }
-                    if p[1] < acc[1] {
-                        acc[1] = p[1];
-                    }
-                    if p[2] < acc[2] {
-                        acc[2] = p[2];
-                    }
-                    if p[3] < acc[3] {
-                        acc[3] = p[3];
-                    }
-                }
-                MorphologyOp::Dilate => {
-                    if p[0] > acc[0] {
-                        acc[0] = p[0];
-                    }
-                    if p[1] > acc[1] {
-                        acc[1] = p[1];
-                    }
-                    if p[2] > acc[2] {
-                        acc[2] = p[2];
-                    }
-                    if p[3] > acc[3] {
-                        acc[3] = p[3];
-                    }
-                }
+    debug_assert!(len > 0);
+    let radius = radius.min(len - 1);
+    if radius == 0 {
+        dst.copy_from_slice(src);
+        return;
+    }
+    let win = 2 * radius + 1;
+    let padded = len + 2 * radius;
+    let neutral: u8 = match op {
+        MorphologyOp::Erode => 255,
+        MorphologyOp::Dilate => 0,
+    };
+    #[inline]
+    fn ext(op: MorphologyOp, a: u8, b: u8) -> u8 {
+        match op {
+            MorphologyOp::Erode => a.min(b),
+            MorphologyOp::Dilate => a.max(b),
+        }
+    }
+    // Padded line (channel-interleaved, like `src`).
+    let mut line = vec![neutral; padded * 4];
+    line[radius * 4..radius * 4 + len * 4].copy_from_slice(src);
+    // Block-prefix extremum (forward pass, in place over a copy) and
+    // block-suffix extremum (backward pass).
+    let mut pre = line.clone();
+    for j in 1..padded {
+        if j % win != 0 {
+            for c in 0..4 {
+                pre[j * 4 + c] = ext(op, pre[(j - 1) * 4 + c], pre[j * 4 + c]);
             }
         }
-        dst[i * 4..i * 4 + 4].copy_from_slice(&acc);
+    }
+    let mut suf = line;
+    for j in (0..padded - 1).rev() {
+        if (j + 1) % win != 0 {
+            for c in 0..4 {
+                suf[j * 4 + c] = ext(op, suf[(j + 1) * 4 + c], suf[j * 4 + c]);
+            }
+        }
+    }
+    // Output pixel `i` covers padded window `[i, i + win - 1]`.
+    for i in 0..len {
+        let a = i;
+        let b = i + win - 1;
+        for c in 0..4 {
+            dst[i * 4 + c] = ext(op, suf[a * 4 + c], pre[b * 4 + c]);
+        }
     }
 }
 
@@ -1915,19 +1952,34 @@ fn gaussian_separable_pass(
 
         for i in 0..primary {
             let mut acc = [0f32; 4];
-            for (k_idx, w_coef) in kernel.iter().enumerate() {
-                let logical = i as isize + k_idx as isize - half as isize;
-                // §9.14 edgeMode: out-of-line samples are duplicated /
-                // wrapped / zeroed. `None` contributes nothing to the
-                // accumulator.
-                let Some(pi) = resolve_line_index(logical, primary, edge) else {
-                    continue;
-                };
-                let p = &line_in[pi * 4..pi * 4 + 4];
-                acc[0] += p[0] as f32 * w_coef;
-                acc[1] += p[1] as f32 * w_coef;
-                acc[2] += p[2] as f32 * w_coef;
-                acc[3] += p[3] as f32 * w_coef;
+            if i >= half && i + half < primary {
+                // Interior: every tap index `i + k - half` is in
+                // `[0, primary)` for all three edge modes, so the
+                // per-tap edge resolution is the identity — walk the
+                // taps directly (same order, same accumulation).
+                let base = (i - half) * 4;
+                for (k_idx, w_coef) in kernel.iter().enumerate() {
+                    let p = &line_in[base + k_idx * 4..base + k_idx * 4 + 4];
+                    acc[0] += p[0] as f32 * w_coef;
+                    acc[1] += p[1] as f32 * w_coef;
+                    acc[2] += p[2] as f32 * w_coef;
+                    acc[3] += p[3] as f32 * w_coef;
+                }
+            } else {
+                for (k_idx, w_coef) in kernel.iter().enumerate() {
+                    let logical = i as isize + k_idx as isize - half as isize;
+                    // §9.14 edgeMode: out-of-line samples are
+                    // duplicated / wrapped / zeroed. `None` contributes
+                    // nothing to the accumulator.
+                    let Some(pi) = resolve_line_index(logical, primary, edge) else {
+                        continue;
+                    };
+                    let p = &line_in[pi * 4..pi * 4 + 4];
+                    acc[0] += p[0] as f32 * w_coef;
+                    acc[1] += p[1] as f32 * w_coef;
+                    acc[2] += p[2] as f32 * w_coef;
+                    acc[3] += p[3] as f32 * w_coef;
+                }
             }
             let off = i * 4;
             line_out[off] = quantise_u8(acc[0]);
@@ -3103,16 +3155,31 @@ pub fn component_transfer(src: &[u8], width: u32, height: u32, ct: &ComponentTra
         return src.to_vec();
     }
 
+    // Each channel byte has only 256 possible values and the transfer
+    // functions are pure, so the per-pixel `apply` + `quantise_unit`
+    // pipeline collapses to four 256-entry lookup tables built with
+    // exactly that pipeline — output bytes are identical, and the
+    // `O(4 · 256)` build cost amortises against `O(W · H)` pixels.
+    // (A Gamma function with an invalid exponent still panics here,
+    // during the build, matching the per-pixel behaviour.)
+    let build_lut = |f: &TransferFunc| -> [u8; 256] {
+        let mut t = [0u8; 256];
+        for (i, slot) in t.iter_mut().enumerate() {
+            *slot = quantise_unit(f.apply(i as f32 / 255.0));
+        }
+        t
+    };
+    let lut_r = build_lut(&ct.r);
+    let lut_g = build_lut(&ct.g);
+    let lut_b = build_lut(&ct.b);
+    let lut_a = build_lut(&ct.a);
+
     let mut out = Vec::with_capacity(src.len());
     for chunk in src.chunks_exact(4) {
-        let r = chunk[0] as f32 / 255.0;
-        let g = chunk[1] as f32 / 255.0;
-        let b = chunk[2] as f32 / 255.0;
-        let a = chunk[3] as f32 / 255.0;
-        out.push(quantise_unit(ct.r.apply(r)));
-        out.push(quantise_unit(ct.g.apply(g)));
-        out.push(quantise_unit(ct.b.apply(b)));
-        out.push(quantise_unit(ct.a.apply(a)));
+        out.push(lut_r[chunk[0] as usize]);
+        out.push(lut_g[chunk[1] as usize]);
+        out.push(lut_b[chunk[2] as usize]);
+        out.push(lut_a[chunk[3] as usize]);
     }
     out
 }
