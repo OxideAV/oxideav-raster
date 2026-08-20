@@ -34,3 +34,7 @@ harness = false
 [[bench]]
 name = "render"
 harness = false
+
+[[bench]]
+name = "sampling"
+harness = false

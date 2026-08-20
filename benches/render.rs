@@ -13,13 +13,32 @@
 //!     "circles"), measuring the walk → flatten → fill → paint →
 //!     composite pipeline.
 //!
+//! Round 449 additions (the surfaces the round-401 harness left
+//! unbenched):
+//!
+//!   - **stroke_star_256**: stroke-geometry build (round joins/caps) +
+//!     NonZero fill of a 64-point cubic star outline.
+//!   - **render_glyphlike_400_256**: 400 small (~9 px) cubic blobs on a
+//!     256×256 canvas — a caption-density scene where per-shape
+//!     overheads (edge-table build, mask alloc, composite setup)
+//!     dominate over per-pixel work.
+//!   - **render_softmask_256**: one full-canvas `Node::SoftMask`
+//!     (luminance kind) — two offscreen subtree renders + coverage
+//!     conversion + modulated blit.
+//!   - **render_gradient_linear_256 / _radial_256**: full-canvas
+//!     gradient fills through the stops-LUT paint path.
+//!   - **render_cached_group_hit_256**: a `cache_key`-tagged group
+//!     re-rendered with a warm bitmap cache — measures the
+//!     lookup-plus-blit fast path.
+//!
 //! Run with: `cargo bench -p oxideav-raster --bench render`
 
 use criterion::{criterion_group, criterion_main, Criterion};
 use std::hint::black_box;
 
 use oxideav_core::{
-    FillRule, Group, Node, Paint, Path, PathNode, Point, Rgba, Transform2D, VectorFrame,
+    FillRule, GradientStop, Group, LineCap, LineJoin, LinearGradient, MaskKind, Node, Paint, Path,
+    PathNode, Point, RadialGradient, Rgba, SpreadMethod, Stroke, Transform2D, VectorFrame,
 };
 use oxideav_raster::{flatten_path, rasterize_fill, Renderer};
 
@@ -149,6 +168,164 @@ fn bench_render(c: &mut Criterion) {
     c.bench_function("render_scene_256", |b| {
         let r = Renderer::new(256, 256);
         b.iter(|| r.render(black_box(&frame)))
+    });
+
+    // --- Round 449 additions ---
+
+    // Stroked star outline: stroke-geometry build + NonZero fill.
+    let stroked_star = {
+        let mut root = Group::default();
+        root.children.push(Node::Path(PathNode {
+            path: star_path(128.0, 128.0, 120.0, 48.0, 64),
+            fill: None,
+            stroke: Some(Stroke {
+                width: 3.0,
+                paint: Paint::Solid(Rgba::opaque(20, 40, 200)),
+                cap: LineCap::Round,
+                join: LineJoin::Round,
+                miter_limit: 4.0,
+                dash: None,
+            }),
+            fill_rule: FillRule::NonZero,
+        }));
+        VectorFrame {
+            width: 256.0,
+            height: 256.0,
+            view_box: None,
+            root,
+            pts: None,
+            time_base: oxideav_core::time::TimeBase::new(1, 1),
+        }
+    };
+    c.bench_function("stroke_star_256", |b| {
+        let r = Renderer::new(256, 256);
+        b.iter(|| r.render(black_box(&stroked_star)))
+    });
+
+    // Caption-density scene: 400 small cubic blobs (~9 px each).
+    let glyphlike = {
+        let mut root = Group::default();
+        for i in 0..400u32 {
+            let gx = (i % 20) as f32 * 12.0 + 8.0;
+            let gy = (i / 20) as f32 * 12.0 + 8.0;
+            root.children.push(circle_node(
+                gx,
+                gy,
+                4.5,
+                Rgba::opaque(((i * 7) % 200) as u8 + 30, 40, 90),
+            ));
+        }
+        VectorFrame {
+            width: 256.0,
+            height: 256.0,
+            view_box: None,
+            root,
+            pts: None,
+            time_base: oxideav_core::time::TimeBase::new(1, 1),
+        }
+    };
+    c.bench_function("render_glyphlike_400_256", |b| {
+        let r = Renderer::new(256, 256);
+        b.iter(|| r.render(black_box(&glyphlike)))
+    });
+
+    // Full-canvas luminance soft mask over a full-canvas fill.
+    let softmask = {
+        let content = circle_node(128.0, 128.0, 120.0, Rgba::opaque(255, 30, 30));
+        let mask = circle_node(100.0, 100.0, 110.0, Rgba::opaque(255, 255, 255));
+        let mut root = Group::default();
+        root.children.push(Node::SoftMask {
+            mask: Box::new(mask),
+            mask_kind: MaskKind::Luminance,
+            content: Box::new(content),
+        });
+        VectorFrame {
+            width: 256.0,
+            height: 256.0,
+            view_box: None,
+            root,
+            pts: None,
+            time_base: oxideav_core::time::TimeBase::new(1, 1),
+        }
+    };
+    c.bench_function("render_softmask_256", |b| {
+        let r = Renderer::new(256, 256);
+        b.iter(|| r.render(black_box(&softmask)))
+    });
+
+    // Full-canvas gradient fills through the stops-LUT paint path.
+    let grad_stops = vec![
+        GradientStop::new(0.0, Rgba::opaque(255, 0, 0)),
+        GradientStop::new(0.5, Rgba::opaque(0, 255, 0)),
+        GradientStop::new(1.0, Rgba::opaque(0, 0, 255)),
+    ];
+    let full_rect_with = |paint: Paint| -> VectorFrame {
+        let mut p = Path::new();
+        p.move_to(Point::new(0.0, 0.0))
+            .line_to(Point::new(256.0, 0.0))
+            .line_to(Point::new(256.0, 256.0))
+            .line_to(Point::new(0.0, 256.0))
+            .close();
+        let mut root = Group::default();
+        root.children.push(Node::Path(PathNode {
+            path: p,
+            fill: Some(paint),
+            stroke: None,
+            fill_rule: FillRule::NonZero,
+        }));
+        VectorFrame {
+            width: 256.0,
+            height: 256.0,
+            view_box: None,
+            root,
+            pts: None,
+            time_base: oxideav_core::time::TimeBase::new(1, 1),
+        }
+    };
+    let linear = full_rect_with(Paint::LinearGradient(LinearGradient {
+        start: Point::new(0.0, 0.0),
+        end: Point::new(256.0, 256.0),
+        stops: grad_stops.clone(),
+        spread: SpreadMethod::Pad,
+    }));
+    c.bench_function("render_gradient_linear_256", |b| {
+        let r = Renderer::new(256, 256);
+        b.iter(|| r.render(black_box(&linear)))
+    });
+    let radial = full_rect_with(Paint::RadialGradient(RadialGradient {
+        center: Point::new(128.0, 128.0),
+        radius: 128.0,
+        focal: None,
+        stops: grad_stops,
+        spread: SpreadMethod::Reflect,
+    }));
+    c.bench_function("render_gradient_radial_256", |b| {
+        let r = Renderer::new(256, 256);
+        b.iter(|| r.render(black_box(&radial)))
+    });
+
+    // Warm bitmap-cache hit: cache_key-tagged group, second-and-later
+    // renders reuse the cached crop (lookup + blit only).
+    let cached = {
+        let mut root = Group::default();
+        root.children.push(Node::Group(Group {
+            cache_key: Some(0xC0FFEE),
+            children: vec![circle_node(128.0, 128.0, 100.0, Rgba::opaque(10, 200, 90))],
+            ..Group::default()
+        }));
+        VectorFrame {
+            width: 256.0,
+            height: 256.0,
+            view_box: None,
+            root,
+            pts: None,
+            time_base: oxideav_core::time::TimeBase::new(1, 1),
+        }
+    };
+    c.bench_function("render_cached_group_hit_256", |b| {
+        let r = Renderer::new(256, 256);
+        let _warm = r.render(&cached); // populate the cache
+        b.iter(|| r.render(black_box(&cached)))
     });
 }
 

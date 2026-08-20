@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Benchmark coverage for the previously unbenched hot surfaces**
+  (r449 depth pass): a new `sampling` Criterion harness (the seven
+  `ImageFilter` resampling kernels at 4× magnification, bilinear +
+  Lanczos3 at 2× minification, and pattern fill through both tile
+  samplers) plus six `render`-harness scenarios (stroke geometry,
+  caption-density 400-blob scene, luminance soft mask, linear/radial
+  gradient fills through the stops LUT, warm bitmap-cache hit).
+  Baselines recorded in `BENCHMARKS.md`.
+
 ### Fixed
 
 - **Fuzzer-found: extreme `feOffset` / `feDropShadow` /
