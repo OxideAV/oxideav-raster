@@ -58,7 +58,8 @@ produces a packed `Rgba` `VideoFrame`.
 use oxideav_raster::Renderer;
 use oxideav_core::VectorFrame;
 
-let frame: VectorFrame = /* … decoded by oxideav-svg / oxideav-pdf */;
+// Normally decoded by oxideav-svg / oxideav-pdf; an empty 800×600 canvas here.
+let frame = VectorFrame::new(800.0, 600.0);
 let renderer = Renderer::new(800, 600);
 let video = renderer.render(&frame);
 // `video` is a packed Rgba VideoFrame, 800×600, ready to composite
@@ -70,6 +71,7 @@ For a one-shot render at the frame's natural pixel size:
 ```rust
 use oxideav_raster::rasterize;
 
+# let frame = oxideav_core::VectorFrame::new(800.0, 600.0);
 let frame_out = rasterize(&frame); // returns oxideav_core::Frame::Video(...)
 ```
 
