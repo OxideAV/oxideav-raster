@@ -4,8 +4,8 @@
 //! See the crate-level docs for the overall pipeline.
 
 use oxideav_core::{
-    FillRule, Frame, Group, ImageRef, MaskKind, Node, Paint, Path, PathNode, Rect, Rgba, Stroke,
-    Transform2D, VectorFrame, VideoFrame, VideoPlane,
+    FillRule, Frame, Group, ImageRef, MaskKind, Node, Paint, Path, PathNode, Point, Rect, Rgba,
+    Stroke, Transform2D, VectorFrame, VideoFrame, VideoPlane,
 };
 
 use crate::blend::BlendMode;
@@ -599,7 +599,7 @@ impl Renderer {
                 Some(c) => intersect_masks(c, &mask),
                 None => mask,
             };
-            self.composite_with_paint(buf, stride, &mask, bounds, fill, group_opacity);
+            self.composite_with_paint(buf, stride, &mask, bounds, fill, &transform, group_opacity);
         }
         // Stroke pass.
         if let Some(stroke) = &node.stroke {
@@ -615,10 +615,33 @@ impl Renderer {
                 Some(c) => intersect_masks(c, &mask),
                 None => mask,
             };
-            self.composite_with_paint(buf, stride, &mask, bounds, &stroke.paint, group_opacity);
+            self.composite_with_paint(
+                buf,
+                stride,
+                &mask,
+                bounds,
+                &stroke.paint,
+                &transform,
+                group_opacity,
+            );
         }
     }
 
+    /// Composite `paint` through `mask` onto `buf`.
+    ///
+    /// `transform` is the current transformation matrix (CTM) the
+    /// painted geometry was flattened with — user space → device
+    /// pixels. A [`Paint::Solid`] ignores it. Gradient paints are
+    /// defined in the painted element's user space (SVG 2 §14.2.2.1 /
+    /// §14.2.3.1 `gradientUnits="userSpaceOnUse"`: "the user coordinate
+    /// system for the element referencing the gradient"), so every
+    /// device pixel centre is mapped back through the inverse CTM
+    /// before the gradient is evaluated. That is the same mapping the
+    /// path itself went through — the gradient geometry therefore
+    /// follows the `viewBox` → viewport scale, every ancestor group
+    /// `transform` and the element's own `transform`, and a radial
+    /// gradient under a non-uniform CTM renders elliptical rings
+    /// exactly as the spec describes, without any special casing.
     fn composite_with_paint(
         &self,
         buf: &mut [u8],
@@ -626,6 +649,7 @@ impl Renderer {
         mask: &AlphaMask,
         bounds: Option<(u32, u32, u32, u32)>,
         paint: &Paint,
+        transform: &Transform2D,
         group_opacity: f32,
     ) {
         if mask.is_empty() {
@@ -670,9 +694,19 @@ impl Renderer {
             // ~10 destination pixels, which is essentially always in
             // practice.
             other => {
+                // Device → user space. A singular CTM collapses the
+                // geometry to zero area, so there is nothing a gradient
+                // could be sampled over; the mask is empty in that case
+                // anyway.
+                let Some(inv) = invert_2d(transform) else {
+                    return;
+                };
                 let space = self.color_interpolation;
                 let lut = build_paint_lut(other, space);
                 let other = other.clone();
+                let user_at = move |x: u32, y: u32| -> Point {
+                    inv.apply(Point::new(x as f32 + 0.5, y as f32 + 0.5))
+                };
                 match lut {
                     Some(lut) => composite_rgba_premultiplied_blend_rect(
                         buf,
@@ -686,7 +720,8 @@ impl Renderer {
                         blend,
                         rect,
                         move |x, y| {
-                            sample_paint_with_lut(&other, x as f32 + 0.5, y as f32 + 0.5, &lut)
+                            let p = user_at(x, y);
+                            sample_paint_with_lut(&other, p.x, p.y, &lut)
                         },
                     ),
                     None => composite_rgba_premultiplied_blend_rect(
@@ -700,7 +735,10 @@ impl Renderer {
                         group_opacity,
                         blend,
                         rect,
-                        move |x, y| sample_paint_in(&other, x as f32 + 0.5, y as f32 + 0.5, space),
+                        move |x, y| {
+                            let p = user_at(x, y);
+                            sample_paint_in(&other, p.x, p.y, space)
+                        },
                     ),
                 }
             }

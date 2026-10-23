@@ -17,9 +17,16 @@
 //!   linear scale `× 12.92` / `÷ 12.92` below). Alpha is *not*
 //!   gamma-encoded — it carries linear coverage and is interpolated as-is.
 //!
-//! Gradient coordinates are taken to be in the same pixel space the
-//! caller is using for raster output (the Renderer applies the active
-//! transform to the gradient endpoints before passing them in).
+//! The evaluators here are coordinate-system agnostic: a gradient and
+//! the sample point must simply be expressed in the *same* space. The
+//! [`Renderer`](crate::Renderer) keeps gradients in the painted
+//! element's user space (where `oxideav-core` defines them) and maps
+//! every device pixel centre back through the inverse of the current
+//! transformation matrix before sampling — so the gradient geometry
+//! follows the `viewBox` scale, group transforms and the element's own
+//! transform exactly like the path outline does (SVG 2 §14.2.2.1 /
+//! §14.2.3.1 `gradientUnits="userSpaceOnUse"`). Callers evaluating a
+//! gradient directly in pixel space pass pixel coordinates for both.
 
 use oxideav_core::{LinearGradient, Point, RadialGradient, Rgba, SpreadMethod};
 

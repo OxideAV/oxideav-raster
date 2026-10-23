@@ -6,9 +6,12 @@
 //! [`crate::gradient::eval_radial_gradient_in`] in the requested
 //! interpolation space.
 //!
-//! Gradient endpoints are passed through the active transform by the
-//! [`Renderer`](crate::Renderer) before reaching this layer, so the
-//! gradient evaluators see the gradient in raster pixel space.
+//! The sample position must be expressed in the gradient's own
+//! coordinate system. The [`Renderer`](crate::Renderer) maps each
+//! device pixel centre through the inverse of the current
+//! transformation matrix before calling in, so gradients stay in the
+//! user space `oxideav-core` defines them in and follow the painted
+//! element's `viewBox` / group / element transforms.
 
 use oxideav_core::{Paint, Rgba};
 

@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- gradient paints follow the painted node's CTM (#6): linear / radial
+  gradient geometry is defined in the element's user space (SVG 2
+  §14.2.2.1 / §14.2.3.1 `userSpaceOnUse`), so the renderer now maps each
+  device pixel through the inverse current transformation matrix before
+  sampling — the `viewBox` → viewport scale, group transforms and the
+  element's own transform (including the isolated group-opacity and
+  bitmap-cache paths) no longer misplace or mis-scale gradients, and a
+  radial gradient under a non-uniform transform renders elliptical rings
+  as the spec describes. Consumers that pre-transformed gradient points
+  into device space as a workaround should stop doing so.
+
 ### Changed
 
 - edition 2024, MSRV 1.95
