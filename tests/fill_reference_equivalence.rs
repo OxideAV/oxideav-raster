@@ -79,8 +79,8 @@ fn rasterize_fill_reference(
             continue;
         }
         let n = c.points.len();
-        let last_idx = if c.closed { n } else { n - 1 };
-        for i in 0..last_idx {
+        // SVG 2 §13.4.1: fill implicitly closes every subpath.
+        for i in 0..n {
             let (x0, y0) = c.points[i];
             let (x1, y1) = c.points[(i + 1) % n];
             if (x0 - x1).abs() < 1e-6 && (y0 - y1).abs() < 1e-6 {

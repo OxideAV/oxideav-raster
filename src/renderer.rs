@@ -11,7 +11,9 @@ use oxideav_core::{
 use crate::blend::BlendMode;
 use crate::cache::{CacheStats, RasterizedSubtree, SharedCache, composite_key};
 use crate::composite::composite_rgba_premultiplied_blend_rect;
-use crate::fill::{AlphaMask, rasterize_fill, rasterize_fill_with_bounds};
+use crate::fill::{
+    AlphaMask, CoverageMode, rasterize_fill_analytic_with_bounds, rasterize_fill_with_bounds,
+};
 use crate::filter::PreserveAspectRatio;
 use crate::flatten::{FlatContour, flatten_path};
 use crate::gradient::InterpolationSpace;
@@ -39,9 +41,16 @@ pub struct Renderer {
     pub width: u32,
     /// Output canvas height in pixels.
     pub height: u32,
+    /// Anti-aliasing coverage kernel for every fill, stroke, clip and
+    /// image-rectangle mask. Defaults to [`CoverageMode::Analytic`]
+    /// (exact pixel-area coverage, no sampling grid). Select
+    /// [`CoverageMode::Supersampled`] to use the historical vertical
+    /// supersampler driven by [`Renderer::supersampling`].
+    pub coverage: CoverageMode,
     /// Per-axis-Y vertical supersampling factor for AA. 1, 2, 4, or 8.
     /// Defaults to 4. Other values are clamped to the closest valid
-    /// value at fill time.
+    /// value at fill time. Only consulted when [`Renderer::coverage`]
+    /// is [`CoverageMode::Supersampled`].
     pub supersampling: u8,
     /// Sub-pixel positioning toggle. Currently a no-op for the
     /// shape-rasterizer (subpixel positioning matters mostly for text
@@ -163,13 +172,14 @@ pub const DEFAULT_CACHE_CAPACITY: usize = 256;
 
 impl Renderer {
     /// Build a renderer for the given destination size with sane
-    /// defaults (`supersampling = 4`, transparent background, no
-    /// sub-pixel positioning, bilinear image filtering, 256-entry
-    /// bitmap cache).
+    /// defaults (exact-area anti-aliasing, `supersampling = 4` for the
+    /// supersampled mode, transparent background, no sub-pixel
+    /// positioning, bilinear image filtering, 256-entry bitmap cache).
     pub fn new(width: u32, height: u32) -> Self {
         Self {
             width,
             height,
+            coverage: CoverageMode::Analytic,
             supersampling: 4,
             subpixel_positioning: false,
             background: Rgba::new(0, 0, 0, 0),
@@ -274,6 +284,34 @@ impl Renderer {
         }
     }
 
+    /// Select the anti-aliasing coverage kernel (builder form of the
+    /// [`Renderer::coverage`] field).
+    pub fn with_coverage(mut self, coverage: CoverageMode) -> Self {
+        self.coverage = coverage;
+        self
+    }
+
+    /// Rasterize `contours` into a canvas-sized alpha mask with the
+    /// configured coverage kernel, reporting the touched bounds.
+    fn rasterize_with_bounds(
+        &self,
+        contours: &[FlatContour],
+        fill_rule: FillRule,
+    ) -> (AlphaMask, Option<(u32, u32, u32, u32)>) {
+        match self.coverage {
+            CoverageMode::Analytic => {
+                rasterize_fill_analytic_with_bounds(contours, self.width, self.height, fill_rule)
+            }
+            _ => rasterize_fill_with_bounds(
+                contours,
+                self.width,
+                self.height,
+                fill_rule,
+                self.supersampling,
+            ),
+        }
+    }
+
     /// Render a single node at the given transform. Returns a packed
     /// `Rgba` `VideoFrame` of the renderer's full canvas size, with
     /// only that node painted onto the `background` clear.
@@ -372,13 +410,7 @@ impl Renderer {
         // with whatever clip mask is being inherited.
         let group_clip_storage: Option<AlphaMask> = g.clip.as_ref().map(|clip_path| {
             let cs = flatten_path(&clip_path.commands, &local);
-            let m = rasterize_fill(
-                &cs,
-                self.width,
-                self.height,
-                FillRule::NonZero,
-                self.supersampling,
-            );
+            let m = self.rasterize_with_bounds(&cs, FillRule::NonZero).0;
             match clip_mask {
                 Some(parent) => intersect_masks(parent, &m),
                 None => m,
@@ -417,13 +449,7 @@ impl Renderer {
         // handled at blit time.
         let group_clip_storage: Option<AlphaMask> = g.clip.as_ref().map(|clip_path| {
             let cs = flatten_path(&clip_path.commands, &local);
-            rasterize_fill(
-                &cs,
-                self.width,
-                self.height,
-                FillRule::NonZero,
-                self.supersampling,
-            )
+            self.rasterize_with_bounds(&cs, FillRule::NonZero).0
         });
         let effective_clip = group_clip_storage.as_ref();
         for child in &g.children {
@@ -588,13 +614,7 @@ impl Renderer {
         // Fill pass.
         if let Some(fill) = &node.fill {
             let contours = flatten_path(&node.path.commands, &transform);
-            let (mask, bounds) = rasterize_fill_with_bounds(
-                &contours,
-                self.width,
-                self.height,
-                node.fill_rule,
-                self.supersampling,
-            );
+            let (mask, bounds) = self.rasterize_with_bounds(&contours, node.fill_rule);
             let mask = match clip_mask {
                 Some(c) => intersect_masks(c, &mask),
                 None => mask,
@@ -604,13 +624,7 @@ impl Renderer {
         // Stroke pass.
         if let Some(stroke) = &node.stroke {
             let stroke_geom = build_stroke_geometry(&node.path, &transform, stroke);
-            let (mask, bounds) = rasterize_fill_with_bounds(
-                &stroke_geom,
-                self.width,
-                self.height,
-                FillRule::NonZero,
-                self.supersampling,
-            );
+            let (mask, bounds) = self.rasterize_with_bounds(&stroke_geom, FillRule::NonZero);
             let mask = match clip_mask {
                 Some(c) => intersect_masks(c, &mask),
                 None => mask,
@@ -763,13 +777,7 @@ impl Renderer {
         let rect_path = rect_to_path(img.bounds);
         let local = transform.compose(&img.transform);
         let contours = flatten_path(&rect_path.commands, &local);
-        let (mask, fill_bounds) = rasterize_fill_with_bounds(
-            &contours,
-            self.width,
-            self.height,
-            FillRule::NonZero,
-            self.supersampling,
-        );
+        let (mask, fill_bounds) = self.rasterize_with_bounds(&contours, FillRule::NonZero);
         let mask = match clip_mask {
             Some(c) => intersect_masks(c, &mask),
             None => mask,
@@ -1153,13 +1161,7 @@ impl Renderer {
         let stride = (self.width as usize) * 4;
         let mut buf = vec![0u8; stride * (self.height as usize)];
         let contours = flatten_path(&path.commands, &transform);
-        let (mask, bounds) = rasterize_fill_with_bounds(
-            &contours,
-            self.width,
-            self.height,
-            fill_rule,
-            self.supersampling,
-        );
+        let (mask, bounds) = self.rasterize_with_bounds(&contours, fill_rule);
         self.composite_with_pattern(&mut buf, stride, &mask, bounds, pattern, transform, 1.0);
         VideoFrame {
             pts: None,
@@ -1185,13 +1187,7 @@ impl Renderer {
         let stride = (self.width as usize) * 4;
         let mut buf = vec![0u8; stride * (self.height as usize)];
         let geom = build_stroke_geometry(path, &transform, stroke);
-        let (mask, bounds) = rasterize_fill_with_bounds(
-            &geom,
-            self.width,
-            self.height,
-            FillRule::NonZero,
-            self.supersampling,
-        );
+        let (mask, bounds) = self.rasterize_with_bounds(&geom, FillRule::NonZero);
         self.composite_with_pattern(&mut buf, stride, &mask, bounds, pattern, transform, 1.0);
         VideoFrame {
             pts: None,
@@ -1355,6 +1351,7 @@ impl Renderer {
     fn rasterize_pattern_tile(&self, pattern: &Pattern, tw: u32, th: u32) -> VideoFrame {
         let mut tile_renderer = Renderer::with_cache_capacity(tw, th, 1);
         tile_renderer.supersampling = self.supersampling;
+        tile_renderer.coverage = self.coverage;
         tile_renderer.image_filter = self.image_filter;
         tile_renderer.color_interpolation = self.color_interpolation;
         let scale = Transform2D::scale(

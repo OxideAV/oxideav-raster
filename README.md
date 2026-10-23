@@ -15,12 +15,13 @@ produces a packed `Rgba` `VideoFrame`.
 | ----------------------------------------- | -------------------- |
 | Path flattening (line/quad/cubic)         | done                 |
 | SVG elliptic-arc → cubic Bezier           | done                 |
-| Scanline AA fill (even-odd / NZ)          | done — analytic horizontal coverage (fractional span boundaries) + vertical supersampling, so near-vertical edges anti-alias in X |
-| Configurable supersampling 1/2/4/8×       | done                 |
+| Exact-area AA fill (even-odd / NZ)        | done — default `CoverageMode::Analytic`: sparse scan conversion with sub-strips at vertices + edge crossings and closed-form trapezoid integration per pixel; exact for self-intersecting / overlapping outlines; matches the closed-form pixel area to ±1 level, rsvg-convert edges within 16 levels (its coverage is quantised in 1/30 steps) |
+| Supersampled AA fill 1/2/4/8×             | done — `CoverageMode::Supersampled`: analytic horizontal coverage + vertical sub-scanlines; kept for byte-stable callers |
+| Open subpaths implicitly closed for fill (SVG 2 §13.4.1) | done |
 | Stroke geometry (caps + joins)            | done — round joins/caps tessellate with a radius-adaptive sagitta-bounded chord count (sub-pixel-smooth at every width) |
 | SVG 2 `stroke-linejoin: miter-clip` / `arcs` (§13.5.5) | done — `ExtendedStroke` + `stroke_to_fill_path_ext`; miter-clip trims the apex at `miterlimit/2 · width` instead of bevelling; `arcs` falls through to miter-clip on flattened (zero-curvature) input per spec |
 | Dash patterns                             | done — closed-subpath seam dash joins continuously (SVG 1.1 §11.4 / SVG 2 §13.5.6) |
-| Linear + radial gradients                 | done                 |
+| Linear + radial gradients                 | done — geometry in the node's user space, sampled through the inverse CTM (viewBox scale, group / element transforms, elliptical radial rings under non-uniform scale — SVG 2 §14.2.2.1 / §14.2.3.1) |
 | Off-centre focal radial                   | done                 |
 | Two-circle radial (`fr` focal radius)     | done (SVG 2 §13.2.4 / CSS Images 3) |
 | Pad / Reflect / Repeat spread             | done                 |

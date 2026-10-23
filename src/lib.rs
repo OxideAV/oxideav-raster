@@ -13,11 +13,24 @@
 //!    ([`PathCommand`](oxideav_core::PathCommand)) into one polyline per
 //!    contour using de Casteljau subdivision (quadratic + cubic) and the
 //!    SVG 1.1 Appendix F.6.5 elliptic-arc → cubic-Bezier algorithm.
-//! 3. **Rasterize** each contour set into an alpha mask via the standard
-//!    active-edge-list scanline fill, with a configurable supersampling
-//!    factor for anti-aliasing (1 / 2 / 4 / 8×).
+//! 3. **Rasterize** each contour set into an alpha mask. The default
+//!    kernel ([`CoverageMode::Analytic`], [`rasterize_fill_analytic`])
+//!    computes the exact pixel area inside the outline — a sparse scan
+//!    converter that splits each pixel row into sub-strips at vertices
+//!    and edge crossings and integrates trapezoid spans per cell in
+//!    closed form, so coverage is continuous up to the 8-bit output and
+//!    exact for self-intersecting / overlapping outlines (every stroke
+//!    is one). The historical vertically supersampled kernel
+//!    ([`CoverageMode::Supersampled`], [`rasterize_fill`], 1 / 2 / 4 /
+//!    8 sub-scanlines) is kept selectable.
 //! 4. **Paint** the mask: solid colors, linear/radial gradients (sRGB
-//!    interpolation, Pad / Reflect / Repeat spread).
+//!    interpolation, Pad / Reflect / Repeat spread). Gradient geometry
+//!    is defined in the painted node's user space, so every device
+//!    pixel is mapped back through the inverse of the node's current
+//!    transformation matrix before the gradient is evaluated (SVG 2
+//!    §14.2.2.1 / §14.2.3.1): gradients follow the `viewBox` scale,
+//!    group transforms and the element's own transform exactly like
+//!    the outline does.
 //! 5. **Composite** premultiplied-alpha onto the output frame. A
 //!    partially-transparent group (`opacity < 1`) is first rendered to
 //!    an isolated offscreen image at full opacity, then blended onto the
@@ -37,7 +50,8 @@
 //! # Implemented
 //!
 //! * paths (move / line / quad / cubic / arc / close),
-//! * fill (even-odd + non-zero) with configurable supersampling,
+//! * fill (even-odd + non-zero) with exact-area anti-aliasing (or the
+//!   configurable supersampled kernel),
 //! * stroke geometry (Butt/Round/Square caps, Miter/Round/Bevel joins,
 //!   dash patterns, miter limit),
 //! * linear + radial gradients (Pad/Reflect/Repeat spread, off-centre
@@ -250,7 +264,7 @@ mod stroke;
 pub use blend::{BlendMode, blend_channel, blend_over};
 pub use cache::{CacheStats, RasterizedSubtree};
 pub use composite::{composite_rgba_premultiplied, composite_rgba_premultiplied_blend};
-pub use fill::{AlphaMask, rasterize_fill};
+pub use fill::{AlphaMask, CoverageMode, rasterize_fill, rasterize_fill_analytic};
 pub use filter::{
     AspectRatioAlign, BlendFilterMode, ColorMatrix, ColorMatrixOp, ComponentTransfer, CompositeOp,
     ConvolveEdgeMode, ConvolveMatrix, DiffuseLighting, DisplacementChannel, DisplacementSampling,
