@@ -12,7 +12,7 @@
 
 use oxideav_core::Rgba;
 use oxideav_raster::{
-    displacement_map, displacement_map_pixels, DisplacementChannel, DisplacementSampling,
+    DisplacementChannel, DisplacementSampling, displacement_map, displacement_map_pixels,
 };
 
 /// Build a packed-RGBA buffer of `w·h` pixels coloured by `f`.
@@ -232,8 +232,8 @@ fn extreme_scale_with_zero_xc_yc_pulls_everything_off_canvas() {
         DisplacementSampling::Nearest,
     );
     assert_eq!(out.len(), 4 * 4 * 4);
-    for px in out.chunks_exact(4) {
-        assert_eq!(px, [0, 0, 0, 0]);
+    for px in out.as_chunks::<4>().0 {
+        assert_eq!(*px, [0, 0, 0, 0]);
     }
 }
 
@@ -248,11 +248,15 @@ fn typed_pixel_wrapper_round_trips_through_byte_path() {
         Rgba::new((x * 30) as u8, (y * 30) as u8, 128, 255)
     });
     let pixels_in1: Vec<Rgba> = bytes_in1
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| Rgba::new(c[0], c[1], c[2], c[3]))
         .collect();
     let pixels_in2: Vec<Rgba> = bytes_in2
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| Rgba::new(c[0], c[1], c[2], c[3]))
         .collect();
     for sampling in [
@@ -423,7 +427,7 @@ fn warp_is_purely_local_and_does_not_invent_pixels() {
     // Collect the set of byte triples used by `in1`.
     use std::collections::HashSet;
     let mut src_pixels: HashSet<[u8; 4]> = HashSet::new();
-    for chunk in in1.chunks_exact(4) {
+    for chunk in in1.as_chunks::<4>().0 {
         src_pixels.insert([chunk[0], chunk[1], chunk[2], chunk[3]]);
     }
     // Transparent black is the documented §15.7.3 fallback ⇒
@@ -440,7 +444,7 @@ fn warp_is_purely_local_and_does_not_invent_pixels() {
         DisplacementChannel::G,
         DisplacementSampling::Nearest,
     );
-    for (i, chunk) in out.chunks_exact(4).enumerate() {
+    for (i, chunk) in out.as_chunks::<4>().0.iter().enumerate() {
         let p: [u8; 4] = [chunk[0], chunk[1], chunk[2], chunk[3]];
         assert!(
             src_pixels.contains(&p),

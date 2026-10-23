@@ -28,10 +28,10 @@
 
 use libfuzzer_sys::fuzz_target;
 use oxideav_raster::{
-    BlendFilterMode, ColorMatrix, ColorMatrixOp, ComponentTransfer, CompositeOp,
-    ConvolveEdgeMode, ConvolveMatrix, DisplacementChannel, DisplacementSampling,
-    FilterColorSpace, FilterGraph, FilterInput, FilterPrimitive, FilterStep, MorphologyOp,
-    OffsetSampling, Subregion, TransferFunc, Turbulence,
+    BlendFilterMode, ColorMatrix, ColorMatrixOp, ComponentTransfer, CompositeOp, ConvolveEdgeMode,
+    ConvolveMatrix, DisplacementChannel, DisplacementSampling, FilterColorSpace, FilterGraph,
+    FilterInput, FilterPrimitive, FilterStep, MorphologyOp, OffsetSampling, Subregion,
+    TransferFunc, Turbulence,
 };
 
 fn input_sel(b: u8) -> FilterInput {
@@ -53,11 +53,7 @@ fn f32_from(b0: u8, b1: u8, b2: u8, b3: u8) -> f32 {
 /// Map raw f32 bits into a finite clamped range (NaN / ±inf → 0.0) for
 /// parameters whose functions document a panics-on-NaN contract.
 fn finite_clamped(v: f32, lo: f32, hi: f32) -> f32 {
-    if v.is_finite() {
-        v.clamp(lo, hi)
-    } else {
-        0.0
-    }
+    if v.is_finite() { v.clamp(lo, hi) } else { 0.0 }
 }
 
 fuzz_target!(|data: &[u8]| {

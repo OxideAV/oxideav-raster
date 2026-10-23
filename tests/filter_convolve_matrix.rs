@@ -8,7 +8,7 @@
 //! semantics hold for callers consuming the published API).
 
 use oxideav_core::Rgba;
-use oxideav_raster::{convolve_matrix, convolve_matrix_pixels, ConvolveEdgeMode, ConvolveMatrix};
+use oxideav_raster::{ConvolveEdgeMode, ConvolveMatrix, convolve_matrix, convolve_matrix_pixels};
 
 fn solid_bytes(w: u32, h: u32, rgba: [u8; 4]) -> Vec<u8> {
     let mut v = Vec::with_capacity((w * h * 4) as usize);

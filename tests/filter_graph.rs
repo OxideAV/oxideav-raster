@@ -8,9 +8,9 @@
 //! in2="flood")`.
 
 use oxideav_raster::{
-    color_matrix_op, composite_filter, flood, gaussian_blur, in_filter_space, merge, offset,
     ColorMatrix, ColorMatrixOp, CompositeOp, ConvolveEdgeMode, FilterColorSpace, FilterGraph,
-    FilterInput, FilterPrimitive, FilterStep, OffsetSampling, Subregion,
+    FilterInput, FilterPrimitive, FilterStep, OffsetSampling, Subregion, color_matrix_op,
+    composite_filter, flood, gaussian_blur, in_filter_space, merge, offset,
 };
 
 /// A deterministic non-uniform test image with varied alpha.
@@ -30,7 +30,12 @@ fn test_image(width: u32, height: u32) -> Vec<u8> {
 
 fn source_alpha_of(src: &[u8]) -> Vec<u8> {
     let mut buf = vec![0u8; src.len()];
-    for (dst, s) in buf.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
+    for (dst, s) in buf
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(src.as_chunks::<4>().0)
+    {
         dst[3] = s[3];
     }
     buf

@@ -60,13 +60,13 @@
 //! working-space values.
 
 use crate::filter::{
-    blend_filter, clip_to_subregion, color_matrix_op, component_transfer, composite_filter,
-    convolve_matrix, diffuse_lighting, displacement_map, drop_shadow, flood, gaussian_blur_edge,
-    image_source, merge, morphology, offset, specular_lighting, srgb_to_linear_f32, to_linear_rgb,
-    to_srgb, turbulence_filter, BlendFilterMode, ColorMatrix, ColorMatrixOp, ComponentTransfer,
-    CompositeOp, ConvolveEdgeMode, ConvolveMatrix, DiffuseLighting, DisplacementChannel,
-    DisplacementSampling, FilterColorSpace, ImageSourceSampling, MorphologyOp, OffsetSampling,
-    PreserveAspectRatio, SpecularLighting, Subregion, Turbulence,
+    BlendFilterMode, ColorMatrix, ColorMatrixOp, ComponentTransfer, CompositeOp, ConvolveEdgeMode,
+    ConvolveMatrix, DiffuseLighting, DisplacementChannel, DisplacementSampling, FilterColorSpace,
+    ImageSourceSampling, MorphologyOp, OffsetSampling, PreserveAspectRatio, SpecularLighting,
+    Subregion, Turbulence, blend_filter, clip_to_subregion, color_matrix_op, component_transfer,
+    composite_filter, convolve_matrix, diffuse_lighting, displacement_map, drop_shadow, flood,
+    gaussian_blur_edge, image_source, merge, morphology, offset, specular_lighting,
+    srgb_to_linear_f32, to_linear_rgb, to_srgb, turbulence_filter,
 };
 
 /// Input selector for a filter primitive — the §9.2 `in` / `in2`
@@ -669,7 +669,12 @@ fn resolve_input<'a>(
         FilterInput::SourceGraphic => source_graphic,
         FilterInput::SourceAlpha => source_alpha.get_or_insert_with(|| {
             let mut buf = vec![0u8; source_graphic.len()];
-            for (dst, src) in buf.chunks_exact_mut(4).zip(source_graphic.chunks_exact(4)) {
+            for (dst, src) in buf
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .zip(source_graphic.as_chunks::<4>().0)
+            {
                 dst[3] = src[3];
             }
             buf
@@ -798,7 +803,7 @@ mod tests {
             .with_input(FilterInput::SourceAlpha),
         );
         let out = g.evaluate(&src, 4, 4);
-        for (o, s) in out.chunks_exact(4).zip(src.chunks_exact(4)) {
+        for (o, s) in out.as_chunks::<4>().0.iter().zip(src.as_chunks::<4>().0) {
             assert_eq!(&o[..3], &[0, 0, 0], "RGB must be implicitly black");
             assert_eq!(o[3], s[3], "alpha channel must match SourceGraphic");
         }
@@ -891,7 +896,7 @@ mod tests {
         let i = (3 + 1) * 4;
         src[i..i + 4].copy_from_slice(&[9, 8, 7, 255]);
         let out = anchored_tile(&src, 3, 3, Subregion::new(1.0, 1.0, 1.0, 1.0));
-        for px in out.chunks_exact(4) {
+        for px in out.as_chunks::<4>().0 {
             assert_eq!(px, &[9, 8, 7, 255]);
         }
     }

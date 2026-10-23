@@ -43,17 +43,17 @@
 //!
 //! Run with: `cargo bench -p oxideav-raster --bench filter`
 
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
 
 use oxideav_raster::{
-    apply_filter_functions, blend_filter, color_matrix_op, component_transfer, composite_filter,
-    convolve_matrix, diffuse_lighting, displacement_map, drop_shadow, gaussian_blur_edge,
-    morphology, parse_filter_value_list, specular_lighting, turbulence_filter, BlendFilterMode,
-    ColorMatrix, ColorMatrixOp, ComponentTransfer, CompositeOp, ConvolveEdgeMode, ConvolveMatrix,
-    DiffuseLighting, DisplacementChannel, DisplacementSampling, FilterColorSpace, FilterGraph,
-    FilterPrimitive, FilterStep, LightSource, MorphologyOp, OffsetSampling, SpecularLighting,
-    TransferFunc, Turbulence,
+    BlendFilterMode, ColorMatrix, ColorMatrixOp, ComponentTransfer, CompositeOp, ConvolveEdgeMode,
+    ConvolveMatrix, DiffuseLighting, DisplacementChannel, DisplacementSampling, FilterColorSpace,
+    FilterGraph, FilterPrimitive, FilterStep, LightSource, MorphologyOp, OffsetSampling,
+    SpecularLighting, TransferFunc, Turbulence, apply_filter_functions, blend_filter,
+    color_matrix_op, component_transfer, composite_filter, convolve_matrix, diffuse_lighting,
+    displacement_map, drop_shadow, gaussian_blur_edge, morphology, parse_filter_value_list,
+    specular_lighting, turbulence_filter,
 };
 
 fn lcg_image(width: u32, height: u32, seed: u64) -> Vec<u8> {

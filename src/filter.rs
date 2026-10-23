@@ -464,7 +464,7 @@ pub fn to_srgb_pixels(buf: &mut [Rgba]) {
 /// full precision is required.
 pub fn to_linear_rgb(buf: &mut [u8]) {
     let lut = srgb_to_linear_lut_u8();
-    for px in buf.chunks_exact_mut(4) {
+    for px in buf.as_chunks_mut::<4>().0 {
         px[0] = lut[px[0] as usize];
         px[1] = lut[px[1] as usize];
         px[2] = lut[px[2] as usize];
@@ -478,7 +478,7 @@ pub fn to_linear_rgb(buf: &mut [u8]) {
 /// of 4.
 pub fn to_srgb(buf: &mut [u8]) {
     let lut = linear_to_srgb_lut_u8();
-    for px in buf.chunks_exact_mut(4) {
+    for px in buf.as_chunks_mut::<4>().0 {
         px[0] = lut[px[0] as usize];
         px[1] = lut[px[1] as usize];
         px[2] = lut[px[2] as usize];
@@ -782,7 +782,9 @@ pub fn morphology_pixels(
         bytes.push(p.a);
     }
     let out = morphology(&bytes, width, height, radius_x, radius_y, op);
-    out.chunks_exact(4)
+    out.as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| Rgba::new(c[0], c[1], c[2], c[3]))
         .collect()
 }
@@ -1331,7 +1333,7 @@ pub fn color_matrix(src: &[u8], width: u32, height: u32, m: &ColorMatrix) -> Vec
 
     let rows = &m.0;
     let mut out = Vec::with_capacity(src.len());
-    for chunk in src.chunks_exact(4) {
+    for chunk in src.as_chunks::<4>().0 {
         let r = chunk[0] as f32 / 255.0;
         let g = chunk[1] as f32 / 255.0;
         let b = chunk[2] as f32 / 255.0;
@@ -1394,7 +1396,9 @@ pub fn color_matrix_pixels(src: &[Rgba], width: u32, height: u32, m: &ColorMatri
         bytes.push(p.a);
     }
     let out = color_matrix(&bytes, width, height, m);
-    out.chunks_exact(4)
+    out.as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| Rgba::new(c[0], c[1], c[2], c[3]))
         .collect()
 }
@@ -1634,7 +1638,7 @@ mod color_matrix_tests {
             Rgba::new((x * 100) as u8, (y * 50) as u8, 33, 200)
         });
         let out = color_matrix(&img, 2, 2, &m);
-        for chunk in out.chunks_exact(4) {
+        for chunk in out.as_chunks::<4>().0 {
             assert!(
                 (chunk[0] as i32 - 128).abs() <= 1,
                 "R bias drift: {}",
@@ -1880,7 +1884,9 @@ pub fn gaussian_blur_pixels(
         bytes.push(p.a);
     }
     let out = gaussian_blur(&bytes, width, height, std_x, std_y);
-    out.chunks_exact(4)
+    out.as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| Rgba::new(c[0], c[1], c[2], c[3]))
         .collect()
 }
@@ -3175,7 +3181,7 @@ pub fn component_transfer(src: &[u8], width: u32, height: u32, ct: &ComponentTra
     let lut_a = build_lut(&ct.a);
 
     let mut out = Vec::with_capacity(src.len());
-    for chunk in src.chunks_exact(4) {
+    for chunk in src.as_chunks::<4>().0 {
         out.push(lut_r[chunk[0] as usize]);
         out.push(lut_g[chunk[1] as usize]);
         out.push(lut_b[chunk[2] as usize]);
@@ -3209,7 +3215,9 @@ pub fn component_transfer_pixels(
         bytes.push(p.a);
     }
     let out = component_transfer(&bytes, width, height, ct);
-    out.chunks_exact(4)
+    out.as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| Rgba::new(c[0], c[1], c[2], c[3]))
         .collect()
 }
@@ -3508,7 +3516,9 @@ mod component_transfer_tests {
         let via_bytes = component_transfer(&bytes, 4, 4, &ct);
         let via_pixels = component_transfer_pixels(&img, 4, 4, &ct);
         let want_pixels: Vec<Rgba> = via_bytes
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| Rgba::new(c[0], c[1], c[2], c[3]))
             .collect();
         assert_eq!(via_pixels, want_pixels);
@@ -3717,7 +3727,7 @@ pub fn composite_filter(
     }
 
     let mut out = Vec::with_capacity(expected);
-    for (pa, pb) in in1.chunks_exact(4).zip(in2.chunks_exact(4)) {
+    for (pa, pb) in in1.as_chunks::<4>().0.iter().zip(in2.as_chunks::<4>().0) {
         // Straight-alpha bytes → premultiplied [0, 1].
         let aa = pa[3] as f32 / 255.0;
         let ab = pb[3] as f32 / 255.0;
@@ -3807,7 +3817,9 @@ pub fn composite_filter_pixels(
         b2.extend_from_slice(&[p.r, p.g, p.b, p.a]);
     }
     let out = composite_filter(&b1, &b2, width, height, op);
-    out.chunks_exact(4)
+    out.as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| Rgba::new(c[0], c[1], c[2], c[3]))
         .collect()
 }
@@ -4228,7 +4240,9 @@ pub fn convolve_matrix_pixels(
         bytes.extend_from_slice(&[p.r, p.g, p.b, p.a]);
     }
     let out = convolve_matrix(&bytes, width, height, cm);
-    out.chunks_exact(4)
+    out.as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| Rgba::new(c[0], c[1], c[2], c[3]))
         .collect()
 }
@@ -4925,11 +4939,15 @@ mod composite_tests {
             Rgba::new(7, (x * 20) as u8, (y * 50) as u8, 200)
         });
         let a_p: Vec<Rgba> = a_b
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| Rgba::new(c[0], c[1], c[2], c[3]))
             .collect();
         let b_p: Vec<Rgba> = b_b
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| Rgba::new(c[0], c[1], c[2], c[3]))
             .collect();
         for op in [
@@ -5600,7 +5618,9 @@ pub fn turbulence_filter(width: u32, height: u32, params: &Turbulence) -> Vec<u8
 pub fn turbulence_filter_pixels(width: u32, height: u32, params: &Turbulence) -> Vec<Rgba> {
     let bytes = turbulence_filter(width, height, params);
     bytes
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| Rgba::new(c[0], c[1], c[2], c[3]))
         .collect()
 }
@@ -5683,7 +5703,7 @@ mod turbulence_tests {
         let out = turbulence_filter(4, 4, &p);
         // Every pixel must equal pixel 0.
         let p0 = &out[..4];
-        for chunk in out.chunks_exact(4) {
+        for chunk in out.as_chunks::<4>().0 {
             assert_eq!(chunk, p0);
         }
     }
@@ -5722,7 +5742,7 @@ mod turbulence_tests {
             .with_kind(TurbulenceType::Turbulence);
         let out = turbulence_filter(32, 32, &p);
         let mut acc = [0u64; 4];
-        for chunk in out.chunks_exact(4) {
+        for chunk in out.as_chunks::<4>().0 {
             for (i, v) in chunk.iter().enumerate() {
                 acc[i] += *v as u64;
             }
@@ -5747,7 +5767,7 @@ mod turbulence_tests {
             .with_kind(TurbulenceType::FractalNoise);
         let out = turbulence_filter(48, 48, &p);
         let mut acc = [0u64; 4];
-        for chunk in out.chunks_exact(4) {
+        for chunk in out.as_chunks::<4>().0 {
             for (i, v) in chunk.iter().enumerate() {
                 acc[i] += *v as u64;
             }
@@ -5788,7 +5808,7 @@ mod turbulence_tests {
         let p = Turbulence::new(0.1, 0.1).with_seed(9).with_num_octaves(2);
         let out = turbulence_filter(8, 8, &p);
         let mut all_equal_channels = true;
-        for chunk in out.chunks_exact(4) {
+        for chunk in out.as_chunks::<4>().0 {
             if !(chunk[0] == chunk[1] && chunk[1] == chunk[2] && chunk[2] == chunk[3]) {
                 all_equal_channels = false;
                 break;
@@ -6070,7 +6090,9 @@ pub fn offset_pixels(
         b.extend_from_slice(&[p.r, p.g, p.b, p.a]);
     }
     let out = offset(&b, width, height, dx, dy, sampling);
-    out.chunks_exact(4)
+    out.as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| Rgba::new(c[0], c[1], c[2], c[3]))
         .collect()
 }
@@ -6230,7 +6252,12 @@ pub fn merge(width: u32, height: u32, layers: &[&[u8]]) -> Vec<u8> {
     // pixel onto fully transparent backdrop equals that pixel).
     let mut dst: Vec<u8> = layers[0].to_vec();
     for layer in &layers[1..] {
-        for (d, s) in dst.chunks_exact_mut(4).zip(layer.chunks_exact(4)) {
+        for (d, s) in dst
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .zip(layer.as_chunks::<4>().0)
+        {
             let sa = s[3] as f32 / 255.0;
             let da = d[3] as f32 / 255.0;
             // §14.2 simple-alpha-compositing `over`, expressed
@@ -6283,7 +6310,9 @@ pub fn merge_pixels(width: u32, height: u32, layers: &[&[Rgba]]) -> Vec<Rgba> {
         .collect();
     let byte_refs: Vec<&[u8]> = bytes.iter().map(|b| b.as_slice()).collect();
     let out = merge(width, height, &byte_refs);
-    out.chunks_exact(4)
+    out.as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| Rgba::new(c[0], c[1], c[2], c[3]))
         .collect()
 }
@@ -6391,7 +6420,12 @@ pub fn drop_shadow(
     // §9.12: "Take the alpha channel of the input". Blurring this
     // alpha-only buffer is the feGaussianBlur of the equivalent tree.
     let mut alpha_only = vec![0u8; expected];
-    for (dst, s) in alpha_only.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
+    for (dst, s) in alpha_only
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(src.as_chunks::<4>().0)
+    {
         dst[3] = s[3];
     }
     let blurred = gaussian_blur(&alpha_only, width, height, std_x, std_y);
@@ -6453,7 +6487,9 @@ pub fn drop_shadow_pixels(
         flood_opacity,
         sampling,
     );
-    out.chunks_exact(4)
+    out.as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| Rgba::new(c[0], c[1], c[2], c[3]))
         .collect()
 }
@@ -6744,7 +6780,9 @@ mod subregion_tests {
             [(x * 30) as u8, (y * 40) as u8, ((x + y) * 10) as u8, 180]
         });
         let mut typed: Vec<Rgba> = bytes
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| Rgba::new(c[0], c[1], c[2], c[3]))
             .collect();
         let region = Subregion::new(2.0, 1.5, 3.5, 3.0);
@@ -6883,7 +6921,9 @@ pub fn tile_pixels(
         bytes.extend_from_slice(&[p.r, p.g, p.b, p.a]);
     }
     let out = tile(&bytes, src_width, src_height, out_width, out_height);
-    out.chunks_exact(4)
+    out.as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| Rgba::new(c[0], c[1], c[2], c[3]))
         .collect()
 }
@@ -6932,8 +6972,8 @@ mod flood_offset_merge_tests {
         let out = flood(3, 2, 200, 100, 50, 0.5);
         assert_eq!(out.len(), 3 * 2 * 4);
         // round(0.5 · 255 + 0.5) = 128
-        for px in out.chunks_exact(4) {
-            assert_eq!(px, [200, 100, 50, 128]);
+        for px in out.as_chunks::<4>().0 {
+            assert_eq!(*px, [200, 100, 50, 128]);
         }
     }
 
@@ -7092,7 +7132,9 @@ mod flood_offset_merge_tests {
             *b = (i * 9 % 241) as u8;
         }
         let typed: Vec<Rgba> = src
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| Rgba::new(c[0], c[1], c[2], c[3]))
             .collect();
         let bytes_out = offset(&src, 5, 5, 2.0, -1.0, OffsetSampling::Nearest);
@@ -7212,11 +7254,15 @@ mod flood_offset_merge_tests {
         let a_b = solid_layer(3, 2, Rgba::new(40, 50, 60, 200));
         let b_b = solid_layer(3, 2, Rgba::new(160, 170, 180, 96));
         let a_p: Vec<Rgba> = a_b
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| Rgba::new(c[0], c[1], c[2], c[3]))
             .collect();
         let b_p: Vec<Rgba> = b_b
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| Rgba::new(c[0], c[1], c[2], c[3]))
             .collect();
         let bytes_out = merge(3, 2, &[&a_b, &b_b]);
@@ -7311,8 +7357,8 @@ mod tile_tests {
         let src = vec![17, 34, 51, 200];
         let out = tile(&src, 1, 1, 5, 3);
         assert_eq!(out.len(), 5 * 3 * 4);
-        for px in out.chunks_exact(4) {
-            assert_eq!(px, [17, 34, 51, 200]);
+        for px in out.as_chunks::<4>().0 {
+            assert_eq!(*px, [17, 34, 51, 200]);
         }
     }
 
@@ -7391,7 +7437,9 @@ mod tile_tests {
     fn tile_typed_wrapper_agrees_with_byte_path() {
         let src_bytes = checker_2x2();
         let src_typed: Vec<Rgba> = src_bytes
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| Rgba::new(c[0], c[1], c[2], c[3]))
             .collect();
         let bytes_out = tile(&src_bytes, 2, 2, 5, 3);
@@ -7688,7 +7736,9 @@ pub fn displacement_map_pixels(
     let out = displacement_map(
         &b1, &b2, width, height, scale, x_channel, y_channel, sampling,
     );
-    out.chunks_exact(4)
+    out.as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| Rgba::new(c[0], c[1], c[2], c[3]))
         .collect()
 }
@@ -7917,8 +7967,8 @@ mod displacement_map_tests {
             DisplacementSampling::Nearest,
         );
         assert_eq!(out.len(), (w * h * 4) as usize);
-        for chunk in out.chunks_exact(4) {
-            assert_eq!(chunk, [0, 0, 0, 0]);
+        for chunk in out.as_chunks::<4>().0 {
+            assert_eq!(*chunk, [0, 0, 0, 0]);
         }
     }
 
@@ -7926,28 +7976,32 @@ mod displacement_map_tests {
     fn empty_extent_returns_empty() {
         // 0×N and N×0 short-circuit to an empty Vec — no buffer
         // length to check, no per-pixel work to perform.
-        assert!(displacement_map(
-            &[],
-            &[],
-            0,
-            5,
-            10.0,
-            DisplacementChannel::R,
-            DisplacementChannel::G,
-            DisplacementSampling::Nearest,
-        )
-        .is_empty());
-        assert!(displacement_map(
-            &[],
-            &[],
-            5,
-            0,
-            10.0,
-            DisplacementChannel::R,
-            DisplacementChannel::G,
-            DisplacementSampling::Bilinear,
-        )
-        .is_empty());
+        assert!(
+            displacement_map(
+                &[],
+                &[],
+                0,
+                5,
+                10.0,
+                DisplacementChannel::R,
+                DisplacementChannel::G,
+                DisplacementSampling::Nearest,
+            )
+            .is_empty()
+        );
+        assert!(
+            displacement_map(
+                &[],
+                &[],
+                5,
+                0,
+                10.0,
+                DisplacementChannel::R,
+                DisplacementChannel::G,
+                DisplacementSampling::Bilinear,
+            )
+            .is_empty()
+        );
     }
 
     #[test]
@@ -8051,11 +8105,15 @@ mod displacement_map_tests {
         let bytes_in1 = flat_src(w, h, 30, 60, 90, 220);
         let bytes_in2 = flat_map(w, h, 200, 80);
         let pixels_in1: Vec<Rgba> = bytes_in1
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| Rgba::new(c[0], c[1], c[2], c[3]))
             .collect();
         let pixels_in2: Vec<Rgba> = bytes_in2
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| Rgba::new(c[0], c[1], c[2], c[3]))
             .collect();
         let bytes_out = displacement_map(
@@ -8400,7 +8458,7 @@ pub fn blend_filter(
     // modes take this branch.
     if let Some(core_mode) = mode.extended_core_mode() {
         let mut out = Vec::with_capacity(expected);
-        for (pa, pb) in in1.chunks_exact(4).zip(in2.chunks_exact(4)) {
+        for (pa, pb) in in1.as_chunks::<4>().0.iter().zip(in2.as_chunks::<4>().0) {
             let cs = Rgba::new(pa[0], pa[1], pa[2], pa[3]);
             let cb = Rgba::new(pb[0], pb[1], pb[2], pb[3]);
             let r = crate::blend::blend_over(cb, cs, core_mode);
@@ -8410,7 +8468,7 @@ pub fn blend_filter(
     }
 
     let mut out = Vec::with_capacity(expected);
-    for (pa, pb) in in1.chunks_exact(4).zip(in2.chunks_exact(4)) {
+    for (pa, pb) in in1.as_chunks::<4>().0.iter().zip(in2.as_chunks::<4>().0) {
         // Straight-alpha bytes → premultiplied `[0, 1]` floats. §15.9
         // names the alpha quantities `qa` / `qb` and the colour
         // quantities `ca` / `cb`; the latter are premultiplied so each
@@ -8519,7 +8577,9 @@ pub fn blend_filter_pixels(
         b2.extend_from_slice(&[p.r, p.g, p.b, p.a]);
     }
     let out = blend_filter(&b1, &b2, width, height, mode);
-    out.chunks_exact(4)
+    out.as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| Rgba::new(c[0], c[1], c[2], c[3]))
         .collect()
 }
@@ -8717,13 +8777,13 @@ mod blend_filter_tests {
         // Expected per channel: min(200,30)=30, min(100,200)=100,
         // min(50,90)=50; max(200,30)=200, max(100,200)=200,
         // max(50,90)=90. Within one ULP of the float round-trip.
-        for px in dk.chunks_exact(4) {
+        for px in dk.as_chunks::<4>().0 {
             assert!((px[0] as i32 - 30).abs() <= 1);
             assert!((px[1] as i32 - 100).abs() <= 1);
             assert!((px[2] as i32 - 50).abs() <= 1);
             assert_eq!(px[3], 255);
         }
-        for px in lt.chunks_exact(4) {
+        for px in lt.as_chunks::<4>().0 {
             assert!((px[0] as i32 - 200).abs() <= 1);
             assert!((px[1] as i32 - 200).abs() <= 1);
             assert!((px[2] as i32 - 90).abs() <= 1);
@@ -8793,11 +8853,15 @@ mod blend_filter_tests {
         let bytes_in1 = flat(w, h, 200, 100, 50, 128);
         let bytes_in2 = flat(w, h, 30, 200, 90, 200);
         let pixels_in1: Vec<Rgba> = bytes_in1
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| Rgba::new(c[0], c[1], c[2], c[3]))
             .collect();
         let pixels_in2: Vec<Rgba> = bytes_in2
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| Rgba::new(c[0], c[1], c[2], c[3]))
             .collect();
         for mode in [
@@ -9417,7 +9481,9 @@ pub fn diffuse_lighting_pixels(
     }
     let out_bytes = diffuse_lighting(&bytes, width, height, params);
     out_bytes
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| Rgba::new(c[0], c[1], c[2], c[3]))
         .collect()
 }
@@ -9454,7 +9520,7 @@ mod diffuse_lighting_tests {
             },
         };
         let out = diffuse_lighting(&src, 4, 4, &params);
-        for px in out.chunks_exact(4) {
+        for px in out.as_chunks::<4>().0 {
             assert!(
                 (px[0] as i32 - 255).abs() <= 1,
                 "interior R != 255: {}",
@@ -9519,7 +9585,7 @@ mod diffuse_lighting_tests {
             },
         };
         let out = diffuse_lighting(&src, 3, 3, &params);
-        for px in out.chunks_exact(4) {
+        for px in out.as_chunks::<4>().0 {
             assert_eq!(px[0], 0);
             assert_eq!(px[1], 0);
             assert_eq!(px[2], 0);
@@ -9549,7 +9615,7 @@ mod diffuse_lighting_tests {
         let out = diffuse_lighting(&src, 8, 5, &params);
         // 120 · 0.5 ≈ 60, 200 · 0.5 = 100, 80 · 0.5 = 40 — within one
         // ULP of the quantisation round-trip.
-        for (i, px) in out.chunks_exact(4).enumerate() {
+        for (i, px) in out.as_chunks::<4>().0.iter().enumerate() {
             assert!(
                 (px[0] as i32 - 60).abs() <= 1,
                 "pixel {i} R = {} not ≈ 60",
@@ -9619,7 +9685,7 @@ mod diffuse_lighting_tests {
             out[edge_idx]
         );
         // All alphas = 255.
-        for px in out.chunks_exact(4) {
+        for px in out.as_chunks::<4>().0 {
             assert_eq!(px[3], 255);
         }
     }
@@ -9790,7 +9856,9 @@ mod diffuse_lighting_tests {
         let h = 4u32;
         let src_bytes = flat_alpha(w, h, 180);
         let src_pixels: Vec<Rgba> = src_bytes
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| Rgba::new(c[0], c[1], c[2], c[3]))
             .collect();
         let params = DiffuseLighting {
@@ -10067,7 +10135,9 @@ pub fn specular_lighting_pixels(
     }
     let out_bytes = specular_lighting(&bytes, width, height, params);
     out_bytes
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| Rgba::new(c[0], c[1], c[2], c[3]))
         .collect()
 }
@@ -10105,7 +10175,7 @@ mod specular_lighting_tests {
             },
         };
         let out = specular_lighting(&src, 4, 4, &params);
-        for (i, px) in out.chunks_exact(4).enumerate() {
+        for (i, px) in out.as_chunks::<4>().0.iter().enumerate() {
             assert!(
                 (px[0] as i32 - 255).abs() <= 1,
                 "pixel {i} R != 255: {}",
@@ -10189,7 +10259,7 @@ mod specular_lighting_tests {
             },
         };
         let out = specular_lighting(&src, 3, 3, &params);
-        for px in out.chunks_exact(4) {
+        for px in out.as_chunks::<4>().0 {
             assert_eq!(px[0], 0);
             assert_eq!(px[1], 0);
             assert_eq!(px[2], 0);
@@ -10218,7 +10288,7 @@ mod specular_lighting_tests {
             },
         };
         let out = specular_lighting(&src, 3, 3, &params);
-        for px in out.chunks_exact(4) {
+        for px in out.as_chunks::<4>().0 {
             // ks · 1 · (255, 100, 50) / 255 = (1.0, ~0.392, ~0.196)
             // ⇒ (255, 100, 50) on quantisation.
             assert!((px[0] as i32 - 255).abs() <= 1);
@@ -10250,7 +10320,7 @@ mod specular_lighting_tests {
         };
         let out = specular_lighting(&src, 8, 5, &params);
         let first = [out[0], out[1], out[2], out[3]];
-        for (i, px) in out.chunks_exact(4).enumerate() {
+        for (i, px) in out.as_chunks::<4>().0.iter().enumerate() {
             // Allow one quantisation-rounding ULP either way.
             assert!(
                 (px[0] as i32 - first[0] as i32).abs() <= 1,
@@ -10284,7 +10354,7 @@ mod specular_lighting_tests {
             },
         };
         let out = specular_lighting(&src, 3, 3, &params);
-        for px in out.chunks_exact(4) {
+        for px in out.as_chunks::<4>().0 {
             assert_eq!(px[0], 0);
             assert_eq!(px[1], 0);
             assert_eq!(px[2], 0);
@@ -10397,7 +10467,7 @@ mod specular_lighting_tests {
         let out = specular_lighting(&src, 2, 2, &params);
         assert_eq!(out.len(), 2 * 2 * 4);
         // Sa = max(Sr, Sg, Sb) on every pixel.
-        for px in out.chunks_exact(4) {
+        for px in out.as_chunks::<4>().0 {
             let m = px[0].max(px[1]).max(px[2]);
             // Allow ±1 ULP for the pre-quantisation max vs the
             // post-quantisation max of the per-channel triples.
@@ -10453,7 +10523,9 @@ mod specular_lighting_tests {
         let h = 4u32;
         let src_bytes = flat_alpha(w, h, 180);
         let src_pixels: Vec<Rgba> = src_bytes
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| Rgba::new(c[0], c[1], c[2], c[3]))
             .collect();
         let params = SpecularLighting {
@@ -10800,7 +10872,9 @@ pub fn image_source_pixels(
     let out = image_source(
         &bytes, src_width, src_height, out_width, out_height, par, sampling,
     );
-    out.chunks_exact(4)
+    out.as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| Rgba::new(c[0], c[1], c[2], c[3]))
         .collect()
 }
@@ -11052,7 +11126,9 @@ mod image_source_tests {
             [(x * 80) as u8, (y * 50) as u8, ((x * y) % 256) as u8, 220]
         });
         let src_typed: Vec<Rgba> = src_bytes
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| Rgba::new(c[0], c[1], c[2], c[3]))
             .collect();
         let par = PreserveAspectRatio {

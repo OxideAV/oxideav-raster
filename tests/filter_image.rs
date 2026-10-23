@@ -11,8 +11,8 @@
 
 use oxideav_core::Rgba;
 use oxideav_raster::{
-    image_source, image_source_pixels, merge, AspectRatioAlign, ImageSourceSampling, MeetOrSlice,
-    PreserveAspectRatio,
+    AspectRatioAlign, ImageSourceSampling, MeetOrSlice, PreserveAspectRatio, image_source,
+    image_source_pixels, merge,
 };
 
 /// Build a packed-RGBA buffer of `w·h` pixels coloured by `f`.
@@ -224,7 +224,9 @@ fn typed_and_byte_paths_agree_on_an_asymmetric_slice() {
         Rgba::new((x * 28) as u8, (y * 42) as u8, ((x * y) % 256) as u8, 230)
     });
     let src_typed: Vec<Rgba> = src_bytes
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| Rgba::new(c[0], c[1], c[2], c[3]))
         .collect();
     let par = PreserveAspectRatio {

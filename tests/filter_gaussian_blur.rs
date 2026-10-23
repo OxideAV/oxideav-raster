@@ -12,7 +12,7 @@
 //! `docs/image/svg/svg11-second-edition.pdf` §15.17.
 
 use oxideav_core::Rgba;
-use oxideav_raster::{gaussian_blur, gaussian_blur_pixels, GAUSSIAN_BLUR_BOX_THRESHOLD};
+use oxideav_raster::{GAUSSIAN_BLUR_BOX_THRESHOLD, gaussian_blur, gaussian_blur_pixels};
 
 fn build<F: FnMut(u32, u32) -> Rgba>(w: u32, h: u32, mut f: F) -> Vec<u8> {
     let mut v = Vec::with_capacity((w * h * 4) as usize);
@@ -82,7 +82,7 @@ fn alpha_only_input_stays_alpha_only_under_blur() {
 
     for &(sx, sy) in &[(0.8, 0.8), (1.5, 1.5), (3.0, 3.0)] {
         let out = gaussian_blur(&img, w, h, sx, sy);
-        for (i, chunk) in out.chunks_exact(4).enumerate() {
+        for (i, chunk) in out.as_chunks::<4>().0.iter().enumerate() {
             assert_eq!(
                 chunk[0], 0,
                 "R diffused at pixel {i} for (sx, sy) = ({sx}, {sy})"
@@ -159,7 +159,7 @@ fn impulse_response_approximate_mass_conservation() {
 
     for s in [1.0f32, 1.5, 2.5] {
         let out = gaussian_blur(&img, w, h, s, s);
-        let alpha_sum: u32 = out.chunks_exact(4).map(|c| c[3] as u32).sum();
+        let alpha_sum: u32 = out.as_chunks::<4>().0.iter().map(|c| c[3] as u32).sum();
         // The Gaussian footprint is well-contained inside a
         // 25×25 canvas for s ≤ 2.5 (3·s ≤ 7.5 ≪ 12), so virtually
         // no analytical mass leaks off the edge. The per-pass `u8`

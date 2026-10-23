@@ -2,11 +2,11 @@
 //! (Filter Effects 1 §5 / §6.1) and evaluate it through
 //! [`oxideav_raster::apply_filter_functions`].
 
-use oxideav_raster::{apply_filter_functions, parse_filter_value_list, FilterFunction};
+use oxideav_raster::{FilterFunction, apply_filter_functions, parse_filter_value_list};
 
 fn image(width: u32, height: u32) -> Vec<u8> {
     let mut buf = vec![0u8; width as usize * height as usize * 4];
-    for (i, px) in buf.chunks_exact_mut(4).enumerate() {
+    for (i, px) in buf.as_chunks_mut::<4>().0.iter_mut().enumerate() {
         px[0] = (i * 31 + 40) as u8;
         px[1] = (i * 67 + 90) as u8;
         px[2] = (i * 13 + 200) as u8;
@@ -45,12 +45,12 @@ fn parsed_multi_function_list_applies_in_document_order() {
 
     let black_then_invert = parse_filter_value_list("brightness(0) invert(1)").unwrap();
     let out = apply_filter_functions(&black_then_invert, &src, 4, 4);
-    for px in out.chunks_exact(4) {
+    for px in out.as_chunks::<4>().0 {
         assert_eq!(&px[..3], &[255, 255, 255]);
     }
     let invert_then_black = parse_filter_value_list("invert(1) brightness(0)").unwrap();
     let out = apply_filter_functions(&invert_then_black, &src, 4, 4);
-    for px in out.chunks_exact(4) {
+    for px in out.as_chunks::<4>().0 {
         assert_eq!(&px[..3], &[0, 0, 0]);
     }
 }

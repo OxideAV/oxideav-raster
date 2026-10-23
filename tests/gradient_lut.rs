@@ -22,8 +22,8 @@ use oxideav_core::{
     RadialGradient, Rgba, SpreadMethod, VectorFrame,
 };
 use oxideav_raster::{
-    eval_linear_gradient_in, eval_linear_gradient_lut, eval_radial_gradient_in,
-    eval_radial_gradient_lut, InterpolationSpace, Renderer, StopsLut,
+    InterpolationSpace, Renderer, StopsLut, eval_linear_gradient_in, eval_linear_gradient_lut,
+    eval_radial_gradient_in, eval_radial_gradient_lut,
 };
 
 fn black_to_white_stops() -> Vec<GradientStop> {

@@ -7,7 +7,7 @@
 
 use oxideav_core::Rgba;
 use oxideav_raster::{
-    component_transfer, component_transfer_pixels, ComponentTransfer, TransferFunc,
+    ComponentTransfer, TransferFunc, component_transfer, component_transfer_pixels,
 };
 
 fn checker_rgba(w: u32, h: u32) -> Vec<u8> {
@@ -153,7 +153,9 @@ fn public_api_pixels_wrapper_matches_byte_api() {
     // ComponentTransfer.
     let bytes = checker_rgba(4, 4);
     let pixels: Vec<Rgba> = bytes
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| Rgba::new(c[0], c[1], c[2], c[3]))
         .collect();
     let ct = ComponentTransfer {
@@ -172,7 +174,9 @@ fn public_api_pixels_wrapper_matches_byte_api() {
     let via_bytes = component_transfer(&bytes, 4, 4, &ct);
     let via_pixels = component_transfer_pixels(&pixels, 4, 4, &ct);
     let want: Vec<Rgba> = via_bytes
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| Rgba::new(c[0], c[1], c[2], c[3]))
         .collect();
     assert_eq!(via_pixels, want);

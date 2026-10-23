@@ -10,7 +10,7 @@
 //! coverage the existing `tests/image_lanczos3.rs` etc. provide.
 
 use oxideav_core::Rgba;
-use oxideav_raster::{morphology, morphology_pixels, MorphologyOp};
+use oxideav_raster::{MorphologyOp, morphology, morphology_pixels};
 
 /// Helper — build a packed-RGBA buffer of `w·h` pixels coloured by
 /// the supplied closure.

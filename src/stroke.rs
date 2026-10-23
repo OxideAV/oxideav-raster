@@ -182,10 +182,10 @@ fn build_segments(
             if let Some(loops) = stroke_closed(&seg.points, half, stroke, join) {
                 out.extend(loops);
             }
-        } else if seg.points.len() >= 2 {
-            if let Some(c) = stroke_open(&seg.points, half, stroke, join) {
-                out.push(c);
-            }
+        } else if seg.points.len() >= 2
+            && let Some(c) = stroke_open(&seg.points, half, stroke, join)
+        {
+            out.push(c);
         }
     }
     out

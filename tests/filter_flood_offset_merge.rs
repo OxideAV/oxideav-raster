@@ -14,8 +14,8 @@
 
 use oxideav_core::Rgba;
 use oxideav_raster::{
-    composite_filter, flood, flood_pixels, gaussian_blur, merge, merge_pixels, offset,
-    offset_pixels, CompositeOp, OffsetSampling,
+    CompositeOp, OffsetSampling, composite_filter, flood, flood_pixels, gaussian_blur, merge,
+    merge_pixels, offset, offset_pixels,
 };
 
 /// Build a packed-RGBA buffer of `w·h` pixels coloured by `f`.
@@ -37,8 +37,8 @@ fn flood_emits_extent_filled_with_resolved_pixel() {
     let out = flood(7, 5, 12, 34, 56, 0.5);
     assert_eq!(out.len(), 7 * 5 * 4);
     // round_half_up(0.5 · 255) = 128.
-    for px in out.chunks_exact(4) {
-        assert_eq!(px, [12, 34, 56, 128]);
+    for px in out.as_chunks::<4>().0 {
+        assert_eq!(*px, [12, 34, 56, 128]);
     }
 }
 
@@ -87,7 +87,9 @@ fn offset_typed_wrapper_round_trips_through_bytes() {
         )
     });
     let typed: Vec<Rgba> = bytes
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| Rgba::new(c[0], c[1], c[2], c[3]))
         .collect();
     for sampling in [OffsetSampling::Nearest, OffsetSampling::Bilinear] {
@@ -193,11 +195,15 @@ fn merge_typed_wrapper_round_trips_through_bytes() {
     let a_b = build(3, 3, |x, _| Rgba::new(255, 0, 0, (x * 60) as u8));
     let b_b = build(3, 3, |_, y| Rgba::new(0, 255, 0, (y * 80) as u8));
     let a_p: Vec<Rgba> = a_b
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| Rgba::new(c[0], c[1], c[2], c[3]))
         .collect();
     let b_p: Vec<Rgba> = b_b
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| Rgba::new(c[0], c[1], c[2], c[3]))
         .collect();
     let bytes_out = merge(3, 3, &[&a_b, &b_b]);
@@ -234,7 +240,9 @@ fn drop_shadow_pipeline_shape_runs_end_to_end() {
     // conventional implementation strategy for a §15.7.2 SourceAlpha
     // input.
     let source_alpha: Vec<u8> = source
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .flat_map(|p| [0, 0, 0, p[3]])
         .collect();
 
@@ -284,7 +292,9 @@ fn drop_shadow_pipeline_with_flood_replaces_shadow_colour() {
         }
     });
     let source_alpha: Vec<u8> = source
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .flat_map(|p| [0, 0, 0, p[3]])
         .collect();
     let blurred = gaussian_blur(&source_alpha, w, h, 1.5, 1.5);

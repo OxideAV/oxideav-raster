@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- edition 2024, MSRV 1.95
+
 ## [0.1.3](https://github.com/OxideAV/oxideav-raster/compare/v0.1.2...v0.1.3) - 2026-08-20
 
 ### Fixed
@@ -1419,8 +1423,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sRGB-space gradient. Wired through `sample_paint_in` →
   `eval_{linear,radial}_gradient_in` so consumers can also evaluate
   paints standalone.
-
-
 
 ### Fixed
 

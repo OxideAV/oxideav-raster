@@ -9,7 +9,7 @@
 //! target.
 
 use oxideav_core::Rgba;
-use oxideav_raster::{blend_filter, blend_filter_pixels, BlendFilterMode, CompositeOp};
+use oxideav_raster::{BlendFilterMode, CompositeOp, blend_filter, blend_filter_pixels};
 
 /// Build a packed-RGBA buffer of `w·h` pixels coloured by `f`.
 fn build<F: FnMut(u32, u32) -> Rgba>(w: u32, h: u32, mut f: F) -> Vec<u8> {
@@ -83,7 +83,7 @@ fn multiply_with_opaque_inputs_matches_componentwise_product() {
     let a = build(4, 4, |x, _| Rgba::new(64 + (x * 32) as u8, 128, 200, 255));
     let b = build(4, 4, |_, y| Rgba::new(255, 64 + (y * 32) as u8, 50, 255));
     let out = blend_filter(&a, &b, 4, 4, BlendFilterMode::Multiply);
-    for (i, px) in out.chunks_exact(4).enumerate() {
+    for (i, px) in out.as_chunks::<4>().0.iter().enumerate() {
         let ai = &a[i * 4..i * 4 + 4];
         let bi = &b[i * 4..i * 4 + 4];
         for c in 0..3 {
@@ -108,7 +108,7 @@ fn screen_with_opaque_inputs_is_screen_formula() {
     let a = build(4, 4, |x, _| Rgba::new((x * 50) as u8, 128, 200, 255));
     let b = build(4, 4, |_, y| Rgba::new(255, (y * 50) as u8, 50, 255));
     let out = blend_filter(&a, &b, 4, 4, BlendFilterMode::Screen);
-    for (i, px) in out.chunks_exact(4).enumerate() {
+    for (i, px) in out.as_chunks::<4>().0.iter().enumerate() {
         let ai = &a[i * 4..i * 4 + 4];
         let bi = &b[i * 4..i * 4 + 4];
         for c in 0..3 {
@@ -137,7 +137,13 @@ fn darken_lighten_are_componentwise_min_max_on_opaque_inputs() {
     let b = build(4, 4, |_, y| Rgba::new(50, (y * 60) as u8, 220, 255));
     let dk = blend_filter(&a, &b, 4, 4, BlendFilterMode::Darken);
     let lt = blend_filter(&a, &b, 4, 4, BlendFilterMode::Lighten);
-    for (i, (d, l)) in dk.chunks_exact(4).zip(lt.chunks_exact(4)).enumerate() {
+    for (i, (d, l)) in dk
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(lt.as_chunks::<4>().0)
+        .enumerate()
+    {
         let ai = &a[i * 4..i * 4 + 4];
         let bi = &b[i * 4..i * 4 + 4];
         for c in 0..3 {
@@ -211,11 +217,15 @@ fn typed_pixel_wrapper_matches_byte_path_across_modes() {
         Rgba::new(30, (x * 50) as u8, (y * 50) as u8, 180)
     });
     let pixels_a: Vec<Rgba> = bytes_a
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| Rgba::new(c[0], c[1], c[2], c[3]))
         .collect();
     let pixels_b: Vec<Rgba> = bytes_b
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| Rgba::new(c[0], c[1], c[2], c[3]))
         .collect();
     for mode in [
@@ -333,11 +343,15 @@ fn extended_modes_typed_path_matches_byte_path() {
         Rgba::new(22, (y * 42) as u8, (x * 38) as u8, (220 - y * 30) as u8)
     });
     let a_p: Vec<Rgba> = a_b
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| Rgba::new(c[0], c[1], c[2], c[3]))
         .collect();
     let b_p: Vec<Rgba> = b_b
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| Rgba::new(c[0], c[1], c[2], c[3]))
         .collect();
     for mode in EXTENDED_MODES {

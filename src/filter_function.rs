@@ -336,7 +336,7 @@ mod tests {
 
     fn image(width: u32, height: u32) -> Vec<u8> {
         let mut buf = vec![0u8; width as usize * height as usize * 4];
-        for (i, px) in buf.chunks_exact_mut(4).enumerate() {
+        for (i, px) in buf.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             px[0] = (i * 41 + 13) as u8;
             px[1] = (i * 89 + 7) as u8;
             px[2] = (i * 23 + 191) as u8;
@@ -449,7 +449,7 @@ mod tests {
         // gray" — slope 0, intercept 0.5.
         let src = image(3, 3);
         let out = apply_filter_functions(&[FilterFunction::Contrast(0.0)], &src, 3, 3);
-        for px in out.chunks_exact(4) {
+        for px in out.as_chunks::<4>().0 {
             assert_eq!(&px[..3], &[128, 128, 128]);
             assert_eq!(px[3], 255);
         }

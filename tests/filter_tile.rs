@@ -102,7 +102,9 @@ fn tile_typed_path_matches_byte_path_at_a_realistic_size() {
         Rgba::new((x * 15) as u8, (y * 22) as u8, ((x * y) % 256) as u8, 240)
     });
     let src_typed: Vec<Rgba> = src_bytes
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| Rgba::new(c[0], c[1], c[2], c[3]))
         .collect();
     let bytes_out = tile(&src_bytes, 16, 11, 100, 80);

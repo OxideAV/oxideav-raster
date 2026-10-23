@@ -4,7 +4,7 @@
 
 use oxideav_core::{LineCap, LineJoin, Paint, Path, Point, Rgba, Stroke, Transform2D};
 use oxideav_raster::{
-    flatten_path, stroke_to_fill_path, stroke_to_fill_path_ext, ExtendedLineJoin, ExtendedStroke,
+    ExtendedLineJoin, ExtendedStroke, flatten_path, stroke_to_fill_path, stroke_to_fill_path_ext,
 };
 
 fn sharp_corner_stroke(width: f32, miter_limit: f32) -> Stroke {

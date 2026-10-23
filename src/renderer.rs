@@ -9,15 +9,15 @@ use oxideav_core::{
 };
 
 use crate::blend::BlendMode;
-use crate::cache::{composite_key, CacheStats, RasterizedSubtree, SharedCache};
+use crate::cache::{CacheStats, RasterizedSubtree, SharedCache, composite_key};
 use crate::composite::composite_rgba_premultiplied_blend_rect;
-use crate::fill::{rasterize_fill, rasterize_fill_with_bounds, AlphaMask};
+use crate::fill::{AlphaMask, rasterize_fill, rasterize_fill_with_bounds};
 use crate::filter::PreserveAspectRatio;
-use crate::flatten::{flatten_path, FlatContour};
+use crate::flatten::{FlatContour, flatten_path};
 use crate::gradient::InterpolationSpace;
 use crate::paint::{build_paint_lut, sample_paint_in, sample_paint_with_lut};
 use crate::pattern::{
-    sample_tile_bilinear_wrap, sample_tile_nearest_wrap, view_box_fit_transform, Pattern,
+    Pattern, sample_tile_bilinear_wrap, sample_tile_nearest_wrap, view_box_fit_transform,
 };
 use crate::stroke::stroke_to_fill_path;
 
@@ -2513,7 +2513,7 @@ mod tests {
         let v = frame(2, 2, Group::default());
         let out = r.render(&v);
         // Every pixel should be the background color.
-        for px in out.planes[0].data.chunks_exact(4) {
+        for px in out.planes[0].data.as_chunks::<4>().0 {
             assert_eq!(px, &[0, 255, 0, 255]);
         }
     }

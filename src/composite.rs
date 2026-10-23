@@ -16,7 +16,7 @@
 //! source alpha by an extra group-opacity factor without rebuilding
 //! the mask.
 
-use crate::blend::{blend_over, BlendMode};
+use crate::blend::{BlendMode, blend_over};
 use crate::fill::AlphaMask;
 use oxideav_core::Rgba;
 

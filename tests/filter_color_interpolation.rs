@@ -8,8 +8,8 @@
 
 use oxideav_core::Rgba;
 use oxideav_raster::{
-    in_filter_space, in_filter_space_pixels, linear_to_srgb_f32, srgb_to_linear_f32, to_linear_rgb,
-    to_linear_rgb_pixels, to_srgb, to_srgb_pixels, FilterColorSpace,
+    FilterColorSpace, in_filter_space, in_filter_space_pixels, linear_to_srgb_f32,
+    srgb_to_linear_f32, to_linear_rgb, to_linear_rgb_pixels, to_srgb, to_srgb_pixels,
 };
 
 /// The property's initial value is `linearRGB`, and `auto` resolves to
@@ -69,7 +69,7 @@ fn byte_buffer_round_trip_preserves_alpha() {
     to_linear_rgb(&mut buf);
 
     // Alpha bytes untouched after linearisation.
-    for (i, chunk) in buf.chunks_exact(4).enumerate() {
+    for (i, chunk) in buf.as_chunks::<4>().0.iter().enumerate() {
         assert_eq!(
             chunk[3],
             original[i * 4 + 3],
@@ -87,8 +87,10 @@ fn byte_buffer_round_trip_preserves_alpha() {
     // This is the inherent cost of an 8-bit linear buffer; the f32
     // transfer functions are exact.
     for (i, (got, want)) in buf
-        .chunks_exact(4)
-        .zip(original.chunks_exact(4))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(original.as_chunks::<4>().0)
         .enumerate()
     {
         for c in 0..3 {

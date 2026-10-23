@@ -9,7 +9,7 @@
 //! `<feDiffuseLighting>` element would target inside a `<filter>`.
 
 use oxideav_core::Rgba;
-use oxideav_raster::{diffuse_lighting, diffuse_lighting_pixels, DiffuseLighting, LightSource};
+use oxideav_raster::{DiffuseLighting, LightSource, diffuse_lighting, diffuse_lighting_pixels};
 
 /// Build a packed-RGBA buffer of `w·h` pixels coloured by `f`.
 fn build<F: FnMut(u32, u32) -> Rgba>(w: u32, h: u32, mut f: F) -> Vec<u8> {
@@ -66,7 +66,7 @@ fn flat_alpha_gives_constant_output_for_distant_light() {
     };
     let out = diffuse_lighting(&src, 10, 7, &params);
     let first = &out[..4];
-    for chunk in out.chunks_exact(4) {
+    for chunk in out.as_chunks::<4>().0 {
         // All pixels equal up to one ULP from the per-pixel quantise
         // round-trip.
         assert!((chunk[0] as i32 - first[0] as i32).abs() <= 1);
@@ -99,7 +99,7 @@ fn light_color_scales_output_linearly() {
     let dim = diffuse_lighting(&src, 4, 4, &make([40, 60, 80]));
     let bright = diffuse_lighting(&src, 4, 4, &make([80, 120, 160]));
     // 2× light colour ⇒ 2× output (within rounding).
-    for (d, b) in dim.chunks_exact(4).zip(bright.chunks_exact(4)) {
+    for (d, b) in dim.as_chunks::<4>().0.iter().zip(bright.as_chunks::<4>().0) {
         assert!((b[0] as i32 - 2 * d[0] as i32).abs() <= 2);
         assert!((b[1] as i32 - 2 * d[1] as i32).abs() <= 2);
         assert!((b[2] as i32 - 2 * d[2] as i32).abs() <= 2);
@@ -125,7 +125,7 @@ fn diffuse_constant_scales_output_linearly() {
     };
     let half = diffuse_lighting(&src, 4, 4, &make(0.5));
     let full = diffuse_lighting(&src, 4, 4, &make(1.0));
-    for (h, f) in half.chunks_exact(4).zip(full.chunks_exact(4)) {
+    for (h, f) in half.as_chunks::<4>().0.iter().zip(full.as_chunks::<4>().0) {
         assert!((2 * h[0] as i32 - f[0] as i32).abs() <= 2);
         assert!((2 * h[1] as i32 - f[1] as i32).abs() <= 2);
         assert!((2 * h[2] as i32 - f[2] as i32).abs() <= 2);
@@ -172,7 +172,9 @@ fn typed_pixel_wrapper_round_trips_against_byte_path() {
         Rgba::new(0, 0, 0, ((x + y) * 20).min(255) as u8)
     });
     let pixels: Vec<Rgba> = bytes
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| Rgba::new(c[0], c[1], c[2], c[3]))
         .collect();
     let params = DiffuseLighting {
@@ -238,7 +240,7 @@ fn output_alpha_is_one_everywhere() {
             light_source: src_kind,
         };
         let out = diffuse_lighting(&src, 5, 5, &params);
-        for px in out.chunks_exact(4) {
+        for px in out.as_chunks::<4>().0 {
             assert_eq!(
                 px[3], 255,
                 "§15.14 demands alpha = 1.0 for every pixel and every light source"
@@ -278,7 +280,7 @@ fn spot_light_with_no_cone_lights_full_hemisphere() {
     // surface with z = 5) should be lit. With `z = 5` and the surface
     // at `Z = 0`, every pixel has `−L · S > 0` so the cone cap
     // doesn't matter and intensity is positive.
-    for px in out.chunks_exact(4) {
+    for px in out.as_chunks::<4>().0 {
         assert!(
             px[0] > 0,
             "in-cone spot should produce R > 0, got {}",

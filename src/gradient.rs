@@ -516,21 +516,13 @@ fn apply_spread(t: f32, spread: SpreadMethod) -> f32 {
         SpreadMethod::Pad => t.clamp(0.0, 1.0),
         SpreadMethod::Repeat => {
             let r = t - t.floor();
-            if r < 0.0 {
-                r + 1.0
-            } else {
-                r
-            }
+            if r < 0.0 { r + 1.0 } else { r }
         }
         SpreadMethod::Reflect => {
             let two = (t * 0.5).floor() * 2.0;
             let local = t - two;
             // local is in [0, 2). Mirror around 1.
-            if local <= 1.0 {
-                local
-            } else {
-                2.0 - local
-            }
+            if local <= 1.0 { local } else { 2.0 - local }
         }
     }
 }

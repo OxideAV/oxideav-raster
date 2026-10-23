@@ -11,7 +11,7 @@
 
 use oxideav_core::Rgba;
 use oxideav_raster::{
-    color_matrix, color_matrix_op, color_matrix_pixels, ColorMatrix, ColorMatrixOp,
+    ColorMatrix, ColorMatrixOp, color_matrix, color_matrix_op, color_matrix_pixels,
 };
 
 fn build<F: FnMut(u32, u32) -> Rgba>(w: u32, h: u32, mut f: F) -> Vec<u8> {
@@ -50,7 +50,7 @@ fn public_api_saturate_zero_makes_image_greyscale() {
         ColorMatrixOp::Saturate(0.0),
         &ColorMatrix::identity(),
     );
-    for (i, chunk) in out.chunks_exact(4).enumerate() {
+    for (i, chunk) in out.as_chunks::<4>().0.iter().enumerate() {
         let dr = (chunk[0] as i32 - chunk[1] as i32).abs();
         let dg = (chunk[1] as i32 - chunk[2] as i32).abs();
         assert!(
@@ -81,7 +81,7 @@ fn public_api_hue_rotate_preserves_alpha_and_total_brightness_on_grey() {
             ColorMatrixOp::HueRotate(theta),
             &ColorMatrix::identity(),
         );
-        for chunk in out.chunks_exact(4) {
+        for chunk in out.as_chunks::<4>().0 {
             assert_eq!(chunk[3], 180, "θ={theta}: alpha must pass through");
             // R, G, B should all be 100 ±2 LSBs.
             for (i, b) in chunk[..3].iter().enumerate() {
@@ -179,7 +179,7 @@ fn public_api_op_matrix_uses_user_supplied_matrix() {
     ]);
     let img = build(2, 2, |_, _| Rgba::new(200, 100, 60, 240));
     let out = color_matrix_op(&img, 2, 2, ColorMatrixOp::Matrix, &user);
-    for chunk in out.chunks_exact(4) {
+    for chunk in out.as_chunks::<4>().0 {
         // 0.5·v rounded to nearest integer: 200→100, 100→50, 60→30, 240→120.
         assert!((chunk[0] as i32 - 100).abs() <= 1);
         assert!((chunk[1] as i32 - 50).abs() <= 1);

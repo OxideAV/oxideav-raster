@@ -9,7 +9,7 @@
 //! so equality must be exact, not approximate.
 
 use oxideav_core::FillRule;
-use oxideav_raster::{rasterize_fill, AlphaMask, FlatContour};
+use oxideav_raster::{AlphaMask, FlatContour, rasterize_fill};
 
 /// The full-grid reference formulation: identical edge table, active
 /// edge list, span walk, and averaging arithmetic — but accumulating

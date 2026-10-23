@@ -23,8 +23,8 @@
 
 use oxideav_core::Rgba;
 use oxideav_raster::{
-    composite_filter, drop_shadow, drop_shadow_pixels, flood, gaussian_blur, merge, offset,
-    CompositeOp, OffsetSampling,
+    CompositeOp, OffsetSampling, composite_filter, drop_shadow, drop_shadow_pixels, flood,
+    gaussian_blur, merge, offset,
 };
 
 /// Build a packed-RGBA buffer of `w·h` pixels coloured by `f`.
@@ -59,7 +59,12 @@ fn manual_chain(
 ) -> Vec<u8> {
     // Step 1: alpha channel of input (RGB zeroed), then blur.
     let mut alpha_only = vec![0u8; src.len()];
-    for (d, s) in alpha_only.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
+    for (d, s) in alpha_only
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(src.as_chunks::<4>().0)
+    {
         d[3] = s[3];
     }
     let blurred = gaussian_blur(&alpha_only, w, h, sx, sy);
@@ -200,8 +205,8 @@ fn source_graphic_is_drawn_on_top() {
         OffsetSampling::Nearest,
     );
     // Every pixel: opaque source over (anything) = opaque source.
-    for px in out.chunks_exact(4) {
-        assert_eq!(px, [0, 0, 255, 255]);
+    for px in out.as_chunks::<4>().0 {
+        assert_eq!(*px, [0, 0, 255, 255]);
     }
 }
 
@@ -242,7 +247,9 @@ fn typed_path_agrees_with_byte_path() {
         Rgba::new((x * 30) as u8, (y * 40) as u8, ((x + y) * 20) as u8, 200)
     });
     let typed: Vec<Rgba> = bytes
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| Rgba::new(c[0], c[1], c[2], c[3]))
         .collect();
     let byte_out = drop_shadow(

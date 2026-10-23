@@ -33,14 +33,14 @@
 //!
 //! Run with: `cargo bench -p oxideav-raster --bench render`
 
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
 
 use oxideav_core::{
     FillRule, GradientStop, Group, LineCap, LineJoin, LinearGradient, MaskKind, Node, Paint, Path,
     PathNode, Point, RadialGradient, Rgba, SpreadMethod, Stroke, Transform2D, VectorFrame,
 };
-use oxideav_raster::{flatten_path, rasterize_fill, Renderer};
+use oxideav_raster::{Renderer, flatten_path, rasterize_fill};
 
 /// An `n`-point star polygon path centred at (cx, cy) with cubic-bulge
 /// edges, giving the flattener and the edge list something non-trivial.

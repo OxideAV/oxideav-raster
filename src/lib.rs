@@ -247,42 +247,42 @@ mod pattern;
 mod renderer;
 mod stroke;
 
-pub use blend::{blend_channel, blend_over, BlendMode};
+pub use blend::{BlendMode, blend_channel, blend_over};
 pub use cache::{CacheStats, RasterizedSubtree};
 pub use composite::{composite_rgba_premultiplied, composite_rgba_premultiplied_blend};
-pub use fill::{rasterize_fill, AlphaMask};
+pub use fill::{AlphaMask, rasterize_fill};
 pub use filter::{
-    blend_filter, blend_filter_pixels, clip_to_subregion, clip_to_subregion_pixels, color_matrix,
-    color_matrix_op, color_matrix_pixels, component_transfer, component_transfer_pixels,
-    composite_filter, composite_filter_pixels, convolve_matrix, convolve_matrix_pixels,
-    diffuse_lighting, diffuse_lighting_pixels, displacement_map, displacement_map_pixels,
-    drop_shadow, drop_shadow_pixels, flood, flood_pixels, gaussian_blur, gaussian_blur_edge,
-    gaussian_blur_pixels, image_source, image_source_pixels, in_filter_space,
-    in_filter_space_pixels, linear_to_srgb_f32, merge, merge_pixels, morphology, morphology_pixels,
-    offset, offset_pixels, specular_lighting, specular_lighting_pixels, srgb_to_linear_f32, tile,
-    tile_pixels, to_linear_rgb, to_linear_rgb_pixels, to_srgb, to_srgb_pixels, turbulence_filter,
-    turbulence_filter_pixels, AspectRatioAlign, BlendFilterMode, ColorMatrix, ColorMatrixOp,
-    ComponentTransfer, CompositeOp, ConvolveEdgeMode, ConvolveMatrix, DiffuseLighting,
-    DisplacementChannel, DisplacementSampling, FilterColorSpace, ImageSourceSampling, LightSource,
-    MeetOrSlice, MorphologyOp, OffsetSampling, PreserveAspectRatio, SpecularLighting, StitchTiles,
-    Subregion, TransferFunc, Turbulence, TurbulenceType, GAUSSIAN_BLUR_BOX_THRESHOLD,
+    AspectRatioAlign, BlendFilterMode, ColorMatrix, ColorMatrixOp, ComponentTransfer, CompositeOp,
+    ConvolveEdgeMode, ConvolveMatrix, DiffuseLighting, DisplacementChannel, DisplacementSampling,
+    FilterColorSpace, GAUSSIAN_BLUR_BOX_THRESHOLD, ImageSourceSampling, LightSource, MeetOrSlice,
+    MorphologyOp, OffsetSampling, PreserveAspectRatio, SpecularLighting, StitchTiles, Subregion,
+    TransferFunc, Turbulence, TurbulenceType, blend_filter, blend_filter_pixels, clip_to_subregion,
+    clip_to_subregion_pixels, color_matrix, color_matrix_op, color_matrix_pixels,
+    component_transfer, component_transfer_pixels, composite_filter, composite_filter_pixels,
+    convolve_matrix, convolve_matrix_pixels, diffuse_lighting, diffuse_lighting_pixels,
+    displacement_map, displacement_map_pixels, drop_shadow, drop_shadow_pixels, flood,
+    flood_pixels, gaussian_blur, gaussian_blur_edge, gaussian_blur_pixels, image_source,
+    image_source_pixels, in_filter_space, in_filter_space_pixels, linear_to_srgb_f32, merge,
+    merge_pixels, morphology, morphology_pixels, offset, offset_pixels, specular_lighting,
+    specular_lighting_pixels, srgb_to_linear_f32, tile, tile_pixels, to_linear_rgb,
+    to_linear_rgb_pixels, to_srgb, to_srgb_pixels, turbulence_filter, turbulence_filter_pixels,
 };
 pub use filter_css::{
-    parse_filter_value_list, parse_filter_value_list_with_color, FilterParseError,
+    FilterParseError, parse_filter_value_list, parse_filter_value_list_with_color,
 };
-pub use filter_function::{apply_filter_functions, FilterFunction};
+pub use filter_function::{FilterFunction, apply_filter_functions};
 pub use filter_graph::{FilterGraph, FilterInput, FilterPrimitive, FilterStep};
-pub use flatten::{flatten_arc_to_cubics, flatten_path, FlatContour};
+pub use flatten::{FlatContour, flatten_arc_to_cubics, flatten_path};
 pub use gradient::{
-    eval_focal_radial_gradient, eval_focal_radial_gradient_in, eval_focal_radial_gradient_lut,
-    eval_linear_gradient, eval_linear_gradient_in, eval_linear_gradient_lut, eval_radial_gradient,
-    eval_radial_gradient_in, eval_radial_gradient_lut, FocalRadialGradient, InterpolationSpace,
-    StopsLut,
+    FocalRadialGradient, InterpolationSpace, StopsLut, eval_focal_radial_gradient,
+    eval_focal_radial_gradient_in, eval_focal_radial_gradient_lut, eval_linear_gradient,
+    eval_linear_gradient_in, eval_linear_gradient_lut, eval_radial_gradient,
+    eval_radial_gradient_in, eval_radial_gradient_lut,
 };
 pub use paint::{sample_paint, sample_paint_in};
-pub use pattern::{view_box_fit_transform, Pattern};
-pub use renderer::{rasterize, ImageFilter, Renderer, DEFAULT_CACHE_CAPACITY};
-pub use stroke::{stroke_to_fill_path, stroke_to_fill_path_ext, ExtendedLineJoin, ExtendedStroke};
+pub use pattern::{Pattern, view_box_fit_transform};
+pub use renderer::{DEFAULT_CACHE_CAPACITY, ImageFilter, Renderer, rasterize};
+pub use stroke::{ExtendedLineJoin, ExtendedStroke, stroke_to_fill_path, stroke_to_fill_path_ext};
 
 #[cfg(test)]
 use oxideav_core::Rgba;

@@ -13,8 +13,8 @@
 use oxideav_core::{Paint, Rgba};
 
 use crate::gradient::{
-    eval_linear_gradient_in, eval_linear_gradient_lut, eval_radial_gradient_in,
-    eval_radial_gradient_lut, InterpolationSpace, StopsLut,
+    InterpolationSpace, StopsLut, eval_linear_gradient_in, eval_linear_gradient_lut,
+    eval_radial_gradient_in, eval_radial_gradient_lut,
 };
 
 /// Build a stops LUT for `paint` in `space` if `paint` is a gradient

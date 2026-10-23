@@ -9,7 +9,7 @@
 //! `tests/filter_morphology.rs` / `tests/filter_color_matrix.rs`.
 
 use oxideav_core::Rgba;
-use oxideav_raster::{composite_filter, composite_filter_pixels, CompositeOp};
+use oxideav_raster::{CompositeOp, composite_filter, composite_filter_pixels};
 
 /// Build a packed-RGBA buffer of `w·h` pixels coloured by `f`.
 fn build<F: FnMut(u32, u32) -> Rgba>(w: u32, h: u32, mut f: F) -> Vec<u8> {
@@ -35,7 +35,9 @@ fn over_with_transparent_in2_returns_in1() {
     // Where in1 is itself transparent the colour is normalised to
     // (0,0,0,0); compare against that normalisation of in1.
     let want: Vec<u8> = a
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .flat_map(|c| {
             if c[3] == 0 {
                 [0, 0, 0, 0]
@@ -163,11 +165,15 @@ fn typed_and_byte_paths_agree_across_operators() {
         Rgba::new(13, (y * 45) as u8, (x * 35) as u8, (200 - x * 20) as u8)
     });
     let a_p: Vec<Rgba> = a_b
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| Rgba::new(c[0], c[1], c[2], c[3]))
         .collect();
     let b_p: Vec<Rgba> = b_b
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| Rgba::new(c[0], c[1], c[2], c[3]))
         .collect();
     for op in [

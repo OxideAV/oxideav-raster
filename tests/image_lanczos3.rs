@@ -139,7 +139,7 @@ fn lanczos3_clamps_in_gamut_at_step_edge() {
     // pixel — i.e. no out-of-range write reaches the buffer.
     let (r, v) = frame_with(red_blue_split_image(6), ImageFilter::Lanczos3, 12);
     let out = r.render(&v);
-    for chunk in out.planes[0].data.chunks_exact(4) {
+    for chunk in out.planes[0].data.as_chunks::<4>().0 {
         let r_ch = chunk[0];
         let g_ch = chunk[1];
         let b_ch = chunk[2];

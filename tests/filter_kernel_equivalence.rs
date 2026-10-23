@@ -3,8 +3,8 @@
 //! formulation it replaced, on randomised inputs.
 
 use oxideav_raster::{
-    component_transfer, morphology, to_linear_rgb, to_srgb, ComponentTransfer, MorphologyOp,
-    TransferFunc,
+    ComponentTransfer, MorphologyOp, TransferFunc, component_transfer, morphology, to_linear_rgb,
+    to_srgb,
 };
 
 fn lcg_bytes(n: usize, seed: u64) -> Vec<u8> {
