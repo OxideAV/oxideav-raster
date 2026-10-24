@@ -309,3 +309,51 @@ fn view_box_and_group_transform_compose() {
         );
     }
 }
+
+/// The oxideav-svg emission contract: gradient geometry is already in
+/// each shape's LOCAL user space (objectBoundingBox resolved there), and
+/// the shape sits under nested group transforms plus its own transform
+/// (emitted as an innermost group). The paint must go through exactly
+/// the CTM the path goes through: rendering the composed CTM in one
+/// group must be byte-identical to the nested form, and the local
+/// gradient must land on the local rectangle's edges.
+#[test]
+fn svg_style_local_gradient_under_nested_transforms() {
+    let outer = Transform2D::translate(8.0, 4.0).compose(&Transform2D::scale(1.5, 1.5));
+    let middle = Transform2D::rotate(0.25);
+    let own = Transform2D::translate(4.0, 2.0);
+    let shape = || {
+        filled(
+            rect_path(0.0, 0.0, 24.0, 16.0),
+            // Local-space gradient spanning the local rect (what svg
+            // emits for objectBoundingBox x1=0 x2=1).
+            black_to_white(Point::new(0.0, 0.0), Point::new(24.0, 0.0)),
+        )
+    };
+    let nested =
+        Group::new().with_child(Node::Group(Group::new().with_transform(outer).with_child(
+            Node::Group(Group::new().with_transform(middle).with_child(Node::Group(
+                Group::new().with_transform(own).with_child(shape()),
+            ))),
+        )));
+    let ctm = outer.compose(&middle).compose(&own);
+    let flat = Group::new().with_child(Node::Group(
+        Group::new().with_transform(ctm).with_child(shape()),
+    ));
+    let r = Renderer::new(64, 64);
+    let a = r.render(&frame(64.0, 64.0, nested));
+    let b = r.render(&frame(64.0, 64.0, flat));
+    assert_eq!(a.planes[0].data, b.planes[0].data);
+    // Local (0.5, 8) is near-black, local (23.5, 8) near-white.
+    let near = |lx: f32, ly: f32| {
+        let p = ctm.apply(Point::new(lx, ly));
+        px(&a, p.x as u32, p.y as u32)
+    };
+    assert!(near(1.0, 8.0)[0] <= 20, "local left {:?}", near(1.0, 8.0));
+    assert!(
+        near(23.0, 8.0)[0] >= 235,
+        "local right {:?}",
+        near(23.0, 8.0)
+    );
+    assert_close(near(12.0, 8.0)[0], 127.5, "local middle");
+}
