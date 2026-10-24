@@ -38,7 +38,7 @@ use oxideav_core::{
     FillRule, GradientStop, Group, LinearGradient, Node, Paint, Path, PathNode, Point,
     RadialGradient, Rgba, SpreadMethod, Stroke, Transform2D, VectorFrame, VideoFrame, ViewBox,
 };
-use oxideav_raster::{CoverageMode, Renderer};
+use oxideav_raster::{CoverageMode, GradientPaint, GradientUnits, Renderer};
 
 const W: u32 = 64;
 const H: u32 = 64;
@@ -343,6 +343,85 @@ fn grad_radial_nonuniform() {
         )),
     );
     check("grad_radial_nonuniform", &v);
+}
+
+/// Rebuild the harness render through a direct gradient endpoint.
+fn render_gradient_fill(path: Path, gradient: &GradientPaint) -> Vec<u8> {
+    let out = Renderer::new(W, H).fill_path_with_gradient(
+        &path,
+        FillRule::NonZero,
+        gradient,
+        Transform2D::identity(),
+    );
+    let plane = &out.planes[0];
+    let mut flat = Vec::with_capacity((W * H * 4) as usize);
+    for y in 0..H as usize {
+        flat.extend_from_slice(&plane.data[y * plane.stride..y * plane.stride + (W as usize) * 4]);
+    }
+    flat
+}
+
+fn check_bytes(name: &str, got: &[u8]) {
+    let want = load_ref(name);
+    let d = diff(got, &want);
+    eprintln!(
+        "{name}: interior max|Δc| = {}; edge max|Δα| = {}, max|Δpremul| = {}, mean|Δα| = {:.3} over {} px",
+        d.max_interior, d.max_alpha, d.max_edge_premul, d.mean_edge_alpha, d.edge_pixels
+    );
+    assert!(
+        d.interior_over == 0,
+        "{name}: {} interior px over tol (max {})",
+        d.interior_over,
+        d.max_interior
+    );
+    assert!(
+        d.edge_over == 0,
+        "{name}: {} edge px over tol (max |Δα| {})",
+        d.edge_over,
+        d.max_alpha
+    );
+    assert!(
+        d.mean_edge_alpha <= EDGE_MEAN_TOL,
+        "{name}: mean edge |Δα| {:.3}",
+        d.mean_edge_alpha
+    );
+}
+
+/// `objectBoundingBox` linear gradient (SVG defaults x1 = 0%, x2 =
+/// 100%) with `gradientTransform="rotate(45 0.5 0.5)"` on a 48 × 24
+/// rect: the non-uniform box turns the 45° bbox-space rotation into a
+/// skewed user-space gradient whose normal is not perpendicular to its
+/// vector (SVG 2 §14.2.2.1).
+#[test]
+fn grad_linear_bbox_transform() {
+    let g = LinearGradient::new(Point::new(0.0, 0.0), Point::new(1.0, 0.0))
+        .with_stop(GradientStop::new(0.0, BLACK))
+        .with_stop(GradientStop::new(1.0, WHITE));
+    let gp = GradientPaint::linear(g)
+        .with_units(GradientUnits::ObjectBoundingBox)
+        .with_transform(rotate_about(45.0, 0.5, 0.5));
+    check_bytes(
+        "grad_linear_bbox_transform",
+        &render_gradient_fill(rect(8.0, 12.0, 48.0, 24.0), &gp),
+    );
+}
+
+/// `objectBoundingBox` radial gradient with an off-centre focus and
+/// `gradientTransform="translate(0.1 0)"` on a 56 × 28 rect: elliptical
+/// rings (§14.2.3.1), focus displaced inside them.
+#[test]
+fn grad_radial_bbox_ellipse() {
+    let g = RadialGradient::new(Point::new(0.4, 0.5), 0.5)
+        .with_focal(Point::new(0.3, 0.5))
+        .with_stop(GradientStop::new(0.0, RED))
+        .with_stop(GradientStop::new(1.0, BLUE));
+    let gp = GradientPaint::radial(g)
+        .with_units(GradientUnits::ObjectBoundingBox)
+        .with_transform(Transform2D::translate(0.1, 0.0));
+    check_bytes(
+        "grad_radial_bbox_ellipse",
+        &render_gradient_fill(rect(4.0, 16.0, 56.0, 28.0), &gp),
+    );
 }
 
 /// The supersampled kernel is kept available (it is what the issue

@@ -231,11 +231,20 @@
 //!   `color-interpolation-filters` working space for the whole chain
 //!   (linearise once on entry, re-encode once on exit).
 //!
+//! * gradient paint servers with their own coordinate system
+//!   ([`GradientPaint`]: SVG 2 §14.2 `gradientUnits` +
+//!   `gradientTransform`, linear / radial / two-circle focal radial)
+//!   resolved against a node's CTM and bounding box by
+//!   [`GradientPaint::sampler`], and painted through
+//!   [`Renderer::fill_path_with_gradient`] /
+//!   [`Renderer::stroke_path_with_gradient`]; [`path_bounding_box`]
+//!   gives the §8.11 object bounding box.
+//!
 //! Deferred to a later round:
 //!
-//! * a `Paint`-level pattern variant (pending an `oxideav-core` IR
-//!   addition — patterns currently paint through the direct
-//!   [`Renderer`] endpoints),
+//! * `Paint`-level pattern and transformed-gradient variants (pending
+//!   `oxideav-core` IR additions — both currently paint through the
+//!   direct [`Renderer`] endpoints),
 //! * full ICC-tagged color-managed pipeline (the `linearRGB`
 //!   interpolation space is implemented; per-channel ICC profile
 //!   transforms are still TODO),
@@ -256,6 +265,7 @@ mod filter_function;
 mod filter_graph;
 mod flatten;
 mod gradient;
+mod gradient_paint;
 mod paint;
 mod pattern;
 mod renderer;
@@ -292,6 +302,9 @@ pub use gradient::{
     eval_focal_radial_gradient_in, eval_focal_radial_gradient_lut, eval_linear_gradient,
     eval_linear_gradient_in, eval_linear_gradient_lut, eval_radial_gradient,
     eval_radial_gradient_in, eval_radial_gradient_lut,
+};
+pub use gradient_paint::{
+    GradientGeometry, GradientPaint, GradientSampler, GradientUnits, path_bounding_box,
 };
 pub use paint::{sample_paint, sample_paint_in};
 pub use pattern::{Pattern, view_box_fit_transform};

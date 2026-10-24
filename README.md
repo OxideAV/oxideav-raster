@@ -40,6 +40,7 @@ produces a packed `Rgba` `VideoFrame`.
 | 12 separable blend modes (PDF §11.3.5.2)  | done                 |
 | 4 non-separable HSL modes (PDF §11.3.5.3) | done                 |
 | Filters — all 17 §15 / Filter-Effects-1 primitives | done — morphology, color-matrix, Gaussian blur (incl. Filter-Effects-1 §9.14 `edgeMode` duplicate/wrap/none), component-transfer, composite, convolve-matrix, turbulence, flood, offset, merge, tile, displacement-map, blend, diffuse-lighting, specular-lighting, image, drop-shadow |
+| Gradient paint servers with `gradientUnits` + `gradientTransform` (SVG 2 §14.2 / §8.11) | done — `GradientPaint` record (linear / radial / two-circle focal radial, `objectBoundingBox` or `userSpaceOnUse`, post-multiplied transform) resolved against the node CTM + bbox by `GradientPaint::sampler`; `fill_path_with_gradient` / `stroke_path_with_gradient`; rsvg-convert interiors within 1 level; lacks a core `Paint` variant — see the contract below |
 | `<pattern>` tiled fill/stroke paint (SVG2 §14.3) | done — user-space tile rect + patternTransform + wrap-around sampling; lacks a core `Paint` variant |
 | Pattern `viewBox` + `preserveAspectRatio` (SVG2 §14.3.2 / §8.2) | done — all 10 alignments × meet/slice + `align=none`, slice overhang tile-clipped |
 | `color-interpolation-filters` working space (Filter Effects 1 §10) | done — `linearRGB` (initial) / `sRGB` / `auto`; linearise→run→re-encode wrapper, alpha preserved |
@@ -75,6 +76,45 @@ use oxideav_raster::rasterize;
 # let frame = oxideav_core::VectorFrame::new(800.0, 600.0);
 let frame_out = rasterize(&frame); // returns oxideav_core::Frame::Video(...)
 ```
+
+## Gradient paint contract
+
+Where a gradient's coordinates live, and who applies which transform:
+
+* **`oxideav_core::Paint::LinearGradient` / `RadialGradient`** carry
+  geometry in the painted node's **user space** (SVG 2 §14.2.2.1 /
+  §14.2.3.1 `gradientUnits="userSpaceOnUse"`). The renderer maps every
+  device pixel centre through the inverse of the node's current
+  transformation matrix (viewBox → viewport fit ∘ ancestor group
+  transforms ∘ the element's own transform) before evaluating the
+  gradient — the same mapping the outline goes through. A decoder must
+  therefore **not** pre-transform gradient points into device space, and
+  a radial gradient under a non-uniform CTM renders elliptical rings by
+  construction.
+* **`oxideav_raster::GradientPaint`** is the additive record for
+  gradients that have a coordinate system of their own: `geometry`
+  (`GradientGeometry::Linear` / `Radial` / `FocalRadial`), `units`
+  (`GradientUnits::UserSpaceOnUse` | `ObjectBoundingBox`) and
+  `transform` (`gradientTransform`). Gradient space maps to user space
+  by `B · transform` with `B = [bw 0 0 bh bx by]` for `objectBoundingBox`
+  (SVG 2 §8.11) and the identity otherwise — `gradientTransform` is
+  post-multiplied, exactly as §14.2.2.1 words it. `GradientPaint::sampler(&ctm, bbox, space)`
+  resolves it to a `GradientSampler` (device → gradient inverse + stops
+  LUT); it returns `None` when nothing is to be painted: an
+  `objectBoundingBox` gradient on a box with zero width or height
+  (§8.11), or a singular matrix. `path_bounding_box` yields the §8.11
+  geometry box (fill geometry only — stroke width does not contribute,
+  so stroke paint uses the same box as fill paint).
+* `Renderer::fill_path_with_gradient` / `stroke_path_with_gradient`
+  paint a single path with a `GradientPaint` under a given CTM (the same
+  shape as the pattern endpoints). `GradientPaint::from_paint` lifts a
+  user-space `Paint` gradient so a decoder can attach the transform it
+  could not express in the core IR (the typical case is a radial
+  gradient under a non-conformal mapping).
+* All of the above is `#[non_exhaustive]` with `new()` / `with_*`
+  builders; a future `oxideav-core` `Paint` variant carrying the same
+  three fields is the intended end state, at which point the scene walk
+  will route through `GradientPaint::sampler` directly.
 
 ## Clean-room policy
 

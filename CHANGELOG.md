@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `GradientPaint` (#6): a gradient paint server with its own coordinate
+  system — `GradientGeometry` (linear / radial / two-circle focal
+  radial), `GradientUnits` (`UserSpaceOnUse` | `ObjectBoundingBox`, SVG 2
+  §8.11) and a post-multiplied `gradientTransform` (§14.2.2.1 /
+  §14.2.3.1). `GradientPaint::sampler(ctm, bbox, space)` resolves it to a
+  `GradientSampler` mapping device pixels back into gradient space;
+  `Renderer::fill_path_with_gradient` / `stroke_path_with_gradient`
+  paint a path with one; `path_bounding_box` gives the §8.11 geometry
+  box; `GradientPaint::from_paint` lifts a user-space core gradient.
+  A zero-extent box under `objectBoundingBox` or a singular matrix paints
+  nothing (§8.11). All records `#[non_exhaustive]` with builders; the
+  contract is documented in the README for decoders to adopt. Verified
+  against rsvg-convert on `gradientTransform` + `objectBoundingBox`
+  fixtures (linear skew, elliptical off-focus radial) within 1 level.
 - exact-area anti-aliasing (#6): `CoverageMode::Analytic` /
   `rasterize_fill_analytic` — a sparse scan converter that cuts each
   pixel row into sub-strips at vertices and edge crossings and integrates

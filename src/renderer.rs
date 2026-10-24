@@ -17,6 +17,7 @@ use crate::fill::{
 use crate::filter::PreserveAspectRatio;
 use crate::flatten::{FlatContour, flatten_path};
 use crate::gradient::InterpolationSpace;
+use crate::gradient_paint::{GradientPaint, GradientSampler, invert_2d, path_bounding_box};
 use crate::paint::{build_paint_lut, sample_paint_in, sample_paint_with_lut};
 use crate::pattern::{
     Pattern, sample_tile_bilinear_wrap, sample_tile_nearest_wrap, view_box_fit_transform,
@@ -1137,6 +1138,104 @@ impl Renderer {
         );
     }
 
+    /// Fill `path` with a [`GradientPaint`] — a gradient carrying its
+    /// own `gradientUnits` / `gradientTransform` (SVG 2 §14.2) —
+    /// returning a full-canvas RGBA frame with only that fill painted.
+    ///
+    /// `transform` is the user → device transform in effect for the
+    /// element referencing the gradient (its CTM). The gradient is
+    /// resolved against it and, under `ObjectBoundingBox` units, the
+    /// path's §8.11 geometry bounding box ([`path_bounding_box`]); see
+    /// [`GradientPaint::sampler`] for when nothing is painted.
+    ///
+    /// For gradients already expressed in user space, a
+    /// [`Paint::LinearGradient`] / [`Paint::RadialGradient`] inside a
+    /// scene rendered by [`Renderer::render`] goes through the very same
+    /// inverse-CTM sampling.
+    pub fn fill_path_with_gradient(
+        &self,
+        path: &Path,
+        fill_rule: FillRule,
+        gradient: &GradientPaint,
+        transform: Transform2D,
+    ) -> VideoFrame {
+        let stride = (self.width as usize) * 4;
+        let mut buf = vec![0u8; stride * (self.height as usize)];
+        if let Some(sampler) = gradient.sampler(
+            &transform,
+            path_bounding_box(path),
+            self.color_interpolation,
+        ) {
+            let contours = flatten_path(&path.commands, &transform);
+            let (mask, bounds) = self.rasterize_with_bounds(&contours, fill_rule);
+            self.composite_with_gradient(&mut buf, stride, &mask, bounds, &sampler, 1.0);
+        }
+        VideoFrame {
+            pts: None,
+            planes: vec![VideoPlane { stride, data: buf }],
+        }
+    }
+
+    /// Stroke `path` with a [`GradientPaint`], returning a full-canvas
+    /// RGBA frame with only that stroke painted. The object bounding
+    /// box used for `ObjectBoundingBox` units is the path's fill
+    /// geometry (SVG 2 §8.11 — the stroke width does not contribute).
+    pub fn stroke_path_with_gradient(
+        &self,
+        path: &Path,
+        stroke: &Stroke,
+        gradient: &GradientPaint,
+        transform: Transform2D,
+    ) -> VideoFrame {
+        let stride = (self.width as usize) * 4;
+        let mut buf = vec![0u8; stride * (self.height as usize)];
+        if let Some(sampler) = gradient.sampler(
+            &transform,
+            path_bounding_box(path),
+            self.color_interpolation,
+        ) {
+            let geom = build_stroke_geometry(path, &transform, stroke);
+            let (mask, bounds) = self.rasterize_with_bounds(&geom, FillRule::NonZero);
+            self.composite_with_gradient(&mut buf, stride, &mask, bounds, &sampler, 1.0);
+        }
+        VideoFrame {
+            pts: None,
+            planes: vec![VideoPlane { stride, data: buf }],
+        }
+    }
+
+    /// Composite a resolved gradient through `mask`, sampling at device
+    /// pixel centres.
+    fn composite_with_gradient(
+        &self,
+        buf: &mut [u8],
+        stride: usize,
+        mask: &AlphaMask,
+        bounds: Option<(u32, u32, u32, u32)>,
+        sampler: &GradientSampler,
+        group_opacity: f32,
+    ) {
+        if mask.is_empty() {
+            return;
+        }
+        let Some(rect) = bounds else {
+            return;
+        };
+        composite_rgba_premultiplied_blend_rect(
+            buf,
+            stride,
+            self.width,
+            self.height,
+            mask,
+            0,
+            0,
+            group_opacity,
+            self.blend_mode,
+            rect,
+            |x, y| sampler.sample(x as f32 + 0.5, y as f32 + 0.5),
+        );
+    }
+
     /// Fill `path` with a tiled [`Pattern`] paint server (SVG 2 §14.3),
     /// returning a full-canvas RGBA frame with only that fill painted
     /// onto the renderer's `background` clear.
@@ -1741,22 +1840,6 @@ fn rect_to_path(r: Rect) -> Path {
         .line_to(oxideav_core::Point::new(r.x, r.y + r.height))
         .close();
     p
-}
-
-/// Inverse of an affine 2D transform. Returns `None` if singular.
-fn invert_2d(t: &Transform2D) -> Option<Transform2D> {
-    let det = t.a * t.d - t.b * t.c;
-    if det.abs() < 1e-12 {
-        return None;
-    }
-    let inv_det = 1.0 / det;
-    let a = t.d * inv_det;
-    let b = -t.b * inv_det;
-    let c = -t.c * inv_det;
-    let d = t.a * inv_det;
-    let e = -(a * t.e + c * t.f);
-    let f = -(b * t.e + d * t.f);
-    Some(Transform2D { a, b, c, d, e, f })
 }
 
 /// Nearest-neighbour sample of an `Rgba` `VideoFrame` (the only
