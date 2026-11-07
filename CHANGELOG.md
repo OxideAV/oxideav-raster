@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/OxideAV/oxideav-raster/compare/v0.1.4...v0.2.0) - 2026-11-07
+
+### Added
+
+- *(renderer)* linear-light compositing and scene supersampling options
+- *(renderer)* band-parallel scan under the core ExecutionContext
+- *(gradient)* exact row-wise gradient evaluation, optional ordered dither
+
+### Fixed
+
+- work bounds for huge pens and sub-pixel dashes; render_paths fuzz target
+- *(stroke)* zero-length subpath caps, straddling arc polygons, join tests
+
+### Other
+
+- r484 benchmark tables, kernel algorithm docs, CHANGELOG summary
+- monotone-chain scan converter, exact thick strokes
+- *(composite)* stream path rows into exact integer source-over
+- tolerance-bounded flattening, windowed coverage, user-space strokes
+- *(gradient)* pin the full #6 transform stack against rsvg-convert ([#6](https://github.com/OxideAV/oxideav-raster/pull/6))
+- API hygiene: non_exhaustive renderer / filter records and growable enums
+
 ### Changed
 
 - `#[non_exhaustive]`: the enums `BlendMode`, `BlendFilterMode`, `CompositeOp`, `FilterColorSpace`, `InterpolationSpace`, `OffsetSampling`, `DisplacementSampling`, `ImageSourceSampling`, `ImageFilter`, `FilterFunction`, `FilterInput`, `FilterPrimitive` and `FilterParseError`; the records `Renderer`, `Pattern`, `ExtendedStroke`, `FilterStep`, `ComponentTransfer`, `ConvolveMatrix`, `Turbulence`, `DiffuseLighting`, `SpecularLighting`, `RasterizedSubtree` and `CacheStats`. Code outside the crate builds the records through their existing constructors / `Default` and `with_*` setters (fields stay public and assignable) and needs a `_ =>` arm when matching the enums. Enums whose value set the SVG filter / painting model fixes (`MorphologyOp`, `ColorMatrixOp`, `TransferFunc`, `ConvolveEdgeMode`, `TurbulenceType`, `StitchTiles`, `DisplacementChannel`, `LightSource`, `AspectRatioAlign`, `MeetOrSlice`, `ExtendedLineJoin`) and the value types (`AlphaMask`, `Subregion`, `PreserveAspectRatio`, `FlatContour`, `FocalRadialGradient`) are unchanged.
