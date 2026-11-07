@@ -933,9 +933,20 @@ impl EdgeTable {
     /// and every crossing into pieces where each chain is one straight
     /// edge in a consistent order, and those are integrated as
     /// trapezoids — the same exact area, just more work.
-    pub(crate) fn scan(&self, fill_rule: FillRule, mut emit: impl FnMut(u32, u32, &[u8])) {
+    pub(crate) fn scan(&self, fill_rule: FillRule, emit: impl FnMut(u32, u32, &[u8])) {
+        self.scan_rows(fill_rule, 0..self.win.y1 - self.win.y0, emit);
+    }
+
+    /// [`Self::scan`] restricted to the window-local rows `rows`. A row's
+    /// output does not depend on which rows were scanned before it.
+    pub(crate) fn scan_rows(
+        &self,
+        fill_rule: FillRule,
+        rows: std::ops::Range<u32>,
+        mut emit: impl FnMut(u32, u32, &[u8]),
+    ) {
         let w = (self.win.x1 - self.win.x0) as usize;
-        let height = self.win.y1 - self.win.y0;
+        let height = rows.end.min(self.win.y1 - self.win.y0);
         let chains = &self.chains;
         // Per-row accumulators: `area` holds boundary-cell areas written
         // directly, `run` is a difference array for fully-covered runs
@@ -953,7 +964,7 @@ impl EdgeTable {
         let mut sub: Vec<f32> = Vec::new();
         let mut strip: Vec<StripEdge> = Vec::new();
 
-        for py in 0..height {
+        for py in rows.start..height {
             let row_top = py as f32;
             let row_bot = row_top + 1.0;
 

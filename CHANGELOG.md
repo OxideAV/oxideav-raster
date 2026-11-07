@@ -30,6 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `Renderer::threads` / `Renderer::with_execution_context(&ExecutionContext)`: following the `oxideav-core` threading contract (serial by default, fan-out bounded by `effective_workers`), large fills and strokes (window ≥ 256 Ki px) are scanned and composited in concurrent row bands. Output is byte-identical to the serial render (the scan carries no cross-row state beyond the chain cursors, which each band re-derives). 4 workers: 4K linear gradient 35 → 11 ms, radius-1000 circle fill + stroke 18 → 6 ms.
 - `GradientDither` (`None` default, `Ordered`) and `Renderer::gradient_dither` / `Renderer::with_gradient_dither`: optional 8×8 Bayer ordered dither for gradient quantisation (wide low-contrast ramps lose their 1-level bands; every 8×8 block's mean tracks the exact ramp within 1/16 level). Off by default because the fixed ±½-level texture costs downstream video encoders bits.
 - `DiffuseLighting::with_*` and `SpecularLighting::with_*` setters for every field (start from `Default`).
 - two more `rsvg-convert` reference fixtures pinning the #6 gradient case end to end (#6): a `userSpaceOnUse` reflected linear gradient with `gradientTransform="skewX(20)"` under a `viewBox` scale, a rotated group and the element's own `transform`, and an `objectBoundingBox` focal radial gradient with a rotated `gradientTransform` under a `viewBox` scale and a non-uniform group. Interiors agree within 1 level (the linear one byte-identical).

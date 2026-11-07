@@ -4,8 +4,8 @@
 //! See the crate-level docs for the overall pipeline.
 
 use oxideav_core::{
-    FillRule, Frame, Group, ImageRef, MaskKind, Node, Paint, Path, PathNode, Point, Rect, Rgba,
-    Stroke, Transform2D, VectorFrame, VideoFrame, VideoPlane,
+    ExecutionContext, FillRule, Frame, Group, ImageRef, MaskKind, Node, Paint, Path, PathNode,
+    Point, Rect, Rgba, Stroke, Transform2D, VectorFrame, VideoFrame, VideoPlane,
 };
 
 use crate::blend::BlendMode;
@@ -98,6 +98,11 @@ pub struct Renderer {
     /// [`GradientDither::Ordered`] trades a fixed ±½-level texture for
     /// banding-free wide, low-contrast ramps.
     pub gradient_dither: GradientDither,
+    /// Worker budget for internal parallelism (row bands of large
+    /// shapes). `1` (the default) renders serially; set it through
+    /// [`Renderer::with_execution_context`]. Output bytes never depend
+    /// on it.
+    pub threads: usize,
     /// Bitmap cache for memoised group subtrees. Shared via
     /// `Arc<Mutex<...>>` so the cache survives `Clone`, and so the
     /// cache lookup remains coherent across the scene walk's
@@ -174,6 +179,18 @@ pub enum ImageFilter {
     BSpline,
 }
 
+/// Paints one coverage row: `(dst, y, x0, coverage, scratch)`, `dst`
+/// being the RGBA bytes of device pixels `x0 .. x0 + coverage.len()` on
+/// row `y`.
+type RowPainter<'a> = dyn Fn(&mut [u8], u32, u32, &[u8], &mut Vec<Rgba>) + Sync + 'a;
+
+/// A shape is scanned in parallel bands only when its window holds at
+/// least this many pixels (below it, thread start-up dominates).
+const PARALLEL_MIN_AREA: u64 = 1 << 18;
+
+/// Minimum rows per parallel band.
+const PARALLEL_MIN_ROWS: u32 = 64;
+
 /// Default cache capacity (entries) when none is specified.
 pub const DEFAULT_CACHE_CAPACITY: usize = 256;
 
@@ -195,6 +212,7 @@ impl Renderer {
             blend_mode: BlendMode::default(),
             preserve_aspect_ratio: PreserveAspectRatio::default(),
             gradient_dither: GradientDither::default(),
+            threads: 1,
             cache: SharedCache::with_capacity(DEFAULT_CACHE_CAPACITY),
         }
     }
@@ -290,6 +308,16 @@ impl Renderer {
             pts: frame.pts,
             planes: vec![VideoPlane { stride, data: buf }],
         }
+    }
+
+    /// Adopt the caller's thread budget (`oxideav-core`'s threading
+    /// contract: serial until told otherwise, fan-out bounded by
+    /// [`ExecutionContext::effective_workers`]). Large fills and
+    /// strokes are then scanned in concurrent row bands; the output is
+    /// byte-identical to the serial render.
+    pub fn with_execution_context(mut self, ctx: &ExecutionContext) -> Self {
+        self.threads = ctx.effective_workers(usize::MAX).max(1);
+        self
     }
 
     /// Select the gradient quantisation (builder form of the
@@ -689,41 +717,97 @@ impl Renderer {
         }
     }
 
-    /// Stream the coverage of `contours` row by row, intersected with
-    /// `clip` (per-pixel minimum), as `emit(y, x0, coverage)` calls in
-    /// device coordinates. The analytic kernel never materialises a
-    /// mask: each row is composited while it is still in cache.
-    fn coverage_rows(
+    /// Stream the coverage of `contours`, intersected with `clip`
+    /// (per-pixel minimum), into `paint_row(dst, y, x0, coverage,
+    /// scratch)` calls — `dst` being the packed RGBA bytes of device
+    /// pixels `x0 .. x0 + coverage.len()` on row `y`. The analytic
+    /// kernel never materialises a mask: each row is composited while
+    /// it is still in cache.
+    ///
+    /// With a thread budget ([`Renderer::with_execution_context`]) a
+    /// large shape's window is cut into horizontal bands scanned and
+    /// painted concurrently. Every row is computed by exactly the same
+    /// code from the same edge table whichever band it falls in (the
+    /// scan carries no state between rows beyond the monotone chain
+    /// cursors, which a band re-derives), so the output is
+    /// byte-identical to the serial render.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_rows(
         &self,
+        buf: &mut [u8],
+        stride: usize,
         contours: &[FlatContour],
         fill_rule: FillRule,
         clip: Option<&AlphaMask>,
-        mut emit: impl FnMut(u32, u32, &[u8]),
+        paint_row: &RowPainter<'_>,
     ) {
-        let mut tmp: Vec<u8> = Vec::new();
-        let mut with_clip = |y: u32, x0: u32, row: &[u8]| match clip {
-            None => emit(y, x0, row),
-            Some(c) => {
-                if y >= c.height {
-                    return;
+        // Clip, then hand a row to the painter.
+        let deliver = |dst_rows: &mut [u8],
+                       row_base: u32,
+                       y: u32,
+                       x0: u32,
+                       row: &[u8],
+                       tmp: &mut Vec<u8>,
+                       scratch: &mut Vec<Rgba>| {
+            let cov: &[u8] = match clip {
+                None => row,
+                Some(c) => {
+                    if y >= c.height {
+                        return;
+                    }
+                    let off = (y * c.width + x0) as usize;
+                    let n = row.len().min(c.width.saturating_sub(x0) as usize);
+                    tmp.clear();
+                    tmp.extend(
+                        row[..n]
+                            .iter()
+                            .zip(&c.data[off..off + n])
+                            .map(|(a, b)| (*a).min(*b)),
+                    );
+                    tmp
                 }
-                let off = (y * c.width + x0) as usize;
-                let n = row.len().min(c.width.saturating_sub(x0) as usize);
-                tmp.clear();
-                tmp.extend(
-                    row[..n]
-                        .iter()
-                        .zip(&c.data[off..off + n])
-                        .map(|(a, b)| (*a).min(*b)),
-                );
-                emit(y, x0, &tmp);
-            }
+            };
+            let off = (y - row_base) as usize * stride + x0 as usize * 4;
+            paint_row(&mut dst_rows[off..off + cov.len() * 4], y, x0, cov, scratch);
         };
+        let (mut tmp, mut scratch) = (Vec::new(), Vec::new());
         match self.coverage {
             CoverageMode::Analytic => {
-                if let Some(t) = EdgeTable::build(contours, self.width, self.height, None) {
-                    t.scan(fill_rule, with_clip);
+                let Some(t) = EdgeTable::build(contours, self.width, self.height, None) else {
+                    return;
+                };
+                let win = t.window();
+                let rows = win.y1 - win.y0;
+                let area = rows as u64 * (win.x1 - win.x0) as u64;
+                let workers = if area >= PARALLEL_MIN_AREA {
+                    self.threads
+                        .min((rows / PARALLEL_MIN_ROWS).max(1) as usize)
+                        .max(1)
+                } else {
+                    1
+                };
+                if workers <= 1 {
+                    t.scan(fill_rule, |y, x0, row| {
+                        deliver(buf, 0, y, x0, row, &mut tmp, &mut scratch)
+                    });
+                    return;
                 }
+                let band = rows.div_ceil(workers as u32);
+                let region = &mut buf[win.y0 as usize * stride..win.y1 as usize * stride];
+                std::thread::scope(|sc| {
+                    for (k, chunk) in region.chunks_mut(band as usize * stride).enumerate() {
+                        let t = &t;
+                        let deliver = &deliver;
+                        let r0 = k as u32 * band;
+                        let r1 = (r0 + band).min(rows);
+                        sc.spawn(move || {
+                            let (mut tmp, mut scratch) = (Vec::new(), Vec::new());
+                            t.scan_rows(fill_rule, r0..r1, |y, x0, row| {
+                                deliver(chunk, win.y0 + r0, y, x0, row, &mut tmp, &mut scratch)
+                            });
+                        });
+                    }
+                });
             }
             _ => {
                 let (cov, bounds) = self.rasterize_with_bounds(contours, fill_rule);
@@ -733,7 +817,8 @@ impl Renderer {
                 let mw = cov.mask.width as usize;
                 for y in by0..=by1 {
                     let off = (y - cov.y0) as usize * mw + (bx0 - cov.x0) as usize;
-                    with_clip(y, bx0, &cov.mask.data[off..off + (bx1 - bx0 + 1) as usize]);
+                    let row = &cov.mask.data[off..off + (bx1 - bx0 + 1) as usize];
+                    deliver(buf, 0, y, bx0, row, &mut tmp, &mut scratch);
                 }
             }
         }
@@ -772,25 +857,30 @@ impl Renderer {
             return;
         }
         let blend = self.blend_mode;
-        let row_slice = |buf: &mut [u8], y: u32, x0: u32, n: usize| -> std::ops::Range<usize> {
-            let _ = buf;
-            let off = y as usize * stride + x0 as usize * 4;
-            off..off + n * 4
-        };
         match paint {
             Paint::Solid(c) if blend.is_normal() => {
                 let src = SolidSource::new(*c, extra_q);
-                self.coverage_rows(contours, fill_rule, clip, |y, x0, row| {
-                    let r = row_slice(buf, y, x0, row.len());
-                    src.over_row(&mut buf[r], row);
-                });
+                self.paint_rows(
+                    buf,
+                    stride,
+                    contours,
+                    fill_rule,
+                    clip,
+                    &|dst, _, _, cov, _| src.over_row(dst, cov),
+                );
             }
             Paint::Solid(c) => {
                 let c = *c;
-                self.coverage_rows(contours, fill_rule, clip, |y, x0, row| {
-                    let r = row_slice(buf, y, x0, row.len());
-                    composite_row(&mut buf[r], row, x0, y, extra_q, blend, &mut |_, _| c);
-                });
+                self.paint_rows(
+                    buf,
+                    stride,
+                    contours,
+                    fill_rule,
+                    clip,
+                    &|dst, y, x0, cov, _| {
+                        composite_row(dst, cov, x0, y, extra_q, blend, &mut |_, _| c)
+                    },
+                );
             }
             // Gradients: whole rows at a time, the stops evaluated
             // exactly (see `gradient_row`).
@@ -803,24 +893,34 @@ impl Renderer {
                 };
                 let space = self.color_interpolation;
                 if let Some(rows) = GradientRows::new(other, &inv, space, self.gradient_dither) {
-                    let mut colors: Vec<Rgba> = Vec::new();
-                    self.coverage_rows(contours, fill_rule, clip, |y, x0, row| {
-                        rows.row(y, x0, row.len(), &mut colors);
-                        let r = row_slice(buf, y, x0, row.len());
-                        composite_row(&mut buf[r], row, x0, y, extra_q, blend, &mut |x, _| {
-                            colors[(x - x0) as usize]
-                        });
-                    });
+                    self.paint_rows(
+                        buf,
+                        stride,
+                        contours,
+                        fill_rule,
+                        clip,
+                        &|dst, y, x0, cov, colors| {
+                            rows.row(y, x0, cov.len(), colors);
+                            composite_row(dst, cov, x0, y, extra_q, blend, &mut |x, _| {
+                                colors[(x - x0) as usize]
+                            });
+                        },
+                    );
                     return;
                 }
-                let mut paint_at = |x: u32, y: u32| {
-                    let p = inv.apply(Point::new(x as f32 + 0.5, y as f32 + 0.5));
-                    sample_paint_in(other, p.x, p.y, space)
-                };
-                self.coverage_rows(contours, fill_rule, clip, |y, x0, row| {
-                    let r = row_slice(buf, y, x0, row.len());
-                    composite_row(&mut buf[r], row, x0, y, extra_q, blend, &mut paint_at);
-                });
+                self.paint_rows(
+                    buf,
+                    stride,
+                    contours,
+                    fill_rule,
+                    clip,
+                    &|dst, y, x0, cov, _| {
+                        composite_row(dst, cov, x0, y, extra_q, blend, &mut |x, y| {
+                            let p = inv.apply(Point::new(x as f32 + 0.5, y as f32 + 0.5));
+                            sample_paint_in(other, p.x, p.y, space)
+                        })
+                    },
+                );
             }
         }
     }

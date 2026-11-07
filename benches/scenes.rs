@@ -16,6 +16,7 @@
 //!     (24 px) on a 3840×2160 canvas — curve flattening + long edges.
 //!   - **text_page_1080p**: 6 000 tiny glyph-like outlines laid out in
 //!     lines like a page of body text.
+//!   - **…_mt4**: the same scenes under a 4-worker `ExecutionContext`.
 //!
 //! Run with: `cargo bench -p oxideav-raster --bench scenes`
 
@@ -324,6 +325,33 @@ fn bench_scenes(c: &mut Criterion) {
 
     let s = big_circle(3840.0, 2160.0);
     g.bench_function("big_circle_4k", |b| b.iter(|| r4.render(black_box(&s))));
+
+    // Same workloads with a 4-worker execution context (row bands of
+    // large shapes; byte-identical output).
+    let ctx = oxideav_core::ExecutionContext::with_threads(4);
+    let r = Renderer::new(1920, 1080).with_execution_context(&ctx);
+    let s = paths_scene(1920.0, 1080.0);
+    g.bench_function("paths_1080p_mt4", |b| b.iter(|| r.render(black_box(&s))));
+    let r4 = Renderer::new(3840, 2160).with_execution_context(&ctx);
+    let s = gradient_scene(
+        3840.0,
+        2160.0,
+        Paint::LinearGradient(LinearGradient {
+            start: Point::new(0.0, 0.0),
+            end: Point::new(3840.0, 2160.0),
+            stops: vec![
+                GradientStop::new(0.0, Rgba::opaque(255, 0, 0)),
+                GradientStop::new(0.5, Rgba::opaque(0, 255, 0)),
+                GradientStop::new(1.0, Rgba::opaque(0, 0, 255)),
+            ],
+            spread: SpreadMethod::Pad,
+        }),
+    );
+    g.bench_function("gradient_linear_4k_mt4", |b| {
+        b.iter(|| r4.render(black_box(&s)))
+    });
+    let s = big_circle(3840.0, 2160.0);
+    g.bench_function("big_circle_4k_mt4", |b| b.iter(|| r4.render(black_box(&s))));
 
     g.finish();
 }
