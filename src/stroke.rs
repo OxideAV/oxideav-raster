@@ -217,6 +217,15 @@ fn build_segments(
     let mut out: Vec<FlatContour> = Vec::with_capacity(segments.len());
     for mut seg in segments {
         dedup_points(&mut seg.points, seg.closed);
+        if seg.points.len() == 1 {
+            // SVG 2 §13.5.4: a zero-length subpath (open or closed, a
+            // zero-length dash included) paints only its cap shape — a
+            // full circle for `round`, a stroke-width square for
+            // `square` (oriented along +x: a zero-length path has that
+            // direction, §9.4), nothing for `butt`.
+            push_dot(&mut out, seg.points[0], half, stroke.cap);
+            continue;
+        }
         if seg.points.len() < 2 {
             continue;
         }
@@ -436,6 +445,34 @@ fn push_join_trim(
         }
     }
     push_join_kind(out, prev, cur, nxt, half, join, miter_limit, outer_side);
+}
+
+/// The cap shape of a zero-length subpath at `p` (see
+/// [`build_segments`]).
+fn push_dot(out: &mut Vec<FlatContour>, p: (f32, f32), half: f32, cap: LineCap) {
+    match cap {
+        LineCap::Round => {
+            let n = arc_chord_count(half, std::f32::consts::TAU).max(8);
+            let rv = straddle_radius(half, std::f32::consts::TAU / n as f32);
+            let poly = (0..n)
+                .map(|i| {
+                    let a = std::f32::consts::TAU * i as f32 / n as f32;
+                    (p.0 + rv * a.cos(), p.1 + rv * a.sin())
+                })
+                .collect();
+            push_positive(out, poly);
+        }
+        LineCap::Square => push_positive(
+            out,
+            vec![
+                (p.0 - half, p.1 - half),
+                (p.0 + half, p.1 - half),
+                (p.0 + half, p.1 + half),
+                (p.0 - half, p.1 + half),
+            ],
+        ),
+        _ => {}
+    }
 }
 
 /// Push `poly` wound positively (non-negative signed area in the
@@ -1109,6 +1146,16 @@ fn arc_chord_count(r: f32, delta: f32) -> usize {
     ((sweep / delta_max).ceil() as usize).max(1)
 }
 
+/// Radius for the interior vertices of a polygonised arc of radius `r`
+/// with per-chord angle `step`: `2r / (1 + cos(step / 2))` puts the
+/// vertices as far outside the circle as the chord midpoints fall
+/// inside it, so the polygon straddles the arc (half the deviation of
+/// an inscribed polygon, and almost no net area bias).
+#[inline]
+fn straddle_radius(r: f32, step: f32) -> f32 {
+    2.0 * r / (1.0 + (step * 0.5).cos())
+}
+
 /// Append a polyline approximating the short arc from `from` to `to`
 /// on the circle of radius `r` centred at `c`. Excludes the endpoints.
 /// The chord count is chosen by [`arc_chord_count`] so the flattening
@@ -1131,9 +1178,10 @@ fn arc_polyline(
         delta += std::f32::consts::TAU;
     }
     let steps = arc_chord_count(r, delta);
+    let rv = straddle_radius(r, delta.abs() / steps as f32);
     for i in 1..steps {
         let t = a0 + delta * (i as f32) / (steps as f32);
-        out.push((c.0 + r * t.cos(), c.1 + r * t.sin()));
+        out.push((c.0 + rv * t.cos(), c.1 + rv * t.sin()));
     }
 }
 
@@ -1200,9 +1248,10 @@ fn arc_polyline_long(
     // the silhouette sub-pixel-smooth (matches the round-join flattening
     // criterion in [`arc_chord_count`]).
     let steps = arc_chord_count(r, delta);
+    let rv = straddle_radius(r, delta.abs() / steps as f32);
     for i in 1..steps {
         let t = a0 + delta * (i as f32) / (steps as f32);
-        out.push((c.0 + r * t.cos(), c.1 + r * t.sin()));
+        out.push((c.0 + rv * t.cos(), c.1 + rv * t.sin()));
     }
 }
 

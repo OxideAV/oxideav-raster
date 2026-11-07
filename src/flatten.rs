@@ -232,6 +232,14 @@ pub(crate) fn flatten_path_with(
             PathCommand::Close if have_subpath => {
                 cur.closed = true;
                 pen = subpath_start;
+                if cur.points.len() == 1 {
+                    // `M x y Z` is a zero-length *closed* subpath: it
+                    // has no area, but SVG 2 §13.5.4 paints its round /
+                    // square line cap, so keep it as a degenerate
+                    // two-point contour.
+                    let p = cur.points[0];
+                    cur.points.push(p);
+                }
                 if cur.points.len() >= 2 {
                     out.push(std::mem::take(&mut cur));
                 } else {

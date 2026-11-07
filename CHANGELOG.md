@@ -27,6 +27,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - hard gradient stops (two stops at one offset) stay a one-pixel edge at any gradient length; the 256-entry stop table interpolated across them, smearing a red|blue stop on a 2 560 px gradient over ~10 px of purple.
 - thick strokes on tight geometry: the offset outline (right side forward, left side back) cancels part of the stroke wherever the pen sweeps backwards over area nothing else covers — a stroke wider than a small closed loop rendered with a hole in its middle (a 233-level error), short segments between sharp turns lost coverage. Each segment is now checked against a sufficient condition for the outline to be exact; failing segments are emitted as positively wound pieces (segment rectangle, outer join wedge, cap) unioned by the non-zero fill. Round-joined strokes match the brute-force distance field within the reference's sampling error.
 - round joins and caps are tessellated to the curve flattener's 1/32 px instead of 0.2 px, which under-covered the chord midpoints of thick caps by up to 51 levels.
+- zero-length subpaths (`M x y L x y`, `M x y Z`, zero-length dashes such as `stroke-dasharray: 0 10`) paint their cap shape per SVG 2 §13.5.4 — a full circle for `round`, a stroke-width square for `square` — instead of nothing, so dotted lines work. Round joins, caps and dots place their polygon vertices so the polygon straddles the circle (half the deviation of an inscribed polygon, no systematic area loss).
+- a thick miter-joined zig-zag with segments shorter than the half-width lost up to 178 levels of coverage at its inner corners (now pinned against a brute-force union-of-pieces reference for bevel / miter joins at turns from 10° to 179°).
 
 ### Added
 
