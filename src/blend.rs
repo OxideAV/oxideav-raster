@@ -46,6 +46,7 @@ use oxideav_core::Rgba;
 /// (i.e. plain source-over). The renderer's composite path special-cases
 /// it for speed so callers paying for the blend dispatch is opt-in.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum BlendMode {
     /// `B(Cb, Cs) = Cs`. Standard Porter–Duff source-over. Default.
     #[default]

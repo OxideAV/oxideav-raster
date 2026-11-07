@@ -50,6 +50,7 @@ use crate::filter_function::FilterFunction;
 /// carries the byte offset (into the original input) where the
 /// offending token starts.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum FilterParseError {
     /// The input was empty (or all whitespace). The `filter` property
     /// grammar requires `none` or at least one item.

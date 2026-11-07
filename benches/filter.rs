@@ -209,31 +209,29 @@ fn bench_filters(c: &mut Criterion) {
             )
         })
     });
-    let diffuse = DiffuseLighting {
-        surface_scale: 3.0,
-        diffuse_constant: 1.0,
-        kernel_unit_length: (1.0, 1.0),
-        light_color: [255, 200, 150],
-        light_source: LightSource::Distant {
+    let diffuse = DiffuseLighting::default()
+        .with_surface_scale(3.0)
+        .with_diffuse_constant(1.0)
+        .with_kernel_unit_length((1.0, 1.0))
+        .with_light_color([255, 200, 150])
+        .with_light_source(LightSource::Distant {
             azimuth_deg: 45.0,
             elevation_deg: 30.0,
-        },
-    };
+        });
     c.bench_function("diffuse_lighting_distant_256", |b| {
         b.iter(|| diffuse_lighting(black_box(&img), 256, 256, &diffuse))
     });
-    let specular = SpecularLighting {
-        surface_scale: 3.0,
-        specular_constant: 1.0,
-        specular_exponent: 20.0,
-        kernel_unit_length: (1.0, 1.0),
-        light_color: [255, 255, 255],
-        light_source: LightSource::Point {
+    let specular = SpecularLighting::default()
+        .with_surface_scale(3.0)
+        .with_specular_constant(1.0)
+        .with_specular_exponent(20.0)
+        .with_kernel_unit_length((1.0, 1.0))
+        .with_light_color([255, 255, 255])
+        .with_light_source(LightSource::Point {
             x: 64.0,
             y: 64.0,
             z: 40.0,
-        },
-    };
+        });
     c.bench_function("specular_lighting_point_256", |b| {
         b.iter(|| specular_lighting(black_box(&img), 256, 256, &specular))
     });

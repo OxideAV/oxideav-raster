@@ -90,6 +90,7 @@ impl ExtendedLineJoin {
 /// Build one with [`ExtendedStroke::new`] or
 /// [`ExtendedStroke::with_join`].
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ExtendedStroke {
     /// The base stroke. Its `join` field is ignored in favour of
     /// [`ExtendedStroke::join`].

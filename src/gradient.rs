@@ -37,6 +37,7 @@ use oxideav_core::{LinearGradient, Point, RadialGradient, Rgba, SpreadMethod};
 /// physically-correct light blending that avoids the dark-band artefact
 /// where complementary primaries cross.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum InterpolationSpace {
     /// Interpolate in non-linear sRGB. The historical SVG 1.1 default
     /// (`color-interpolation: sRGB`); matches almost every SVG renderer

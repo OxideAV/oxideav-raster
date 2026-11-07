@@ -37,6 +37,7 @@ use crate::stroke::stroke_to_fill_path;
 /// scene renderer) avoids re-rasterising the same glyph / decorative
 /// subtree on every frame. See [`Renderer::with_cache_capacity`].
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Renderer {
     /// Output canvas width in pixels.
     pub width: u32,
@@ -102,6 +103,7 @@ pub struct Renderer {
 
 /// Texture sampling filter for `Node::Image` paints.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ImageFilter {
     /// Nearest-neighbour. Pixel-perfect block-replication; aliasing
     /// for non-integer scales but useful for low-resolution sprite

@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `#[non_exhaustive]`: the enums `BlendMode`, `BlendFilterMode`, `CompositeOp`, `FilterColorSpace`, `InterpolationSpace`, `OffsetSampling`, `DisplacementSampling`, `ImageSourceSampling`, `ImageFilter`, `FilterFunction`, `FilterInput`, `FilterPrimitive` and `FilterParseError`; the records `Renderer`, `Pattern`, `ExtendedStroke`, `FilterStep`, `ComponentTransfer`, `ConvolveMatrix`, `Turbulence`, `DiffuseLighting`, `SpecularLighting`, `RasterizedSubtree` and `CacheStats`. Code outside the crate builds the records through their existing constructors / `Default` and `with_*` setters (fields stay public and assignable) and needs a `_ =>` arm when matching the enums. Enums whose value set the SVG filter / painting model fixes (`MorphologyOp`, `ColorMatrixOp`, `TransferFunc`, `ConvolveEdgeMode`, `TurbulenceType`, `StitchTiles`, `DisplacementChannel`, `LightSource`, `AspectRatioAlign`, `MeetOrSlice`, `ExtendedLineJoin`) and the value types (`AlphaMask`, `Subregion`, `PreserveAspectRatio`, `FlatContour`, `FocalRadialGradient`) are unchanged.
+
+### Added
+
+- `DiffuseLighting::with_*` and `SpecularLighting::with_*` setters for every field (start from `Default`).
+
 ## [0.1.4](https://github.com/OxideAV/oxideav-raster/compare/v0.1.3...v0.1.4) - 2026-10-24
 
 ### Added

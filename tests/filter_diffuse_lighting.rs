@@ -54,16 +54,15 @@ fn flat_alpha_gives_constant_output_for_distant_light() {
     // identical at every pixel. Pick `elevation = 90°` so `L·N = 1`
     // → emit the full light colour.
     let src = build(10, 7, |_, _| Rgba::new(0, 0, 0, 180));
-    let params = DiffuseLighting {
-        surface_scale: 3.0,
-        diffuse_constant: 1.0,
-        kernel_unit_length: (1.0, 1.0),
-        light_color: [128, 64, 32],
-        light_source: LightSource::Distant {
+    let params = DiffuseLighting::default()
+        .with_surface_scale(3.0)
+        .with_diffuse_constant(1.0)
+        .with_kernel_unit_length((1.0, 1.0))
+        .with_light_color([128, 64, 32])
+        .with_light_source(LightSource::Distant {
             azimuth_deg: 17.0, // any azimuth works at 90° elevation.
             elevation_deg: 90.0,
-        },
-    };
+        });
     let out = diffuse_lighting(&src, 10, 7, &params);
     let first = &out[..4];
     for chunk in out.as_chunks::<4>().0 {
@@ -86,15 +85,16 @@ fn light_color_scales_output_linearly() {
     // possible without saturation) should double the lit output, up
     // to `u8` quantisation.
     let src = build(4, 4, |_, _| Rgba::new(0, 0, 0, 100));
-    let make = |color: [u8; 3]| DiffuseLighting {
-        surface_scale: 1.0,
-        diffuse_constant: 1.0,
-        kernel_unit_length: (1.0, 1.0),
-        light_color: color,
-        light_source: LightSource::Distant {
-            azimuth_deg: 0.0,
-            elevation_deg: 90.0, // L = (0, 0, 1) → N·L = 1.
-        },
+    let make = |color: [u8; 3]| {
+        DiffuseLighting::default()
+            .with_surface_scale(1.0)
+            .with_diffuse_constant(1.0)
+            .with_kernel_unit_length((1.0, 1.0))
+            .with_light_color(color)
+            .with_light_source(LightSource::Distant {
+                azimuth_deg: 0.0,
+                elevation_deg: 90.0, // L = (0, 0, 1) → N·L = 1.
+            })
     };
     let dim = diffuse_lighting(&src, 4, 4, &make([40, 60, 80]));
     let bright = diffuse_lighting(&src, 4, 4, &make([80, 120, 160]));
@@ -113,15 +113,16 @@ fn diffuse_constant_scales_output_linearly() {
     // §15.14 `D = kd · (N·L) · Light`: `kd = 0.5` halves the lit
     // output; `kd = 1.0` is the reference.
     let src = build(4, 4, |_, _| Rgba::new(0, 0, 0, 100));
-    let make = |kd: f32| DiffuseLighting {
-        surface_scale: 1.0,
-        diffuse_constant: kd,
-        kernel_unit_length: (1.0, 1.0),
-        light_color: [200, 200, 200],
-        light_source: LightSource::Distant {
-            azimuth_deg: 0.0,
-            elevation_deg: 90.0,
-        },
+    let make = |kd: f32| {
+        DiffuseLighting::default()
+            .with_surface_scale(1.0)
+            .with_diffuse_constant(kd)
+            .with_kernel_unit_length((1.0, 1.0))
+            .with_light_color([200, 200, 200])
+            .with_light_source(LightSource::Distant {
+                azimuth_deg: 0.0,
+                elevation_deg: 90.0,
+            })
     };
     let half = diffuse_lighting(&src, 4, 4, &make(0.5));
     let full = diffuse_lighting(&src, 4, 4, &make(1.0));
@@ -138,16 +139,15 @@ fn distant_light_results_independent_of_pixel_position() {
     // — every pixel's `L` is the same. On a flat input, then, the
     // output at `(0, 0)` matches the output at `(w-1, h-1)`.
     let src = build(6, 6, |_, _| Rgba::new(0, 0, 0, 200));
-    let params = DiffuseLighting {
-        surface_scale: 2.0,
-        diffuse_constant: 1.0,
-        kernel_unit_length: (1.0, 1.0),
-        light_color: [255, 255, 255],
-        light_source: LightSource::Distant {
+    let params = DiffuseLighting::default()
+        .with_surface_scale(2.0)
+        .with_diffuse_constant(1.0)
+        .with_kernel_unit_length((1.0, 1.0))
+        .with_light_color([255, 255, 255])
+        .with_light_source(LightSource::Distant {
             azimuth_deg: 30.0,
             elevation_deg: 60.0,
-        },
-    };
+        });
     let out = diffuse_lighting(&src, 6, 6, &params);
     let first = &out[0..4];
     let last_idx = (5 * 6 + 5) * 4;
@@ -177,12 +177,12 @@ fn typed_pixel_wrapper_round_trips_against_byte_path() {
         .iter()
         .map(|c| Rgba::new(c[0], c[1], c[2], c[3]))
         .collect();
-    let params = DiffuseLighting {
-        surface_scale: 4.0,
-        diffuse_constant: 0.75,
-        kernel_unit_length: (1.0, 1.0),
-        light_color: [200, 100, 50],
-        light_source: LightSource::Spot {
+    let params = DiffuseLighting::default()
+        .with_surface_scale(4.0)
+        .with_diffuse_constant(0.75)
+        .with_kernel_unit_length((1.0, 1.0))
+        .with_light_color([200, 100, 50])
+        .with_light_source(LightSource::Spot {
             x: 3.0,
             y: 2.0,
             z: 6.0,
@@ -191,8 +191,7 @@ fn typed_pixel_wrapper_round_trips_against_byte_path() {
             points_at_z: 0.0,
             specular_exponent: 2.5,
             limiting_cone_angle_deg: Some(70.0),
-        },
-    };
+        });
     let bytes_out = diffuse_lighting(&bytes, w, h, &params);
     let pixels_out = diffuse_lighting_pixels(&pixels, w, h, &params);
     let bytes_from_typed: Vec<u8> = pixels_out
@@ -232,13 +231,12 @@ fn output_alpha_is_one_everywhere() {
             limiting_cone_angle_deg: None,
         },
     ] {
-        let params = DiffuseLighting {
-            surface_scale: 1.0,
-            diffuse_constant: 1.0,
-            kernel_unit_length: (1.0, 1.0),
-            light_color: [255, 200, 100],
-            light_source: src_kind,
-        };
+        let params = DiffuseLighting::default()
+            .with_surface_scale(1.0)
+            .with_diffuse_constant(1.0)
+            .with_kernel_unit_length((1.0, 1.0))
+            .with_light_color([255, 200, 100])
+            .with_light_source(src_kind);
         let out = diffuse_lighting(&src, 5, 5, &params);
         for px in out.as_chunks::<4>().0 {
             assert_eq!(
@@ -259,12 +257,12 @@ fn spot_light_with_no_cone_lights_full_hemisphere() {
     let w = 7u32;
     let h = 7u32;
     let src = build(w, h, |_, _| Rgba::new(0, 0, 0, 100));
-    let params = DiffuseLighting {
-        surface_scale: 1.0,
-        diffuse_constant: 1.0,
-        kernel_unit_length: (1.0, 1.0),
-        light_color: [255, 255, 255],
-        light_source: LightSource::Spot {
+    let params = DiffuseLighting::default()
+        .with_surface_scale(1.0)
+        .with_diffuse_constant(1.0)
+        .with_kernel_unit_length((1.0, 1.0))
+        .with_light_color([255, 255, 255])
+        .with_light_source(LightSource::Spot {
             x: 3.0,
             y: 3.0,
             z: 5.0,
@@ -273,8 +271,7 @@ fn spot_light_with_no_cone_lights_full_hemisphere() {
             points_at_z: 0.0,
             specular_exponent: 1.0,
             limiting_cone_angle_deg: None,
-        },
-    };
+        });
     let out = diffuse_lighting(&src, w, h, &params);
     // All in-hemisphere pixels (which is all of them on a flat
     // surface with z = 5) should be lit. With `z = 5` and the surface
@@ -301,17 +298,17 @@ fn point_light_intensity_falls_off_with_distance_via_angle() {
     let w = 9u32;
     let h = 9u32;
     let src = build(w, h, |_, _| Rgba::new(0, 0, 0, 100));
-    let params = DiffuseLighting {
-        surface_scale: 0.01, // ≈ flat normal regardless of alpha.
-        diffuse_constant: 1.0,
-        kernel_unit_length: (1.0, 1.0),
-        light_color: [255, 255, 255],
-        light_source: LightSource::Point {
+    let params = DiffuseLighting::default()
+        .with_surface_scale(0.01)
+        // ≈ flat normal regardless of alpha.
+        .with_diffuse_constant(1.0)
+        .with_kernel_unit_length((1.0, 1.0))
+        .with_light_color([255, 255, 255])
+        .with_light_source(LightSource::Point {
             x: 4.0,
             y: 4.0,
             z: 5.0,
-        },
-    };
+        });
     let out = diffuse_lighting(&src, w, h, &params);
     let centre = (4 * w as usize + 4) * 4;
     let corner = 0usize;

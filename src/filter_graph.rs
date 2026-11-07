@@ -72,6 +72,7 @@ use crate::filter::{
 /// Input selector for a filter primitive — the §9.2 `in` / `in2`
 /// attribute value.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum FilterInput {
     /// No `in` value provided. §9.2: the first filter primitive reads
     /// `SourceGraphic`; a subsequent one reads the previous
@@ -98,6 +99,7 @@ pub enum FilterInput {
 /// for `in2`), except [`Merge`](Self::Merge), whose per-`feMergeNode`
 /// input list is part of the primitive itself.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum FilterPrimitive {
     /// `feBlend` (§9.5) — blends `in` over `in2` under a
     /// Compositing-1 blend mode.
@@ -231,6 +233,7 @@ pub enum FilterPrimitive {
 /// One filter primitive child of a `filter` element: the primitive
 /// itself plus its §9.2 common attributes.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct FilterStep {
     /// The primitive and its parameters.
     pub primitive: FilterPrimitive,

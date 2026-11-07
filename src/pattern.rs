@@ -76,6 +76,7 @@ use oxideav_core::{Node, Rgba, Transform2D, VideoFrame, ViewBox};
 /// [`Renderer::fill_path_with_pattern`]: crate::Renderer::fill_path_with_pattern
 /// [`Renderer::stroke_path_with_pattern`]: crate::Renderer::stroke_path_with_pattern
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct Pattern {
     /// Tile-rectangle left edge in user space.
     pub x: f32,

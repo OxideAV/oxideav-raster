@@ -287,6 +287,7 @@ use oxideav_core::Rgba;
 /// for the `color-interpolation` `linearRGB` conversion); see
 /// [`srgb_to_linear_f32`] / [`linear_to_srgb_f32`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum FilterColorSpace {
     /// `color-interpolation-filters: linearRGB` — the property's
     /// **initial value**. Filter colour operations occur in the
@@ -3046,6 +3047,7 @@ fn discrete_step(v: &[f32], c: f32) -> f32 {
 /// SVG 1.1 §15.11 `<feComponentTransfer>` configuration — one
 /// [`TransferFunc`] per RGBA channel, applied independently per pixel.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct ComponentTransfer {
     /// Red-channel function (`<feFuncR>`).
     pub r: TransferFunc,
@@ -3615,6 +3617,7 @@ mod component_transfer_tests {
 /// path (`Cr' = (1 − Ea)·Cr + Er`, i.e. `over` with `Fa = 1`,
 /// `Fb = 1 − αa`).
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
 pub enum CompositeOp {
     /// `in` source-over `in2`. `Fa = 1`, `Fb = 1 − αa`.
     Over,
@@ -3873,6 +3876,7 @@ pub enum ConvolveEdgeMode {
 ///   `SOURCE_{X,Y}`, then re-premultiplies the result before
 ///   re-quantising to `u8`.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct ConvolveMatrix {
     /// Number of columns in `kernel`. Must be `≥ 1`.
     pub order_x: u32,
@@ -5066,6 +5070,7 @@ pub enum StitchTiles {
 ///   (set per-render by [`turbulence_filter`] from its `width`/`height`
 ///   arguments when the explicit pair are zero)
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct Turbulence {
     /// X-axis base frequency. Must be `>= 0` (§15.24 "A negative value
     /// for base frequency is an error"). A value of `0` collapses the
@@ -5994,6 +5999,7 @@ pub fn flood_pixels(width: u32, height: u32, r: u8, g: u8, b: u8, flood_opacity:
 /// make use of appropriate interpolation techniques, for example
 /// bilinear or bicubic."
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum OffsetSampling {
     /// Round `(dx, dy)` to the nearest integer pixel shift and copy
     /// source pixels into the output verbatim. The default — matches
@@ -7524,6 +7530,7 @@ impl DisplacementChannel {
 /// bit-exact nearest-pixel default and a bilinear-resampling
 /// alternative for the fractional-displacement case.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum DisplacementSampling {
     /// Round the warped source coordinate to the nearest integer pixel
     /// and copy the source byte triple verbatim. Out-of-bounds source
@@ -8279,6 +8286,7 @@ mod displacement_map_tests {
 ///
 /// The §15.9 / §9.13 attribute tables give `Normal` as the default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum BlendFilterMode {
     /// `cr = (1 − qa) · cb + ca`. §15.9 notes that this is the
     /// pixel-wise equivalent of `feComposite` operator `"over"` and
@@ -9011,6 +9019,7 @@ pub enum LightSource {
 /// a given (x, y) position, which might be implemented in some cases as
 /// one pixel"; this implementation therefore defaults to `(1.0, 1.0)`.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
 pub struct DiffuseLighting {
     /// `surfaceScale` — vertical scale of the height field
     /// `Z(x, y) = surfaceScale · I(x, y)`. §15.14 default: 1.
@@ -9029,6 +9038,38 @@ pub struct DiffuseLighting {
     /// Light-source descriptor selected by the §15.14 content model
     /// "exactly one light source element".
     pub light_source: LightSource,
+}
+
+impl DiffuseLighting {
+    /// Set `surface_scale`.
+    pub fn with_surface_scale(mut self, surface_scale: f32) -> Self {
+        self.surface_scale = surface_scale;
+        self
+    }
+
+    /// Set `diffuse_constant`.
+    pub fn with_diffuse_constant(mut self, diffuse_constant: f32) -> Self {
+        self.diffuse_constant = diffuse_constant;
+        self
+    }
+
+    /// Set `kernel_unit_length`.
+    pub fn with_kernel_unit_length(mut self, kernel_unit_length: (f32, f32)) -> Self {
+        self.kernel_unit_length = kernel_unit_length;
+        self
+    }
+
+    /// Set `light_color`.
+    pub fn with_light_color(mut self, light_color: [u8; 3]) -> Self {
+        self.light_color = light_color;
+        self
+    }
+
+    /// Set `light_source`.
+    pub fn with_light_source(mut self, light_source: LightSource) -> Self {
+        self.light_source = light_source;
+        self
+    }
 }
 
 impl Default for DiffuseLighting {
@@ -9908,6 +9949,7 @@ mod diffuse_lighting_tests {
 ///   value is an error.
 /// * `lighting-color` default white `(255, 255, 255)`.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
 pub struct SpecularLighting {
     /// `surfaceScale` — vertical scale of the height field
     /// `Z(x, y) = surfaceScale · I(x, y)`. §15.22 default: 1.
@@ -9932,6 +9974,44 @@ pub struct SpecularLighting {
     /// Light-source descriptor selected by the §15.22 content model
     /// ("exactly one light source element").
     pub light_source: LightSource,
+}
+
+impl SpecularLighting {
+    /// Set `surface_scale`.
+    pub fn with_surface_scale(mut self, surface_scale: f32) -> Self {
+        self.surface_scale = surface_scale;
+        self
+    }
+
+    /// Set `specular_constant`.
+    pub fn with_specular_constant(mut self, specular_constant: f32) -> Self {
+        self.specular_constant = specular_constant;
+        self
+    }
+
+    /// Set `specular_exponent`.
+    pub fn with_specular_exponent(mut self, specular_exponent: f32) -> Self {
+        self.specular_exponent = specular_exponent;
+        self
+    }
+
+    /// Set `kernel_unit_length`.
+    pub fn with_kernel_unit_length(mut self, kernel_unit_length: (f32, f32)) -> Self {
+        self.kernel_unit_length = kernel_unit_length;
+        self
+    }
+
+    /// Set `light_color`.
+    pub fn with_light_color(mut self, light_color: [u8; 3]) -> Self {
+        self.light_color = light_color;
+        self
+    }
+
+    /// Set `light_source`.
+    pub fn with_light_source(mut self, light_source: LightSource) -> Self {
+        self.light_source = light_source;
+        self
+    }
 }
 
 impl Default for SpecularLighting {
@@ -10646,6 +10726,7 @@ pub struct PreserveAspectRatio {
 /// viewers make use of appropriate interpolation techniques, for
 /// example bilinear or bicubic."
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum ImageSourceSampling {
     /// Round the mapped source coordinate to the nearest integer
     /// pixel and copy it verbatim. Out-of-bounds coordinates emit

@@ -96,42 +96,40 @@ fn public_api_gamma_two_two_round_trips_with_inverse() {
     // Forward gamma 2.2 then inverse gamma 1/2.2 must reproduce every
     // pixel within ±1 LSB (two u8→f32→u8 round-trips, ≤½ LSB each).
     let img = checker_rgba(5, 5);
-    let fwd = ComponentTransfer {
-        r: TransferFunc::Gamma {
+    let fwd = ComponentTransfer::default()
+        .with_r(TransferFunc::Gamma {
             amplitude: 1.0,
             exponent: 2.2,
             offset: 0.0,
-        },
-        g: TransferFunc::Gamma {
+        })
+        .with_g(TransferFunc::Gamma {
             amplitude: 1.0,
             exponent: 2.2,
             offset: 0.0,
-        },
-        b: TransferFunc::Gamma {
+        })
+        .with_b(TransferFunc::Gamma {
             amplitude: 1.0,
             exponent: 2.2,
             offset: 0.0,
-        },
-        a: TransferFunc::Identity,
-    };
-    let inv = ComponentTransfer {
-        r: TransferFunc::Gamma {
+        })
+        .with_a(TransferFunc::Identity);
+    let inv = ComponentTransfer::default()
+        .with_r(TransferFunc::Gamma {
             amplitude: 1.0,
             exponent: 1.0 / 2.2,
             offset: 0.0,
-        },
-        g: TransferFunc::Gamma {
+        })
+        .with_g(TransferFunc::Gamma {
             amplitude: 1.0,
             exponent: 1.0 / 2.2,
             offset: 0.0,
-        },
-        b: TransferFunc::Gamma {
+        })
+        .with_b(TransferFunc::Gamma {
             amplitude: 1.0,
             exponent: 1.0 / 2.2,
             offset: 0.0,
-        },
-        a: TransferFunc::Identity,
-    };
+        })
+        .with_a(TransferFunc::Identity);
     let bent = component_transfer(&img, 5, 5, &fwd);
     let back = component_transfer(&bent, 5, 5, &inv);
     for i in 0..img.len() {
@@ -158,19 +156,18 @@ fn public_api_pixels_wrapper_matches_byte_api() {
         .iter()
         .map(|c| Rgba::new(c[0], c[1], c[2], c[3]))
         .collect();
-    let ct = ComponentTransfer {
-        r: TransferFunc::Linear {
+    let ct = ComponentTransfer::default()
+        .with_r(TransferFunc::Linear {
             slope: 0.5,
             intercept: 0.25,
-        },
-        g: TransferFunc::Discrete(vec![0.0, 0.5, 1.0]),
-        b: TransferFunc::Gamma {
+        })
+        .with_g(TransferFunc::Discrete(vec![0.0, 0.5, 1.0]))
+        .with_b(TransferFunc::Gamma {
             amplitude: 1.0,
             exponent: 1.5,
             offset: 0.0,
-        },
-        a: TransferFunc::Identity,
-    };
+        })
+        .with_a(TransferFunc::Identity);
     let via_bytes = component_transfer(&bytes, 4, 4, &ct);
     let via_pixels = component_transfer_pixels(&pixels, 4, 4, &ct);
     let want: Vec<Rgba> = via_bytes
@@ -198,24 +195,23 @@ fn public_api_linear_intercept_one_saturates_to_full() {
     // output pixel to (255, 255, 255, 255) regardless of input —
     // tests that the output clamp is applied per-channel.
     let img = checker_rgba(2, 2);
-    let ct = ComponentTransfer {
-        r: TransferFunc::Linear {
+    let ct = ComponentTransfer::default()
+        .with_r(TransferFunc::Linear {
             slope: 0.0,
             intercept: 1.0,
-        },
-        g: TransferFunc::Linear {
+        })
+        .with_g(TransferFunc::Linear {
             slope: 0.0,
             intercept: 1.0,
-        },
-        b: TransferFunc::Linear {
+        })
+        .with_b(TransferFunc::Linear {
             slope: 0.0,
             intercept: 1.0,
-        },
-        a: TransferFunc::Linear {
+        })
+        .with_a(TransferFunc::Linear {
             slope: 0.0,
             intercept: 1.0,
-        },
-    };
+        });
     let out = component_transfer(&img, 2, 2, &ct);
     for byte in out {
         assert_eq!(byte, 255);
@@ -227,24 +223,23 @@ fn public_api_linear_intercept_minus_one_clamps_to_zero() {
     // Linear { slope: 1, intercept: -1 } sends every input C ∈ [0, 1]
     // to C - 1 ≤ 0; the output clamp drops everything to 0.
     let img = checker_rgba(2, 2);
-    let ct = ComponentTransfer {
-        r: TransferFunc::Linear {
+    let ct = ComponentTransfer::default()
+        .with_r(TransferFunc::Linear {
             slope: 1.0,
             intercept: -1.0,
-        },
-        g: TransferFunc::Linear {
+        })
+        .with_g(TransferFunc::Linear {
             slope: 1.0,
             intercept: -1.0,
-        },
-        b: TransferFunc::Linear {
+        })
+        .with_b(TransferFunc::Linear {
             slope: 1.0,
             intercept: -1.0,
-        },
-        a: TransferFunc::Linear {
+        })
+        .with_a(TransferFunc::Linear {
             slope: 1.0,
             intercept: -1.0,
-        },
-    };
+        });
     let out = component_transfer(&img, 2, 2, &ct);
     for byte in out {
         assert_eq!(byte, 0);

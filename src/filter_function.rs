@@ -38,6 +38,7 @@ use crate::filter_graph::{FilterGraph, FilterPrimitive, FilterStep};
 
 /// One CSS `<filter-function>` (Filter Effects 1 §6.1).
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum FilterFunction {
     /// `grayscale(<number-percentage>?)` — §13.1.1.
     Grayscale(f32),

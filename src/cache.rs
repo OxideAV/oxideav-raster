@@ -48,6 +48,7 @@ use oxideav_core::Transform2D;
 /// A subtree that paints nothing is stored with `width = height = 0`;
 /// blits of empty subtrees are no-ops.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct RasterizedSubtree {
     /// Bitmap width in pixels (post-crop).
     pub width: u32,
@@ -68,6 +69,7 @@ pub struct RasterizedSubtree {
 /// Hits / misses counter, observable through
 /// [`crate::Renderer::cache_stats`] for testing and tuning.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct CacheStats {
     /// Number of `get` calls that returned a cached entry.
     pub hits: u64,
