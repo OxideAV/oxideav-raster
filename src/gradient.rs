@@ -500,7 +500,7 @@ pub fn eval_focal_radial_gradient_lut(
 /// or outside the boundary. SVG normalises this so the gradient
 /// equation always has a real positive root for points inside the
 /// circle.
-fn clamp_focal_inside_circle(focal: Point, center: Point, r: f32) -> (f32, f32) {
+pub(crate) fn clamp_focal_inside_circle(focal: Point, center: Point, r: f32) -> (f32, f32) {
     let dx = focal.x - center.x;
     let dy = focal.y - center.y;
     let dist_sq = dx * dx + dy * dy;
@@ -516,7 +516,7 @@ fn clamp_focal_inside_circle(focal: Point, center: Point, r: f32) -> (f32, f32) 
 
 /// Map a parametric coordinate `t` through the spread method, producing
 /// a value in `[0.0, 1.0]` ready for stop interpolation.
-fn apply_spread(t: f32, spread: SpreadMethod) -> f32 {
+pub(crate) fn apply_spread(t: f32, spread: SpreadMethod) -> f32 {
     if t.is_nan() {
         return 0.0;
     }
@@ -612,7 +612,7 @@ fn lerp_rgba(a: Rgba, b: Rgba, t: f32, space: InterpolationSpace) -> Rgba {
 /// value in `[0.0, 1.0]`. Matches the formula in SVG 2 §13.9
 /// (`color-interpolation` linearRGB conversion).
 #[inline]
-fn srgb_to_linear(c: u8) -> f32 {
+pub(crate) fn srgb_to_linear(c: u8) -> f32 {
     let cs = c as f32 / 255.0;
     if cs <= 0.040_45 {
         cs / 12.92

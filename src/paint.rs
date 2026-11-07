@@ -15,15 +15,15 @@
 
 use oxideav_core::{Paint, Rgba};
 
-use crate::gradient::{
-    InterpolationSpace, StopsLut, eval_linear_gradient_in, eval_linear_gradient_lut,
-    eval_radial_gradient_in, eval_radial_gradient_lut,
-};
+use crate::gradient::{InterpolationSpace, eval_linear_gradient_in, eval_radial_gradient_in};
+#[cfg(test)]
+use crate::gradient::{StopsLut, eval_linear_gradient_lut, eval_radial_gradient_lut};
 
 /// Build a stops LUT for `paint` in `space` if `paint` is a gradient
 /// type that benefits from one. Returns `None` for solid paints and
 /// any non-gradient variant (which the per-pixel path will route
 /// through the slow `sample_paint_in` fallback anyway).
+#[cfg(test)]
 pub(crate) fn build_paint_lut(paint: &Paint, space: InterpolationSpace) -> Option<StopsLut> {
     match paint {
         Paint::LinearGradient(g) => Some(StopsLut::build(&g.stops, space)),
@@ -36,6 +36,7 @@ pub(crate) fn build_paint_lut(paint: &Paint, space: InterpolationSpace) -> Optio
 /// gradient paints. Solid paints return their color unchanged; non-
 /// gradient variants fall through to the transparent default
 /// (matching [`sample_paint_in`]).
+#[cfg(test)]
 #[inline]
 pub(crate) fn sample_paint_with_lut(paint: &Paint, x: f32, y: f32, lut: &StopsLut) -> Rgba {
     match paint {

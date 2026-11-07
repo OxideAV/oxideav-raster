@@ -16,7 +16,8 @@ use crate::filter::PreserveAspectRatio;
 use crate::flatten::{FLATTEN_TOLERANCE_PX, FlatContour, FlattenOptions, flatten_path_with};
 use crate::gradient::InterpolationSpace;
 use crate::gradient_paint::{GradientPaint, GradientSampler, invert_2d, path_bounding_box};
-use crate::paint::{build_paint_lut, sample_paint_in, sample_paint_with_lut};
+use crate::gradient_row::{GradientDither, GradientRows};
+use crate::paint::sample_paint_in;
 use crate::pattern::{
     Pattern, sample_tile_bilinear_wrap, sample_tile_nearest_wrap, view_box_fit_transform,
 };
@@ -92,6 +93,11 @@ pub struct Renderer {
     /// `overflow: hidden`). Has no effect when the frame carries no
     /// `viewBox` (user-space is already in pixels).
     pub preserve_aspect_ratio: PreserveAspectRatio,
+    /// Quantisation of gradient paints to 8 bits. Defaults to
+    /// [`GradientDither::None`] (round to nearest);
+    /// [`GradientDither::Ordered`] trades a fixed ±½-level texture for
+    /// banding-free wide, low-contrast ramps.
+    pub gradient_dither: GradientDither,
     /// Bitmap cache for memoised group subtrees. Shared via
     /// `Arc<Mutex<...>>` so the cache survives `Clone`, and so the
     /// cache lookup remains coherent across the scene walk's
@@ -188,6 +194,7 @@ impl Renderer {
             color_interpolation: InterpolationSpace::default(),
             blend_mode: BlendMode::default(),
             preserve_aspect_ratio: PreserveAspectRatio::default(),
+            gradient_dither: GradientDither::default(),
             cache: SharedCache::with_capacity(DEFAULT_CACHE_CAPACITY),
         }
     }
@@ -283,6 +290,13 @@ impl Renderer {
             pts: frame.pts,
             planes: vec![VideoPlane { stride, data: buf }],
         }
+    }
+
+    /// Select the gradient quantisation (builder form of the
+    /// [`Renderer::gradient_dither`] field).
+    pub fn with_gradient_dither(mut self, dither: GradientDither) -> Self {
+        self.gradient_dither = dither;
+        self
     }
 
     /// Select the anti-aliasing coverage kernel (builder form of the
@@ -778,10 +792,8 @@ impl Renderer {
                     composite_row(&mut buf[r], row, x0, y, extra_q, blend, &mut |_, _| c);
                 });
             }
-            // Gradients pre-bake a stops LUT once per fill — this
-            // collapses the per-pixel stops-window scan + (for
-            // `LinearRgb`) the transfer-curve evaluation down to a table
-            // lookup.
+            // Gradients: whole rows at a time, the stops evaluated
+            // exactly (see `gradient_row`).
             other => {
                 // Device → user space. A singular CTM collapses the
                 // geometry to zero area, so there is nothing a gradient
@@ -790,32 +802,25 @@ impl Renderer {
                     return;
                 };
                 let space = self.color_interpolation;
-                let lut = build_paint_lut(other, space);
-                let user_at = move |x: u32, y: u32| -> Point {
-                    inv.apply(Point::new(x as f32 + 0.5, y as f32 + 0.5))
-                };
-                match lut {
-                    Some(lut) => {
-                        let mut paint_at = |x: u32, y: u32| {
-                            let p = user_at(x, y);
-                            sample_paint_with_lut(other, p.x, p.y, &lut)
-                        };
-                        self.coverage_rows(contours, fill_rule, clip, |y, x0, row| {
-                            let r = row_slice(buf, y, x0, row.len());
-                            composite_row(&mut buf[r], row, x0, y, extra_q, blend, &mut paint_at);
+                if let Some(rows) = GradientRows::new(other, &inv, space, self.gradient_dither) {
+                    let mut colors: Vec<Rgba> = Vec::new();
+                    self.coverage_rows(contours, fill_rule, clip, |y, x0, row| {
+                        rows.row(y, x0, row.len(), &mut colors);
+                        let r = row_slice(buf, y, x0, row.len());
+                        composite_row(&mut buf[r], row, x0, y, extra_q, blend, &mut |x, _| {
+                            colors[(x - x0) as usize]
                         });
-                    }
-                    None => {
-                        let mut paint_at = |x: u32, y: u32| {
-                            let p = user_at(x, y);
-                            sample_paint_in(other, p.x, p.y, space)
-                        };
-                        self.coverage_rows(contours, fill_rule, clip, |y, x0, row| {
-                            let r = row_slice(buf, y, x0, row.len());
-                            composite_row(&mut buf[r], row, x0, y, extra_q, blend, &mut paint_at);
-                        });
-                    }
+                    });
+                    return;
                 }
+                let mut paint_at = |x: u32, y: u32| {
+                    let p = inv.apply(Point::new(x as f32 + 0.5, y as f32 + 0.5));
+                    sample_paint_in(other, p.x, p.y, space)
+                };
+                self.coverage_rows(contours, fill_rule, clip, |y, x0, row| {
+                    let r = row_slice(buf, y, x0, row.len());
+                    composite_row(&mut buf[r], row, x0, y, extra_q, blend, &mut paint_at);
+                });
             }
         }
     }

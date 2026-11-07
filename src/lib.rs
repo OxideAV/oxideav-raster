@@ -266,6 +266,7 @@ mod filter_graph;
 mod flatten;
 mod gradient;
 mod gradient_paint;
+mod gradient_row;
 mod paint;
 mod pattern;
 mod renderer;
@@ -306,6 +307,7 @@ pub use gradient::{
 pub use gradient_paint::{
     GradientGeometry, GradientPaint, GradientSampler, GradientUnits, path_bounding_box,
 };
+pub use gradient_row::GradientDither;
 pub use paint::{sample_paint, sample_paint_in};
 pub use pattern::{Pattern, view_box_fit_transform};
 pub use renderer::{DEFAULT_CACHE_CAPACITY, ImageFilter, Renderer, rasterize};
