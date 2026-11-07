@@ -457,3 +457,62 @@ fn supersampled_mode_is_coarser_than_analytic() {
         ss4.max_alpha
     );
 }
+
+/// Render one path with a [`GradientPaint`] through a full CTM.
+fn render_gradient_fill_ctm(path: Path, gradient: &GradientPaint, ctm: Transform2D) -> Vec<u8> {
+    let out = Renderer::new(W, H).fill_path_with_gradient(&path, FillRule::NonZero, gradient, ctm);
+    let plane = &out.planes[0];
+    let mut flat = Vec::with_capacity((W * H * 4) as usize);
+    for y in 0..H as usize {
+        flat.extend_from_slice(&plane.data[y * plane.stride..y * plane.stride + (W as usize) * 4]);
+    }
+    flat
+}
+
+/// The issue #6 case end to end: every transform the reporter listed
+/// stacked on one gradient — the `viewBox` → viewport scale (100 → 64),
+/// a group `translate(50 50) rotate(-30)`, the element's own
+/// `transform="scale(1 0.8)"` and a `gradientTransform="skewX(20)"` on a
+/// `userSpaceOnUse` reflected linear gradient (SVG 2 §14.2.2.1: the
+/// gradient lives in the referencing element's user space, i.e. after
+/// its own `transform`).
+#[test]
+fn grad_combined_ctm() {
+    let g = LinearGradient::new(Point::new(0.0, 0.0), Point::new(50.0, 0.0))
+        .with_stop(GradientStop::new(0.0, RED))
+        .with_stop(GradientStop::new(1.0, BLUE))
+        .with_spread(SpreadMethod::Reflect);
+    let gp = GradientPaint::linear(g)
+        .with_units(GradientUnits::UserSpaceOnUse)
+        .with_transform(Transform2D::skew_x(20f32.to_radians()));
+    let ctm = Transform2D::scale(0.64, 0.64)
+        .compose(&Transform2D::translate(50.0, 50.0))
+        .compose(&Transform2D::rotate((-30f32).to_radians()))
+        .compose(&Transform2D::scale(1.0, 0.8));
+    check_bytes(
+        "grad_combined_ctm",
+        &render_gradient_fill_ctm(rect(-40.0, -25.0, 80.0, 50.0), &gp, ctm),
+    );
+}
+
+/// `objectBoundingBox` focal radial gradient with a rotated
+/// `gradientTransform`, on a rect under a `viewBox` scale (200 → 64) and
+/// a non-uniform group `translate(20 30) scale(1.5 1)`: the bounding box
+/// is taken in the element's user space (§8.11), before the CTM.
+#[test]
+fn grad_radial_bbox_ctm() {
+    let g = RadialGradient::new(Point::new(0.5, 0.5), 0.5)
+        .with_focal(Point::new(0.35, 0.4))
+        .with_stop(GradientStop::new(0.0, WHITE))
+        .with_stop(GradientStop::new(1.0, Rgba::opaque(0, 128, 0)));
+    let gp = GradientPaint::radial(g)
+        .with_units(GradientUnits::ObjectBoundingBox)
+        .with_transform(rotate_about(15.0, 0.5, 0.5));
+    let ctm = Transform2D::scale(0.32, 0.32)
+        .compose(&Transform2D::translate(20.0, 30.0))
+        .compose(&Transform2D::scale(1.5, 1.0));
+    check_bytes(
+        "grad_radial_bbox_ctm",
+        &render_gradient_fill_ctm(rect(0.0, 0.0, 100.0, 120.0), &gp, ctm),
+    );
+}

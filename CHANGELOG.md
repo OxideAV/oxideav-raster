@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - `DiffuseLighting::with_*` and `SpecularLighting::with_*` setters for every field (start from `Default`).
+- two more `rsvg-convert` reference fixtures pinning the #6 gradient case end to end (#6): a `userSpaceOnUse` reflected linear gradient with `gradientTransform="skewX(20)"` under a `viewBox` scale, a rotated group and the element's own `transform`, and an `objectBoundingBox` focal radial gradient with a rotated `gradientTransform` under a `viewBox` scale and a non-uniform group. Interiors agree within 1 level (the linear one byte-identical).
 
 ## [0.1.4](https://github.com/OxideAV/oxideav-raster/compare/v0.1.3...v0.1.4) - 2026-10-24
 
