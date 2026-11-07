@@ -10,8 +10,8 @@ use oxideav_core::{
 
 use crate::blend::BlendMode;
 use crate::cache::{CacheStats, RasterizedSubtree, SharedCache, composite_key};
-use crate::composite::composite_coverage_rect;
-use crate::fill::{AlphaMask, Coverage, CoverageMode, rasterize_fill_with_bounds};
+use crate::composite::{SolidSource, composite_coverage_rect, composite_row};
+use crate::fill::{AlphaMask, Coverage, CoverageMode, EdgeTable, rasterize_fill_with_bounds};
 use crate::filter::PreserveAspectRatio;
 use crate::flatten::{FLATTEN_TOLERANCE_PX, FlatContour, FlattenOptions, flatten_path_with};
 use crate::gradient::InterpolationSpace;
@@ -647,27 +647,27 @@ impl Renderer {
         // Fill pass.
         if let Some(fill) = &node.fill {
             let contours = self.flatten_fill(&node.path.commands, &transform);
-            let (mask, bounds) = self.rasterize_with_bounds(&contours, node.fill_rule);
-            let mask = match clip_mask {
-                Some(c) => mask.intersect_clip(c),
-                None => mask,
-            };
-            self.composite_with_paint(buf, stride, &mask, bounds, fill, &transform, group_opacity);
+            self.paint_contours(
+                buf,
+                stride,
+                &contours,
+                node.fill_rule,
+                clip_mask,
+                fill,
+                &transform,
+                group_opacity,
+            );
         }
         // Stroke pass.
         if let Some(stroke) = &node.stroke {
             let stroke_geom =
                 build_stroke_geometry(&node.path, &transform, stroke, (self.width, self.height));
-            let (mask, bounds) = self.rasterize_with_bounds(&stroke_geom, FillRule::NonZero);
-            let mask = match clip_mask {
-                Some(c) => mask.intersect_clip(c),
-                None => mask,
-            };
-            self.composite_with_paint(
+            self.paint_contours(
                 buf,
                 stride,
-                &mask,
-                bounds,
+                &stroke_geom,
+                FillRule::NonZero,
+                clip_mask,
                 &stroke.paint,
                 &transform,
                 group_opacity,
@@ -675,7 +675,58 @@ impl Renderer {
         }
     }
 
-    /// Composite `paint` through `mask` onto `buf`.
+    /// Stream the coverage of `contours` row by row, intersected with
+    /// `clip` (per-pixel minimum), as `emit(y, x0, coverage)` calls in
+    /// device coordinates. The analytic kernel never materialises a
+    /// mask: each row is composited while it is still in cache.
+    fn coverage_rows(
+        &self,
+        contours: &[FlatContour],
+        fill_rule: FillRule,
+        clip: Option<&AlphaMask>,
+        mut emit: impl FnMut(u32, u32, &[u8]),
+    ) {
+        let mut tmp: Vec<u8> = Vec::new();
+        let mut with_clip = |y: u32, x0: u32, row: &[u8]| match clip {
+            None => emit(y, x0, row),
+            Some(c) => {
+                if y >= c.height {
+                    return;
+                }
+                let off = (y * c.width + x0) as usize;
+                let n = row.len().min(c.width.saturating_sub(x0) as usize);
+                tmp.clear();
+                tmp.extend(
+                    row[..n]
+                        .iter()
+                        .zip(&c.data[off..off + n])
+                        .map(|(a, b)| (*a).min(*b)),
+                );
+                emit(y, x0, &tmp);
+            }
+        };
+        match self.coverage {
+            CoverageMode::Analytic => {
+                if let Some(t) = EdgeTable::build(contours, self.width, self.height, None) {
+                    t.scan(fill_rule, with_clip);
+                }
+            }
+            _ => {
+                let (cov, bounds) = self.rasterize_with_bounds(contours, fill_rule);
+                let Some((bx0, by0, bx1, by1)) = bounds else {
+                    return;
+                };
+                let mw = cov.mask.width as usize;
+                for y in by0..=by1 {
+                    let off = (y - cov.y0) as usize * mw + (bx0 - cov.x0) as usize;
+                    with_clip(y, bx0, &cov.mask.data[off..off + (bx1 - bx0 + 1) as usize]);
+                }
+            }
+        }
+    }
+
+    /// Paint `contours` (filled with `fill_rule`, clipped by `clip`)
+    /// with `paint` onto `buf`.
     ///
     /// `transform` is the current transformation matrix (CTM) the
     /// painted geometry was flattened with — user space → device
@@ -690,98 +741,80 @@ impl Renderer {
     /// `transform` and the element's own `transform`, and a radial
     /// gradient under a non-uniform CTM renders elliptical rings
     /// exactly as the spec describes, without any special casing.
-    fn composite_with_paint(
+    #[allow(clippy::too_many_arguments)]
+    fn paint_contours(
         &self,
         buf: &mut [u8],
         stride: usize,
-        mask: &Coverage,
-        bounds: Option<(u32, u32, u32, u32)>,
+        contours: &[FlatContour],
+        fill_rule: FillRule,
+        clip: Option<&AlphaMask>,
         paint: &Paint,
         transform: &Transform2D,
         group_opacity: f32,
     ) {
-        if mask.mask.is_empty() {
+        let extra_q = (group_opacity.clamp(0.0, 1.0) * 255.0).round() as u32;
+        if extra_q == 0 {
             return;
         }
-        // No span was rasterised: the mask is all-zero, so the
-        // composite scan would skip every pixel anyway.
-        let Some((bx0, by0, bx1, by1)) = bounds else {
-            return;
-        };
-        let rect = (bx0, by0, bx1, by1);
-        // Clone gradient-bearing paints so the per-pixel sampler
-        // doesn't have to re-resolve at each call.
         let blend = self.blend_mode;
+        let row_slice = |buf: &mut [u8], y: u32, x0: u32, n: usize| -> std::ops::Range<usize> {
+            let _ = buf;
+            let off = y as usize * stride + x0 as usize * 4;
+            off..off + n * 4
+        };
         match paint {
+            Paint::Solid(c) if blend.is_normal() => {
+                let src = SolidSource::new(*c, extra_q);
+                self.coverage_rows(contours, fill_rule, clip, |y, x0, row| {
+                    let r = row_slice(buf, y, x0, row.len());
+                    src.over_row(&mut buf[r], row);
+                });
+            }
             Paint::Solid(c) => {
                 let c = *c;
-                composite_coverage_rect(
-                    buf,
-                    stride,
-                    self.width,
-                    self.height,
-                    mask,
-                    group_opacity,
-                    blend,
-                    rect,
-                    move |_x, _y| c,
-                );
+                self.coverage_rows(contours, fill_rule, clip, |y, x0, row| {
+                    let r = row_slice(buf, y, x0, row.len());
+                    composite_row(&mut buf[r], row, x0, y, extra_q, blend, &mut |_, _| c);
+                });
             }
-            // Gradient + future non-Solid variants. Cloned upfront so
-            // the closure owns its data and survives the composite
-            // call's lifetime. Gradients additionally pre-bake a
-            // 256-entry stops LUT once per fill — this collapses the
-            // per-pixel stops-window scan + (for `LinearRgb`) the
-            // `srgb_to_linear` / `linear_to_srgb` `powf` evaluation
-            // down to a single clamped table lookup. The build cost
-            // is `O(stops × 256)` (256× per-stop arithmetic);
-            // amortised against `O(canvas-area)` per-pixel calls this
-            // pays for itself any time the gradient covers more than
-            // ~10 destination pixels, which is essentially always in
-            // practice.
+            // Gradients pre-bake a stops LUT once per fill — this
+            // collapses the per-pixel stops-window scan + (for
+            // `LinearRgb`) the transfer-curve evaluation down to a table
+            // lookup.
             other => {
                 // Device → user space. A singular CTM collapses the
                 // geometry to zero area, so there is nothing a gradient
-                // could be sampled over; the mask is empty in that case
-                // anyway.
+                // could be sampled over.
                 let Some(inv) = invert_2d(transform) else {
                     return;
                 };
                 let space = self.color_interpolation;
                 let lut = build_paint_lut(other, space);
-                let other = other.clone();
                 let user_at = move |x: u32, y: u32| -> Point {
                     inv.apply(Point::new(x as f32 + 0.5, y as f32 + 0.5))
                 };
                 match lut {
-                    Some(lut) => composite_coverage_rect(
-                        buf,
-                        stride,
-                        self.width,
-                        self.height,
-                        mask,
-                        group_opacity,
-                        blend,
-                        rect,
-                        move |x, y| {
+                    Some(lut) => {
+                        let mut paint_at = |x: u32, y: u32| {
                             let p = user_at(x, y);
-                            sample_paint_with_lut(&other, p.x, p.y, &lut)
-                        },
-                    ),
-                    None => composite_coverage_rect(
-                        buf,
-                        stride,
-                        self.width,
-                        self.height,
-                        mask,
-                        group_opacity,
-                        blend,
-                        rect,
-                        move |x, y| {
+                            sample_paint_with_lut(other, p.x, p.y, &lut)
+                        };
+                        self.coverage_rows(contours, fill_rule, clip, |y, x0, row| {
+                            let r = row_slice(buf, y, x0, row.len());
+                            composite_row(&mut buf[r], row, x0, y, extra_q, blend, &mut paint_at);
+                        });
+                    }
+                    None => {
+                        let mut paint_at = |x: u32, y: u32| {
                             let p = user_at(x, y);
-                            sample_paint_in(&other, p.x, p.y, space)
-                        },
-                    ),
+                            sample_paint_in(other, p.x, p.y, space)
+                        };
+                        self.coverage_rows(contours, fill_rule, clip, |y, x0, row| {
+                            let r = row_slice(buf, y, x0, row.len());
+                            composite_row(&mut buf[r], row, x0, y, extra_q, blend, &mut paint_at);
+                        });
+                    }
                 }
             }
         }

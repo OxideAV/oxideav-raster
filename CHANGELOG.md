@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - curve flattening is driven by a rigorous device-pixel error bound (1/32 px, from the second-difference bound on the cubic's second derivative) instead of a 0.5 px chord-length rule: a radius-1000 px circle drops from ~12 600 to a few hundred segments while staying facet-free at any zoom. Curves whose control hull lies wholly beyond one side of the canvas are replaced by their chord (exact for fills; strokes use a reach-grown rectangle, dashed strokes are never culled).
 - the exact-area kernel rasterizes into a window clipped to the shape's bounding box instead of a canvas-sized mask per path, so per-shape cost no longer scales with the canvas: 20 000 small shapes on a 4K canvas 731 → 26 ms, a 1080p text page 91 → 16 ms, a 1080p path-heavy illustration 769 → 275 ms (`benches/scenes.rs`, new).
+- paths are painted straight from the scan converter, one coverage row at a time (no per-shape mask), and source-over is evaluated with exact integer shortcuts: rounding division by 255 via shift-add, the un-premultiply division by a reciprocal table (exhaustively tested equal), an opaque-backdrop path with no division, and for solid paints a 256-entry coverage table plus plain fills of fully covered runs. Output bytes are unchanged; the 1080p illustration goes 275 → 197 ms.
 
 ### Fixed
 
