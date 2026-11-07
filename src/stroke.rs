@@ -170,6 +170,44 @@ pub fn stroke_to_fill_path_ext(
 
 /// Shared outline builder for both entry points: turn dash-split
 /// sub-polylines into fillable contours using the given join shape.
+///
+/// # Two constructions
+///
+/// The fast construction is the classic *offset outline*: the stroke
+/// boundary traced by the two ends of the pen as it travels the
+/// polyline (right side forward, left side backward, caps / joins in
+/// between). Its winding number counts how many times the moving pen
+/// passes over a point, so it is ≥ 1 exactly on the stroke as long as
+/// the pen never sweeps *backwards* across area that no other part of
+/// the stroke covers. The pen sweeps backwards on the inside of every
+/// turn — by its pivot (round / bevel joins) or by the overshoot of a
+/// trimmed inner miter corner — and that backwards sweep stays inside
+/// the two adjacent segments' rectangles when each segment is long
+/// enough to hold the inner corner regions at both of its ends:
+///
+/// ```text
+///   ℓ ≥ h · (c(θ_a) + c(θ_b))
+///   c(θ) = sin θ (θ ≤ 90°) or 1 (θ > 90°)  for a pivot,
+///   c(θ) = tan(θ / 2)                       for a trimmed inner corner
+/// ```
+///
+/// (`h` the half-width, `θ` the turning angle at a vertex). Wherever
+/// both segments at a vertex have room for it, the inner corner of a
+/// round or bevel join is trimmed at the offset lines' intersection
+/// instead of pivoting: same area, but no backward loop — so the
+/// outline of a flattened curve stays y-monotone and crossing-free,
+/// which is what keeps the scan converter on its fast path. When a
+/// segment violates it — a stroke wider than the curvature radius, a
+/// short segment between sharp turns, a tiny closed loop — the offset
+/// outline would cancel part of the stroke (a thick stroke around a
+/// small circle used to leave a hole in the middle). Those segments
+/// are emitted instead as the **union of positively wound pieces**:
+/// one rectangle per segment, one join wedge on the outer side of each
+/// of their turns, one polygon per cap, while the runs of compliant
+/// segments between them keep the offset outline (butt-ended where a
+/// run meets a piece). Every part winds non-negatively and ≥ 1 on its
+/// own area, so the non-zero fill of the set is exactly the union; the
+/// exact-area kernel resolves the overlaps without over-covering.
 fn build_segments(
     segments: Vec<DashSegment>,
     half: f32,
@@ -177,19 +215,364 @@ fn build_segments(
     join: ExtendedLineJoin,
 ) -> Vec<FlatContour> {
     let mut out: Vec<FlatContour> = Vec::with_capacity(segments.len());
-    for seg in segments {
-        if seg.closed {
+    for mut seg in segments {
+        dedup_points(&mut seg.points, seg.closed);
+        if seg.points.len() < 2 {
+            continue;
+        }
+        let trims = plan_trims(&seg.points, seg.closed, half, join, stroke.miter_limit);
+        let safe = exact_segments(
+            &seg.points,
+            seg.closed,
+            half,
+            join,
+            stroke.miter_limit,
+            &trims,
+        );
+        if safe.iter().any(|&ok| !ok) {
+            stroke_mixed(
+                &mut out,
+                &seg.points,
+                seg.closed,
+                half,
+                stroke,
+                join,
+                &safe,
+                &trims,
+            );
+        } else if seg.closed {
             // Closed input → emit outer + inner offset loops.
-            if let Some(loops) = stroke_closed(&seg.points, half, stroke, join) {
+            if let Some(loops) = stroke_closed_trim(&seg.points, half, stroke, join, &trims) {
                 out.extend(loops);
             }
-        } else if seg.points.len() >= 2
-            && let Some(c) = stroke_open(&seg.points, half, stroke, join)
-        {
+        } else if let Some(c) = stroke_open_caps(
+            &seg.points,
+            half,
+            stroke,
+            join,
+            stroke.cap,
+            stroke.cap,
+            &trims,
+        ) {
             out.push(c);
         }
     }
     out
+}
+
+/// Drop consecutive (and, for a closed loop, wrap-around) duplicate
+/// vertices: a zero-length segment has no direction, so its normal is
+/// undefined.
+fn dedup_points(points: &mut Vec<(f32, f32)>, closed: bool) {
+    let same = |a: (f32, f32), b: (f32, f32)| (a.0 - b.0).abs() < 1e-6 && (a.1 - b.1).abs() < 1e-6;
+    points.dedup_by(|b, a| same(*a, *b));
+    if closed {
+        while points.len() >= 2 && same(points[0], points[points.len() - 1]) {
+            points.pop();
+        }
+    }
+}
+
+/// Turning angle in `[0, π]` at `b` for the path `a → b → c`.
+#[inline]
+fn turn_angle(a: (f32, f32), b: (f32, f32), c: (f32, f32)) -> f32 {
+    let (ux, uy) = (b.0 - a.0, b.1 - a.1);
+    let (vx, vy) = (c.0 - b.0, c.1 - b.1);
+    (ux * vy - uy * vx).atan2(ux * vx + uy * vy).abs()
+}
+
+/// Per segment, whether the sufficient condition of
+/// [`build_segments`] for the offset outline holds. Pivot corners need
+/// the segment to *contain* the inner sector at each end
+/// (`ℓ ≥ h · max(c_a, c_b)`), trimmed inner miters *consume* it
+/// (`ℓ ≥ h · (t_a + t_b)`).
+fn exact_segments(
+    points: &[(f32, f32)],
+    closed: bool,
+    half: f32,
+    join: ExtendedLineJoin,
+    miter_limit: f32,
+    trims: &[bool],
+) -> Vec<bool> {
+    let n = points.len();
+    // (pivot containment factor, trimmed-corner consumption factor).
+    let reach = |i: usize| -> (f32, f32) {
+        if !closed && (i == 0 || i == n - 1) {
+            return (0.0, 0.0);
+        }
+        let prev = points[(i + n - 1) % n];
+        let next = points[(i + 1) % n];
+        let theta = turn_angle(prev, points[i], next);
+        let pivot = if theta <= std::f32::consts::FRAC_PI_2 {
+            theta.sin()
+        } else {
+            1.0
+        };
+        let tan_half = (theta * 0.5).tan();
+        let trim = match join {
+            ExtendedLineJoin::Round | ExtendedLineJoin::Bevel => {
+                if trims[i] {
+                    tan_half
+                } else {
+                    0.0
+                }
+            }
+            ExtendedLineJoin::Miter => {
+                // Within the limit the inner corner is trimmed at the
+                // offset lines' intersection; past it the join is a
+                // bevel (a pivot).
+                let cos_half = (theta * 0.5).cos();
+                if cos_half > 0.0 && 1.0 / cos_half <= miter_limit {
+                    tan_half
+                } else {
+                    0.0
+                }
+            }
+            _ => {
+                if tan_half.is_finite() {
+                    tan_half
+                } else {
+                    f32::INFINITY
+                }
+            }
+        };
+        (pivot, trim)
+    };
+    let factors: Vec<(f32, f32)> = (0..n).map(reach).collect();
+    let segs = if closed { n } else { n - 1 };
+    (0..segs)
+        .map(|i| {
+            let a = points[i];
+            let b = points[(i + 1) % n];
+            let len = ((b.0 - a.0).powi(2) + (b.1 - a.1).powi(2)).sqrt();
+            let (pa, ta) = factors[i];
+            let (pb, tb) = factors[(i + 1) % n];
+            len >= half * pa.max(pb) && len >= half * (ta + tb)
+        })
+        .collect()
+}
+
+/// Per vertex, whether the inner corner of a round / bevel join is
+/// trimmed at the offset lines' intersection (see [`build_segments`]):
+/// when both adjacent segments can hold a trimmed corner at *both* of
+/// their ends, `ℓ ≥ h · (tan(θ_a / 2) + tan(θ_b / 2))`. Miter-family
+/// joins already trim within their limit and are left alone.
+fn plan_trims(
+    points: &[(f32, f32)],
+    closed: bool,
+    half: f32,
+    join: ExtendedLineJoin,
+    _miter_limit: f32,
+) -> Vec<bool> {
+    let n = points.len();
+    if !matches!(join, ExtendedLineJoin::Round | ExtendedLineJoin::Bevel) || n < 3 {
+        return vec![false; n];
+    }
+    let is_join = |i: usize| closed || (i != 0 && i != n - 1);
+    let tans: Vec<f32> = (0..n)
+        .map(|i| {
+            if !is_join(i) {
+                return 0.0;
+            }
+            let t = turn_angle(points[(i + n - 1) % n], points[i], points[(i + 1) % n]);
+            if t >= std::f32::consts::FRAC_PI_2 {
+                f32::INFINITY // a sharp corner keeps its pivot
+            } else {
+                (t * 0.5).tan()
+            }
+        })
+        .collect();
+    let seg_ok = |a: usize| -> bool {
+        let b = (a + 1) % n;
+        let (p, q) = (points[a], points[b]);
+        let len = ((q.0 - p.0).powi(2) + (q.1 - p.1).powi(2)).sqrt();
+        len >= half * (tans[a] + tans[b])
+    };
+    (0..n)
+        .map(|i| {
+            is_join(i)
+                && tans[i].is_finite()
+                && tans[i] > 0.0
+                && seg_ok((i + n - 1) % n)
+                && seg_ok(i)
+        })
+        .collect()
+}
+
+/// [`push_join_kind`], except that on the **inner** side of the turn a
+/// `trim` vertex gets the offset lines' intersection point.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn push_join_trim(
+    out: &mut Vec<(f32, f32)>,
+    prev: (f32, f32),
+    cur: (f32, f32),
+    nxt: (f32, f32),
+    half: f32,
+    join: ExtendedLineJoin,
+    miter_limit: f32,
+    outer_side: bool,
+    trim: bool,
+) {
+    if trim {
+        let (n0x, n0y) = right_normal(prev, cur);
+        let turns_right = n0x * (nxt.0 - cur.0) + n0y * (nxt.1 - cur.1) > 0.0;
+        if turns_right == outer_side {
+            let sign = if outer_side { 1.0 } else { -1.0 };
+            let (n1x, n1y) = right_normal(cur, nxt);
+            let off0 = (cur.0 + n0x * half * sign, cur.1 + n0y * half * sign);
+            let off1 = (cur.0 + n1x * half * sign, cur.1 + n1y * half * sign);
+            let (dqx, dqy) = (cur.0 - prev.0, cur.1 - prev.1);
+            let (dpx, dpy) = (nxt.0 - cur.0, nxt.1 - cur.1);
+            let denom = dqx * dpy - dqy * dpx;
+            if denom.abs() > 1e-9 {
+                let t = ((off1.0 - off0.0) * dpy - (off1.1 - off0.1) * dpx) / denom;
+                let p = (off0.0 + dqx * t, off0.1 + dqy * t);
+                if p.0.is_finite() && p.1.is_finite() {
+                    out.push(p);
+                    return;
+                }
+            }
+        }
+    }
+    push_join_kind(out, prev, cur, nxt, half, join, miter_limit, outer_side);
+}
+
+/// Push `poly` wound positively (non-negative signed area in the
+/// raster's y-down frame), dropping degenerate pieces.
+fn push_positive(out: &mut Vec<FlatContour>, mut poly: Vec<(f32, f32)>) {
+    if poly.len() < 3 {
+        return;
+    }
+    let mut area2 = 0.0f64;
+    for i in 0..poly.len() {
+        let (x0, y0) = poly[i];
+        let (x1, y1) = poly[(i + 1) % poly.len()];
+        area2 += x0 as f64 * y1 as f64 - x1 as f64 * y0 as f64;
+    }
+    if area2.abs() < 1e-12 {
+        return;
+    }
+    if area2 < 0.0 {
+        poly.reverse();
+    }
+    out.push(FlatContour {
+        points: poly,
+        closed: true,
+    });
+}
+
+/// The mixed construction of [`build_segments`]: offset outlines for
+/// the runs of compliant segments (`safe[i]` for the segment from
+/// vertex `i` to `i + 1`), positively wound pieces for the rest.
+#[allow(clippy::too_many_arguments)]
+fn stroke_mixed(
+    out: &mut Vec<FlatContour>,
+    points: &[(f32, f32)],
+    closed: bool,
+    half: f32,
+    stroke: &Stroke,
+    join: ExtendedLineJoin,
+    safe: &[bool],
+    trims: &[bool],
+) {
+    let n = points.len();
+    let segs = safe.len();
+    let ml = stroke.miter_limit;
+    // Offset outlines for maximal runs of safe segments. For a closed
+    // loop, start scanning just after an unsafe segment so no run
+    // wraps across the scan start.
+    let start = if closed {
+        (0..segs).find(|&i| !safe[i]).map_or(0, |i| (i + 1) % segs)
+    } else {
+        0
+    };
+    let mut k = 0;
+    while k < segs {
+        let i = (start + k) % segs;
+        if !safe[i] {
+            k += 1;
+            continue;
+        }
+        let mut len = 0;
+        while k + len < segs && safe[(start + k + len) % segs] {
+            len += 1;
+        }
+        let run: Vec<(f32, f32)> = (0..=len).map(|m| points[(i + m) % n]).collect();
+        let first_v = i;
+        let last_v = (i + len) % n;
+        let start_cap = if !closed && first_v == 0 {
+            stroke.cap
+        } else {
+            LineCap::Butt
+        };
+        let end_cap = if !closed && last_v == n - 1 {
+            stroke.cap
+        } else {
+            LineCap::Butt
+        };
+        // Run ends are butt-ended (or real caps): no join there.
+        let run_trims: Vec<bool> = (0..=len)
+            .map(|m| m != 0 && m != len && trims[(i + m) % n])
+            .collect();
+        if let Some(c) = stroke_open_caps(&run, half, stroke, join, start_cap, end_cap, &run_trims)
+        {
+            out.push(c);
+        }
+        k += len;
+    }
+    // Pieces for the unsafe segments, plus the joins at their ends.
+    let is_join_vertex = |v: usize| closed || (v != 0 && v != n - 1);
+    let mut wedge_done = vec![false; n];
+    for i in (0..segs).filter(|&i| !safe[i]) {
+        let a = points[i];
+        let b = points[(i + 1) % n];
+        let (nx, ny) = right_normal(a, b);
+        push_positive(
+            out,
+            vec![
+                (a.0 + nx * half, a.1 + ny * half),
+                (b.0 + nx * half, b.1 + ny * half),
+                (b.0 - nx * half, b.1 - ny * half),
+                (a.0 - nx * half, a.1 - ny * half),
+            ],
+        );
+        for v in [i, (i + 1) % n] {
+            if !is_join_vertex(v) || wedge_done[v] {
+                continue;
+            }
+            wedge_done[v] = true;
+            let prev = points[(v + n - 1) % n];
+            let cur = points[v];
+            let next = points[(v + 1) % n];
+            let (n0x, n0y) = right_normal(prev, cur);
+            let (dx, dy) = (next.0 - cur.0, next.1 - cur.1);
+            // The path bends towards the right normal when the outgoing
+            // direction has a positive component along it; the join
+            // wedge belongs on the other (outer) side.
+            let outer_right = n0x * dx + n0y * dy < 0.0;
+            let sign = if outer_right { 1.0 } else { -1.0 };
+            let (n1x, n1y) = right_normal(cur, next);
+            let mut wedge = vec![cur, (cur.0 + n0x * half * sign, cur.1 + n0y * half * sign)];
+            push_join_kind(&mut wedge, prev, cur, next, half, join, ml, outer_right);
+            wedge.push((cur.0 + n1x * half * sign, cur.1 + n1y * half * sign));
+            push_positive(out, wedge);
+        }
+    }
+    if !closed && stroke.cap != LineCap::Butt {
+        for (from, at, seg) in [
+            (points[n - 2], points[n - 1], segs - 1),
+            (points[1], points[0], 0),
+        ] {
+            if safe[seg] {
+                continue; // capped by its run's outline
+            }
+            let (nx, ny) = right_normal(from, at);
+            let mut cap = vec![(at.0 + nx * half, at.1 + ny * half)];
+            push_cap(&mut cap, from, at, half, stroke.cap);
+            push_positive(out, cap);
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -374,12 +757,16 @@ fn apply_dash(points: &[(f32, f32)], closed: bool, dash: &DashPattern) -> Vec<Da
     out
 }
 
-/// Build the fillable outline for an open polyline.
-fn stroke_open(
+/// Build the fillable offset outline for an open polyline, with
+/// separate start / end caps and per-vertex inner-corner trimming.
+fn stroke_open_caps(
     points: &[(f32, f32)],
     half: f32,
     stroke: &Stroke,
     join: ExtendedLineJoin,
+    start_cap: LineCap,
+    end_cap: LineCap,
+    trims: &[bool],
 ) -> Option<FlatContour> {
     let n = points.len();
     if n < 2 {
@@ -399,7 +786,7 @@ fn stroke_open(
             let (nx, ny) = right_normal(points[n - 2], points[n - 1]);
             out.push((points[n - 1].0 + nx * half, points[n - 1].1 + ny * half));
         } else {
-            push_join_kind(
+            push_join_trim(
                 &mut out,
                 points[i - 1],
                 points[i],
@@ -408,12 +795,13 @@ fn stroke_open(
                 join,
                 ml,
                 true,
+                trims[i],
             );
         }
     }
     // End cap (at the last vertex, going from incoming → outgoing direction
     // which is the reverse of the incoming direction).
-    push_cap(&mut out, points[n - 2], points[n - 1], half, stroke.cap);
+    push_cap(&mut out, points[n - 2], points[n - 1], half, end_cap);
     // Backward (left side relative to the original direction = right
     // side of the reversed walk).
     for i in (0..n).rev() {
@@ -424,7 +812,7 @@ fn stroke_open(
             let (nx, ny) = right_normal(points[1], points[0]);
             out.push((points[0].0 + nx * half, points[0].1 + ny * half));
         } else {
-            push_join_kind(
+            push_join_trim(
                 &mut out,
                 points[i + 1],
                 points[i],
@@ -433,12 +821,13 @@ fn stroke_open(
                 join,
                 ml,
                 true,
+                trims[i],
             );
         }
     }
     // Start cap (at points[0], going from the reversed-walk-incoming
     // direction).
-    push_cap(&mut out, points[1], points[0], half, stroke.cap);
+    push_cap(&mut out, points[1], points[0], half, start_cap);
 
     Some(FlatContour {
         points: out,
@@ -446,13 +835,15 @@ fn stroke_open(
     })
 }
 
-/// Build the fillable outline for a closed contour. Returns up to two
-/// loops (outer then inner) for the caller to fill with NonZero.
-fn stroke_closed(
+/// Build the fillable outline for a closed contour: outer and inner
+/// offset loops (inner reversed) for the caller to fill with NonZero,
+/// with per-vertex inner-corner trimming.
+fn stroke_closed_trim(
     points: &[(f32, f32)],
     half: f32,
     stroke: &Stroke,
     join: ExtendedLineJoin,
+    trims: &[bool],
 ) -> Option<Vec<FlatContour>> {
     let n = points.len();
     if n < 2 {
@@ -465,8 +856,8 @@ fn stroke_closed(
         let prev = points[(i + n - 1) % n];
         let cur = points[i];
         let nxt = points[(i + 1) % n];
-        push_join_kind(&mut outer, prev, cur, nxt, half, join, ml, true);
-        push_join_kind(&mut inner, prev, cur, nxt, half, join, ml, false);
+        push_join_trim(&mut outer, prev, cur, nxt, half, join, ml, true, trims[i]);
+        push_join_trim(&mut inner, prev, cur, nxt, half, join, ml, false, trims[i]);
     }
     // Inner loop is wound opposite to the outer so a NonZero fill
     // produces a hollow ring.
@@ -678,10 +1069,12 @@ fn clip_segment(
 
 /// Maximum allowed deviation (sagitta), in output-pixel units, between a
 /// flattened arc chord and the true circular arc when tessellating round
-/// joins and caps. A value well below one pixel keeps the faceting under
-/// the anti-aliased edge: at 0.2 px the worst-case chord error is a fifth
-/// of a pixel, so the AA ramp absorbs it and the corner reads as smooth.
-const ARC_FLATTEN_TOLERANCE: f32 = 0.2;
+/// joins and caps — the same 1/32 px bound the curve flattener uses, so
+/// a round cap is as smooth as the curve it ends (coverage is an area
+/// integral: a chord sagging `d` px inside the circle under-covers the
+/// pixels along it by up to `d`, so the former 0.2 px cost up to 51 of
+/// 255 levels at the chord midpoints of a thick cap).
+const ARC_FLATTEN_TOLERANCE: f32 = crate::flatten::FLATTEN_TOLERANCE_PX as f32;
 
 /// Number of chord subdivisions needed to flatten a circular arc of
 /// radius `r` sweeping `|delta|` radians while keeping the per-chord
@@ -707,7 +1100,7 @@ fn arc_chord_count(r: f32, delta: f32) -> usize {
     }
     // δ_max = 2·acos(1 − tol/r). The argument is in (−1, 1] here because
     // tol/r ∈ (0, 1), so acos is well defined.
-    let delta_max = 2.0 * (1.0 - ARC_FLATTEN_TOLERANCE / r).acos();
+    let delta_max = (2.0 * (1.0 - (ARC_FLATTEN_TOLERANCE / r) as f64).acos()) as f32;
     if delta_max <= 1e-6 {
         // Degenerate guard (shouldn't trigger given the radius check
         // above); fall back to a fine fixed subdivision.
@@ -1072,7 +1465,7 @@ mod tests {
     #[test]
     fn arc_chord_count_handles_degenerate_inputs() {
         assert_eq!(arc_chord_count(0.0, std::f32::consts::PI), 1);
-        assert_eq!(arc_chord_count(0.1, std::f32::consts::PI), 1);
+        assert_eq!(arc_chord_count(0.02, std::f32::consts::PI), 1);
         assert_eq!(arc_chord_count(100.0, 0.0), 1);
     }
 

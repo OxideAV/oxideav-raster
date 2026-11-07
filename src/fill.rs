@@ -636,9 +636,90 @@ impl Window {
 ///   projection exactly when it crossed the original part, so every
 ///   winding number inside the window — and therefore every coverage
 ///   value — is unchanged.
+///
+/// # Monotone chains
+///
+/// The clipped segments are stored as **y-monotone chains**: maximal
+/// runs of consecutive segments of one contour going the same vertical
+/// direction. A polyline vertex in the middle of a chain is not an
+/// event for the scan (see [`EdgeTable::scan`]), which matters because
+/// a flattened curve puts a vertex every pixel or two.
 pub(crate) struct EdgeTable {
-    edges: Vec<Edge>,
+    /// Chain vertices, window-local, y strictly increasing per chain.
+    pts: Vec<(f32, f32)>,
+    /// `dx/dy` of the segment starting at each vertex (unused at a
+    /// chain's last vertex).
+    dxdy: Vec<f32>,
+    /// Chains sorted by top y.
+    chains: Vec<Chain>,
     win: Window,
+}
+
+/// A y-monotone chain: vertices `pts[start..end]` (at least two).
+#[derive(Debug, Clone, Copy)]
+struct Chain {
+    start: u32,
+    end: u32,
+    winding: i32,
+    y_top: f32,
+    y_bot: f32,
+}
+
+/// Incremental chain assembly in contour order.
+struct ChainBuilder {
+    pts: Vec<(f32, f32)>,
+    chains: Vec<Chain>,
+    cur: Vec<(f32, f32)>,
+    cur_w: i32,
+}
+
+impl ChainBuilder {
+    /// Append the traversal-order piece `a → b` (window-local, `a.y ≠
+    /// b.y`) of winding `w` (+1 downwards).
+    #[inline]
+    fn piece(&mut self, a: (f32, f32), b: (f32, f32), w: i32) {
+        if self.cur_w == w && self.cur.last() == Some(&a) {
+            self.cur.push(b);
+            return;
+        }
+        self.finish();
+        self.cur_w = w;
+        self.cur.push(a);
+        self.cur.push(b);
+    }
+
+    fn finish(&mut self) {
+        if self.cur.len() >= 2 {
+            if self.cur_w < 0 {
+                self.cur.reverse();
+            }
+            let start = self.pts.len() as u32;
+            self.pts.extend_from_slice(&self.cur);
+            self.chains.push(Chain {
+                start,
+                end: self.pts.len() as u32,
+                winding: self.cur_w,
+                y_top: self.cur[0].1,
+                y_bot: self.cur[self.cur.len() - 1].1,
+            });
+        }
+        self.cur.clear();
+    }
+}
+
+/// One chain restricted to a strip: x at the strip's top and bottom,
+/// its x-extent over the strip, and where its walk starts.
+#[derive(Debug, Clone, Copy)]
+struct StripChain {
+    xa: f32,
+    xb: f32,
+    x_min: f32,
+    x_max: f32,
+    winding: i32,
+    /// Index (into `pts`) of the segment containing the strip top.
+    seg: u32,
+    /// One past the chain's last vertex.
+    end: u32,
 }
 
 impl EdgeTable {
@@ -687,26 +768,17 @@ impl EdgeTable {
             win = win.intersect(&l)?;
         }
         let (wx0, wy0, wx1, wy1) = (win.x0 as f64, win.y0 as f64, win.x1 as f64, win.y1 as f64);
+        let local = |x: f64, y: f64| -> (f32, f32) { ((x - wx0) as f32, (y - wy0) as f32) };
 
-        let mut edges: Vec<Edge> = Vec::with_capacity(count + 8);
-        let mut push = |xa: f64, ya: f64, xb: f64, yb: f64, winding: i32| {
-            let (lya, lyb) = ((ya - wy0) as f32, (yb - wy0) as f32);
-            if lya >= lyb {
-                return;
-            }
-            let (lxa, lxb) = ((xa - wx0) as f32, (xb - wx0) as f32);
-            let dxdy = ((xb - xa) / (yb - ya)) as f32;
-            if !dxdy.is_finite() {
-                return;
-            }
-            edges.push(Edge {
-                y_min: lya,
-                y_max: lyb,
-                x_at_y_min: lxa,
-                dxdy: if lxa == lxb { 0.0 } else { dxdy },
-                winding,
-            });
+        let mut b = ChainBuilder {
+            pts: Vec::with_capacity(count + 8),
+            chains: Vec::new(),
+            cur: Vec::new(),
+            cur_w: 0,
         };
+        // Top-to-bottom pieces of one segment (at most three after the
+        // left / right split).
+        let mut pieces: [((f32, f32), (f32, f32)); 3] = [((0.0, 0.0), (0.0, 0.0)); 3];
         for c in contours {
             if c.points.len() < 2 {
                 continue;
@@ -716,10 +788,13 @@ impl EdgeTable {
                 let (x0, y0) = c.points[i];
                 let (x1, y1) = c.points[(i + 1) % n];
                 if !(x0.is_finite() && y0.is_finite() && x1.is_finite() && y1.is_finite()) {
+                    b.finish();
                     continue;
                 }
                 if y0 == y1 {
-                    continue; // horizontal: contributes no area boundary
+                    // Horizontal: contributes no area boundary (and
+                    // breaks the chain).
+                    continue;
                 }
                 let winding = if y1 > y0 { 1i32 } else { -1 };
                 let (mut xa, mut ya, mut xb, mut yb) = if y0 < y1 {
@@ -728,6 +803,7 @@ impl EdgeTable {
                     (x1 as f64, y1 as f64, x0 as f64, y0 as f64)
                 };
                 if yb <= wy0 || ya >= wy1 {
+                    b.finish();
                     continue;
                 }
                 let slope = (xb - xa) / (yb - ya);
@@ -739,45 +815,82 @@ impl EdgeTable {
                     xb -= (yb - wy1) * slope;
                     yb = wy1;
                 }
+                let mut np = 0usize;
                 let inside = |x: f64| (wx0..=wx1).contains(&x);
                 if inside(xa) && inside(xb) {
-                    push(xa, ya, xb, yb, winding);
-                    continue;
-                }
-                // Split where the segment crosses the window's left /
-                // right sides; clamping each piece's endpoints then
-                // projects the outside pieces onto the sides.
-                let mut ts = [0.0f64, 1.0, 1.0, 1.0];
-                let mut nt = 1usize;
-                for side in [wx0, wx1] {
-                    if (xa - side) * (xb - side) < 0.0 {
-                        ts[nt] = (side - xa) / (xb - xa);
-                        nt += 1;
+                    pieces[0] = (local(xa, ya), local(xb, yb));
+                    np = 1;
+                } else {
+                    // Split where the segment crosses the window's left /
+                    // right sides; clamping each piece's endpoints then
+                    // projects the outside pieces onto the sides.
+                    let mut ts = [0.0f64, 1.0, 1.0, 1.0];
+                    let mut nt = 1usize;
+                    for side in [wx0, wx1] {
+                        if (xa - side) * (xb - side) < 0.0 {
+                            ts[nt] = (side - xa) / (xb - xa);
+                            nt += 1;
+                        }
+                    }
+                    ts[nt] = 1.0;
+                    ts[1..nt].sort_unstable_by(f64::total_cmp);
+                    let at = |t: f64| -> (f64, f64) {
+                        if t >= 1.0 {
+                            (xb.clamp(wx0, wx1), yb)
+                        } else {
+                            ((xa + (xb - xa) * t).clamp(wx0, wx1), ya + (yb - ya) * t)
+                        }
+                    };
+                    for k in 0..nt {
+                        let (pa, pb) = (at(ts[k]), at(ts[k + 1]));
+                        if pb.1 > pa.1 {
+                            pieces[np] = (local(pa.0, pa.1), local(pb.0, pb.1));
+                            np += 1;
+                        }
                     }
                 }
-                ts[nt] = 1.0;
-                ts[1..nt].sort_unstable_by(f64::total_cmp);
-                for k in 0..nt {
-                    let (t0, t1) = (ts[k], ts[k + 1]);
-                    let pya = ya + (yb - ya) * t0;
-                    let pyb = if k + 1 == nt { yb } else { ya + (yb - ya) * t1 };
-                    let pxa = (xa + (xb - xa) * t0).clamp(wx0, wx1);
-                    let pxb = if k + 1 == nt {
-                        xb.clamp(wx0, wx1)
+                // Traversal order: downward segments top → bottom,
+                // upward ones bottom → top.
+                for k in 0..np {
+                    let (top, bot) = if winding > 0 {
+                        pieces[k]
                     } else {
-                        (xa + (xb - xa) * t1).clamp(wx0, wx1)
+                        pieces[np - 1 - k]
                     };
-                    if pyb > pya {
-                        push(pxa, pya, pxb, pyb, winding);
+                    if top.1 >= bot.1 {
+                        b.finish();
+                        continue;
+                    }
+                    if winding > 0 {
+                        b.piece(top, bot, 1);
+                    } else {
+                        b.piece(bot, top, -1);
                     }
                 }
             }
+            b.finish();
         }
-        if edges.is_empty() {
+        let ChainBuilder {
+            pts, mut chains, ..
+        } = b;
+        if chains.is_empty() {
             return None;
         }
-        edges.sort_unstable_by(|a, b| a.y_min.total_cmp(&b.y_min));
-        Some(EdgeTable { edges, win })
+        chains.sort_unstable_by(|a, b| a.y_top.total_cmp(&b.y_top));
+        let mut dxdy = vec![0.0f32; pts.len()];
+        for c in &chains {
+            for i in c.start as usize..c.end as usize - 1 {
+                let (p, q) = (pts[i], pts[i + 1]);
+                let d = (q.0 - p.0) / (q.1 - p.1);
+                dxdy[i] = if p.0 == q.0 || !d.is_finite() { 0.0 } else { d };
+            }
+        }
+        Some(EdgeTable {
+            pts,
+            dxdy,
+            chains,
+            win,
+        })
     }
 
     /// The device window the table was clipped to.
@@ -786,152 +899,264 @@ impl EdgeTable {
         self.win
     }
 
+    /// x of the chain segment starting at vertex `i`, at height `y`.
+    #[inline(always)]
+    fn x_at(&self, i: usize, y: f32) -> f32 {
+        let p = self.pts[i];
+        p.0 + (y - p.1) * self.dxdy[i]
+    }
+
     /// Run the exact-area scan, calling `emit(y, x0, coverage)` once
     /// per device row that received any coverage, with the 8-bit
     /// coverage of the touched columns `x0 .. x0 + coverage.len()`
     /// (device coordinates). Rows are emitted top to bottom.
+    ///
+    /// # Strips
+    ///
+    /// Each pixel row is cut into sub-strips at the tops and bottoms of
+    /// chains inside it; within a strip the set of chains is constant.
+    /// When the chains' x-extents over the strip are pairwise disjoint
+    /// once sorted, no two of them can cross there, so the winding
+    /// number between consecutive chains is constant over the strip
+    /// and the coverage is exactly
+    ///
+    /// ```text
+    ///   cov(c) = Σ_k s_k · A_k(c),   s_k = inside(k − 1) − inside(k)
+    /// ```
+    ///
+    /// with `A_k(c)` the area of the cell to the left of chain `k`
+    /// (summed over the chain's straight pieces in the strip, each in
+    /// closed form) and `inside(k)` the fill rule applied to the
+    /// winding just right of chain `k`. Chains between two inside (or
+    /// two outside) regions have `s_k = 0` and cost nothing. When the
+    /// extents overlap, the strip is subdivided at every chain vertex
+    /// and every crossing into pieces where each chain is one straight
+    /// edge in a consistent order, and those are integrated as
+    /// trapezoids — the same exact area, just more work.
     pub(crate) fn scan(&self, fill_rule: FillRule, mut emit: impl FnMut(u32, u32, &[u8])) {
         let w = (self.win.x1 - self.win.x0) as usize;
         let height = self.win.y1 - self.win.y0;
-        let edges = &self.edges;
+        let chains = &self.chains;
         // Per-row accumulators: `area` holds boundary-cell areas written
-        // directly, `run` is a difference array for the fully-covered
-        // interior runs of each span (prefix-summed at row end). Both have
-        // one spare slot so a run ending at the window edge can close.
+        // directly, `run` is a difference array for fully-covered runs
+        // (prefix-summed at row end). Both have one spare slot so a run
+        // ending at the window edge can close.
         let mut area: Vec<f32> = vec![0.0; w + 1];
         let mut run: Vec<f32> = vec![0.0; w + 1];
         let mut out_row: Vec<u8> = vec![0; w];
-        let mut active: Vec<Edge> = Vec::new();
-        let mut next_edge = 0usize;
+        // Active chains: (chain index, cursor = vertex index of the
+        // segment containing the row top).
+        let mut active: Vec<(u32, u32)> = Vec::new();
+        let mut next_chain = 0usize;
         let mut events: Vec<f32> = Vec::new();
+        let mut sc: Vec<StripChain> = Vec::new();
+        let mut sub: Vec<f32> = Vec::new();
         let mut strip: Vec<StripEdge> = Vec::new();
 
         for py in 0..height {
             let row_top = py as f32;
             let row_bot = row_top + 1.0;
 
-            while next_edge < edges.len() && edges[next_edge].y_min < row_bot {
-                active.push(edges[next_edge]);
-                next_edge += 1;
+            while next_chain < chains.len() && chains[next_chain].y_top < row_bot {
+                active.push((next_chain as u32, chains[next_chain].start));
+                next_chain += 1;
             }
-            active.retain(|e| e.y_max > row_top);
+            active.retain(|&(ci, _)| chains[ci as usize].y_bot > row_top);
             if active.is_empty() {
-                if next_edge >= edges.len() {
+                if next_chain >= chains.len() {
                     break;
                 }
                 continue;
             }
+            // Advance cursors past segments ending at or above the row top.
+            for (ci, cur) in &mut active {
+                let end = chains[*ci as usize].end;
+                while *cur + 2 < end && self.pts[*cur as usize + 1].1 <= row_top {
+                    *cur += 1;
+                }
+            }
 
-            // Sub-strip boundaries: the row edges plus every edge endpoint
-            // strictly inside the row.
             events.clear();
             events.push(row_top);
             events.push(row_bot);
-            for e in &active {
-                if e.y_min > row_top && e.y_min < row_bot {
-                    events.push(e.y_min);
+            for &(ci, _) in &active {
+                let c = &chains[ci as usize];
+                if c.y_top > row_top && c.y_top < row_bot {
+                    events.push(c.y_top);
                 }
-                if e.y_max > row_top && e.y_max < row_bot {
-                    events.push(e.y_max);
+                if c.y_bot > row_top && c.y_bot < row_bot {
+                    events.push(c.y_bot);
                 }
             }
             if events.len() > 2 {
                 events.sort_unstable_by(f32::total_cmp);
                 events.dedup();
             }
-
             let mut touched = Touched { lo: w, hi: 0 };
             let mut splits = 0usize;
-            let mut i = 0usize;
-            while i + 1 < events.len() {
-                let ya = events[i];
-                let yb = events[i + 1];
+            let mut ei = 0usize;
+            while ei + 1 < events.len() {
+                let ya = events[ei];
+                let yb = events[ei + 1];
+                ei += 1;
                 let h = yb - ya;
                 if h <= 1e-7 {
-                    i += 1;
                     continue;
                 }
-                // Edges spanning this whole strip, with their x at top and
-                // bottom.
-                strip.clear();
-                for e in &active {
-                    if e.y_min <= ya && e.y_max >= yb {
-                        strip.push(StripEdge {
-                            xa: e.x_at_y_min + (ya - e.y_min) * e.dxdy,
-                            xb: e.x_at_y_min + (yb - e.y_min) * e.dxdy,
-                            winding: e.winding,
-                        });
-                    }
-                }
-                if strip.len() < 2 {
-                    i += 1;
-                    continue;
-                }
-                // Order by x at the top of the strip. Edges that meet at the
-                // top (a vertex, or the crossing a previous split was made
-                // at — equal up to rounding) diverge downwards, so they are
-                // ordered by their bottom x instead; without the tolerance
-                // rounding noise could put them in the wrong order with a
-                // crossing too close to the top to split on.
-                sort_strip(&mut strip);
-                // Neighbours that swap order between top and bottom cross
-                // inside the strip: split at the highest crossing and redo.
-                if splits < MAX_CROSSING_SPLITS_PER_ROW {
-                    let mut first_cross: Option<f32> = None;
-                    for pair in strip.windows(2) {
-                        let (p, q) = (&pair[0], &pair[1]);
-                        if p.xb > q.xb + 1e-5 {
-                            let da = q.xa - p.xa; // ≥ 0 by the sort
-                            let db = p.xb - q.xb; // > 0 by the test
-                            let t = da / (da + db);
-                            let yc = ya + t * h;
-                            if yc > ya + 1e-6 && yc < yb - 1e-6 {
-                                first_cross = Some(first_cross.map_or(yc, |c: f32| c.min(yc)));
-                            }
-                        }
-                    }
-                    if let Some(yc) = first_cross {
-                        events.insert(i + 1, yc);
-                        splits += 1;
+                sc.clear();
+                for &(ci, cur) in &active {
+                    let c = &chains[ci as usize];
+                    if !(c.y_top <= ya && c.y_bot >= yb) {
                         continue;
                     }
+                    let mut i = cur as usize;
+                    while i + 2 < c.end as usize && self.pts[i + 1].1 <= ya {
+                        i += 1;
+                    }
+                    let seg = i;
+                    let xa = self.x_at(i, ya);
+                    let (mut x_min, mut x_max) = (xa, xa);
+                    while i + 2 < c.end as usize && self.pts[i + 1].1 < yb {
+                        let x = self.pts[i + 1].0;
+                        x_min = x_min.min(x);
+                        x_max = x_max.max(x);
+                        i += 1;
+                    }
+                    let xb = self.x_at(i, yb);
+                    x_min = x_min.min(xb);
+                    x_max = x_max.max(xb);
+                    sc.push(StripChain {
+                        xa,
+                        xb,
+                        x_min,
+                        x_max,
+                        winding: c.winding,
+                        seg: seg as u32,
+                        end: c.end,
+                    });
                 }
-                // Fill-rule span walk over the ordered strip edges.
-                match fill_rule {
-                    FillRule::EvenOdd => {
-                        let mut k = 0;
-                        while k + 1 < strip.len() {
-                            accumulate_trapezoid(
-                                &mut area,
-                                &mut run,
-                                &mut touched,
-                                w,
-                                h,
-                                &strip[k],
-                                &strip[k + 1],
-                            );
-                            k += 2;
+                if sc.len() < 2 {
+                    continue;
+                }
+                sort_strip(&mut sc);
+                // Independent clusters: consecutive chains separated by
+                // an x gap with zero winding between them. Each cluster
+                // starts and ends outside, so it can be integrated on its
+                // own — a crossing only costs the cluster it lies in.
+                let mut ca = 0usize;
+                while ca < sc.len() {
+                    let mut cb = ca;
+                    let mut wind = 0i32;
+                    let mut reach = f32::NEG_INFINITY;
+                    let mut ordered = true;
+                    loop {
+                        wind += sc[cb].winding;
+                        reach = reach.max(sc[cb].x_max);
+                        if cb + 1 == sc.len() {
+                            break;
+                        }
+                        let next = &sc[cb + 1];
+                        if wind == 0 && reach <= next.x_min {
+                            break;
+                        }
+                        if ordered
+                            && sc[cb].x_max > next.x_min
+                            && self.first_crossing(&sc[cb], next, ya, yb).is_some()
+                        {
+                            ordered = false;
+                        }
+                        cb += 1;
+                    }
+                    let cluster = &sc[ca..=cb];
+                    ca = cb + 1;
+                    if cluster.len() < 2 {
+                        continue;
+                    }
+                    if ordered {
+                        self.integrate_chains(
+                            cluster,
+                            fill_rule,
+                            ya,
+                            yb,
+                            &mut area,
+                            &mut run,
+                            &mut touched,
+                            w,
+                        );
+                        continue;
+                    }
+                    // Crossing chains: subdivide at every vertex inside
+                    // the strip (and at every crossing), then integrate
+                    // straight edges.
+                    sub.clear();
+                    sub.push(ya);
+                    for c in cluster {
+                        let mut i = c.seg as usize;
+                        while i + 2 < c.end as usize && self.pts[i + 1].1 < yb {
+                            sub.push(self.pts[i + 1].1);
+                            i += 1;
                         }
                     }
-                    FillRule::NonZero => {
-                        let mut winding = 0i32;
-                        for k in 0..strip.len() - 1 {
-                            winding += strip[k].winding;
-                            if winding != 0 {
-                                accumulate_trapezoid(
-                                    &mut area,
-                                    &mut run,
-                                    &mut touched,
-                                    w,
-                                    h,
-                                    &strip[k],
-                                    &strip[k + 1],
-                                );
+                    sub.push(yb);
+                    sub.sort_unstable_by(f32::total_cmp);
+                    sub.dedup();
+                    let mut k = 0usize;
+                    while k + 1 < sub.len() {
+                        let (sa, sb) = (sub[k], sub[k + 1]);
+                        let sh = sb - sa;
+                        if sh <= 1e-7 {
+                            k += 1;
+                            continue;
+                        }
+                        strip.clear();
+                        for c in cluster {
+                            let mut i = c.seg as usize;
+                            while i + 2 < c.end as usize && self.pts[i + 1].1 <= sa {
+                                i += 1;
+                            }
+                            strip.push(StripEdge {
+                                xa: self.x_at(i, sa),
+                                xb: self.x_at(i, sb),
+                                winding: c.winding,
+                            });
+                        }
+                        sort_strip(&mut strip);
+                        // Neighbours that swap order between top and
+                        // bottom cross inside: split at the highest
+                        // crossing, redo.
+                        if splits < MAX_CROSSING_SPLITS_PER_ROW {
+                            let mut first_cross: Option<f32> = None;
+                            for pair in strip.windows(2) {
+                                let (p, q) = (&pair[0], &pair[1]);
+                                if p.xb > q.xb + 1e-5 {
+                                    let da = q.xa - p.xa; // ≥ 0 by the sort
+                                    let db = p.xb - q.xb; // > 0 by the test
+                                    let t = da / (da + db);
+                                    let yc = sa + t * sh;
+                                    if yc > sa + 1e-6 && yc < sb - 1e-6 {
+                                        first_cross =
+                                            Some(first_cross.map_or(yc, |c: f32| c.min(yc)));
+                                    }
+                                }
+                            }
+                            if let Some(yc) = first_cross {
+                                sub.insert(k + 1, yc);
+                                splits += 1;
+                                continue;
                             }
                         }
+                        integrate_edges(
+                            &strip,
+                            fill_rule,
+                            sh,
+                            &mut area,
+                            &mut run,
+                            &mut touched,
+                            w,
+                        );
+                        k += 1;
                     }
                 }
-                i += 1;
             }
 
             if touched.lo > touched.hi {
@@ -951,6 +1176,235 @@ impl EdgeTable {
             emit(self.win.y0 + py, self.win.x0 + lo as u32, &out_row[lo..=hi]);
         }
     }
+
+    /// The first height in `(ya, yb]` where chain `r` (sorted right of
+    /// `l` at the strip top) passes left of `l`, or `None` when it
+    /// never does. Their x difference is piecewise linear with
+    /// breakpoints at the two chains' vertices, so it is examined
+    /// there and the crossing interpolated inside the first interval
+    /// that ends negative.
+    fn first_crossing(&self, l: &StripChain, r: &StripChain, ya: f32, yb: f32) -> Option<f32> {
+        const EPS: f32 = 1e-5;
+        let (mut il, mut ir) = (l.seg as usize, r.seg as usize);
+        let (mut y_prev, mut d_prev) = (ya, r.xa - l.xa);
+        loop {
+            let nl = (il + 2 < l.end as usize && self.pts[il + 1].1 < yb).then(|| self.pts[il + 1]);
+            let nr = (ir + 2 < r.end as usize && self.pts[ir + 1].1 < yb).then(|| self.pts[ir + 1]);
+            let (y, d) = match (nl, nr) {
+                (None, None) => (yb, r.xb - l.xb),
+                (Some(p), q) if q.is_none_or(|q| p.1 <= q.1) => {
+                    let d = self.x_at(ir, p.1) - p.0;
+                    il += 1;
+                    (p.1, d)
+                }
+                (_, Some(q)) => {
+                    let d = q.0 - self.x_at(il, q.1);
+                    ir += 1;
+                    (q.1, d)
+                }
+                _ => unreachable!(),
+            };
+            if d < -EPS {
+                let t = if d_prev > 0.0 {
+                    d_prev / (d_prev - d)
+                } else {
+                    0.0
+                };
+                return Some(y_prev + (y - y_prev) * t);
+            }
+            if y >= yb {
+                return None;
+            }
+            y_prev = y;
+            d_prev = d;
+        }
+    }
+
+    /// Fast-path strip integration over chains in a fixed order (see
+    /// [`Self::scan`]).
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    fn integrate_chains(
+        &self,
+        sc: &[StripChain],
+        fill_rule: FillRule,
+        ya: f32,
+        yb: f32,
+        area: &mut [f32],
+        run: &mut [f32],
+        touched: &mut Touched,
+        w: usize,
+    ) {
+        // Coefficients s_k, and the leftmost cell any boundary with a
+        // non-zero coefficient touches (the common start of every
+        // "fully left of the boundary" run; they cancel to the left
+        // of it because Σ s_k = 0 over a closed strip).
+        let mut winding = 0i32;
+        let mut inside_prev = false;
+        let mut l0 = f32::INFINITY;
+        let mut coef = [0i8; 64];
+        let many = sc.len() > coef.len();
+        for (k, c) in sc.iter().enumerate() {
+            winding += c.winding;
+            let inside = match fill_rule {
+                FillRule::NonZero => winding != 0,
+                FillRule::EvenOdd => winding & 1 != 0,
+            };
+            let s = inside_prev as i8 - inside as i8;
+            if !many {
+                coef[k] = s;
+            }
+            if s != 0 {
+                l0 = l0.min(c.x_min);
+            }
+            inside_prev = inside;
+        }
+        if !l0.is_finite() {
+            return;
+        }
+        let wf = w as f32;
+        let l0 = l0.floor().clamp(0.0, wf) as usize;
+        let mut winding = 0i32;
+        let mut inside_prev = false;
+        for (k, c) in sc.iter().enumerate() {
+            let s = if many {
+                winding += c.winding;
+                let inside = match fill_rule {
+                    FillRule::NonZero => winding != 0,
+                    FillRule::EvenOdd => winding & 1 != 0,
+                };
+                let s = inside_prev as i8 - inside as i8;
+                inside_prev = inside;
+                s
+            } else {
+                coef[k]
+            };
+            if s == 0 {
+                continue;
+            }
+            let sf = s as f32;
+            // Walk the chain's straight pieces inside [ya, yb].
+            let mut i = c.seg as usize;
+            let mut y0 = ya;
+            let mut x0 = c.xa;
+            loop {
+                let last = i + 2 >= c.end as usize || self.pts[i + 1].1 >= yb;
+                let (y1, x1) = if last {
+                    (yb, c.xb)
+                } else {
+                    (self.pts[i + 1].1, self.pts[i + 1].0)
+                };
+                let hp = y1 - y0;
+                if hp > 0.0 {
+                    accumulate_line(area, run, touched, wf, l0, sf * hp, x0, x1);
+                }
+                if last {
+                    break;
+                }
+                y0 = y1;
+                x0 = x1;
+                i += 1;
+            }
+        }
+    }
+}
+
+/// Add `±(area of each cell left of the line x0 → x1)` for one straight
+/// boundary piece of signed height `sh` (`s · h`): cells fully left of
+/// the line through the run difference array starting at `l0`, the
+/// cells the line crosses in closed form.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn accumulate_line(
+    area: &mut [f32],
+    run: &mut [f32],
+    touched: &mut Touched,
+    wf: f32,
+    l0: usize,
+    sh: f32,
+    x0: f32,
+    x1: f32,
+) {
+    let (lo, hi) = if x0 <= x1 { (x0, x1) } else { (x1, x0) };
+    let b0 = (lo.floor().clamp(0.0, wf) as usize).max(l0);
+    let b1 = (hi.ceil().clamp(0.0, wf) as usize).max(b0);
+    if b0 > l0 {
+        run[l0] += sh;
+        run[b0] -= sh;
+    }
+    let d = x1 - x0;
+    if d.abs() < 1e-6 {
+        for (c, a) in area[b0..b1].iter_mut().enumerate() {
+            *a += sh * (x0 - (b0 + c) as f32).clamp(0.0, 1.0);
+        }
+    } else {
+        let inv = sh / d;
+        for (c, a) in area[b0..b1].iter_mut().enumerate() {
+            let cf = (b0 + c) as f32;
+            *a += inv * (clamp_integral(x1, cf) - clamp_integral(x0, cf));
+        }
+    }
+    touched.add(l0, b1.max(b0));
+}
+
+/// Fill-rule span walk over ordered straight strip edges (the
+/// subdivided path of [`EdgeTable::scan`]).
+#[inline]
+fn integrate_edges(
+    strip: &[StripEdge],
+    fill_rule: FillRule,
+    h: f32,
+    area: &mut [f32],
+    run: &mut [f32],
+    touched: &mut Touched,
+    w: usize,
+) {
+    match fill_rule {
+        FillRule::EvenOdd => {
+            let mut k = 0;
+            while k + 1 < strip.len() {
+                accumulate_trapezoid(area, run, touched, w, h, &strip[k], &strip[k + 1]);
+                k += 2;
+            }
+        }
+        FillRule::NonZero => {
+            let mut winding = 0i32;
+            for k in 0..strip.len() - 1 {
+                winding += strip[k].winding;
+                if winding != 0 {
+                    accumulate_trapezoid(area, run, touched, w, h, &strip[k], &strip[k + 1]);
+                }
+            }
+        }
+    }
+}
+
+/// x-ordering keys for [`sort_strip`].
+trait StripOrder {
+    fn top_x(&self) -> f32;
+    fn bot_x(&self) -> f32;
+}
+
+impl StripOrder for StripEdge {
+    #[inline(always)]
+    fn top_x(&self) -> f32 {
+        self.xa
+    }
+    #[inline(always)]
+    fn bot_x(&self) -> f32 {
+        self.xb
+    }
+}
+
+impl StripOrder for StripChain {
+    #[inline(always)]
+    fn top_x(&self) -> f32 {
+        self.xa
+    }
+    #[inline(always)]
+    fn bot_x(&self) -> f32 {
+        self.xb
+    }
 }
 
 /// Sort a strip's edges left to right (see the call site).
@@ -961,8 +1415,8 @@ impl EdgeTable {
 /// neighbours whose top `x` values chain within [`COINCIDENT_EPS`] by
 /// their bottom `x`.
 #[inline]
-fn sort_strip(strip: &mut [StripEdge]) {
-    fn insertion_by(s: &mut [StripEdge], key: impl Fn(&StripEdge) -> f32) {
+fn sort_strip<T: StripOrder>(strip: &mut [T]) {
+    fn insertion_by<T>(s: &mut [T], key: impl Fn(&T) -> f32) {
         for i in 1..s.len() {
             let mut j = i;
             while j > 0 && key(&s[j]) < key(&s[j - 1]) {
@@ -974,22 +1428,22 @@ fn sort_strip(strip: &mut [StripEdge]) {
     // Strips are short and usually already ordered from the previous
     // strip, so a straight insertion sort is the fast path.
     if strip.len() <= 24 {
-        insertion_by(strip, |e| e.xa);
+        insertion_by(strip, |e| e.top_x());
     } else {
-        strip.sort_unstable_by(|p, q| p.xa.total_cmp(&q.xa));
+        strip.sort_unstable_by(|p, q| p.top_x().total_cmp(&q.top_x()));
     }
     let n = strip.len();
     let mut i = 0;
     while i < n {
         let mut j = i + 1;
-        while j < n && strip[j].xa - strip[j - 1].xa <= COINCIDENT_EPS {
+        while j < n && strip[j].top_x() - strip[j - 1].top_x() <= COINCIDENT_EPS {
             j += 1;
         }
         if j - i > 1 {
             if j - i <= 24 {
-                insertion_by(&mut strip[i..j], |e| e.xb);
+                insertion_by(&mut strip[i..j], |e| e.bot_x());
             } else {
-                strip[i..j].sort_unstable_by(|p, q| p.xb.total_cmp(&q.xb));
+                strip[i..j].sort_unstable_by(|p, q| p.bot_x().total_cmp(&q.bot_x()));
             }
         }
         i = j;
@@ -1659,6 +2113,44 @@ mod tests {
                     rule,
                     &format!("case {case} {rule:?}"),
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn analytic_many_vertex_chains_match_point_sampling() {
+        // Wiggly closed curves with dozens of vertices per row band
+        // (long y-monotone chains), self-overlapping and mutually
+        // crossing: exercises the chain fast path, its crossing test
+        // and the subdivided fallback.
+        let mut seed = 0x51_7E_u64;
+        let mut next = move || -> f32 {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 40) as f32 / (1u64 << 24) as f32
+        };
+        for case in 0..6 {
+            let mut cs = Vec::new();
+            for k in 0..2 {
+                let (cx, cy) = (8.0 + 8.0 * next(), 8.0 + 8.0 * next());
+                let r = 5.0 + 6.0 * next();
+                let wob = 0.5 + 3.0 * next();
+                let freq = (3 + (case + k) % 6) as f32;
+                let pts = (0..96)
+                    .map(|i| {
+                        let a = std::f32::consts::TAU * i as f32 / 96.0;
+                        let rr = r + wob * (freq * a).sin();
+                        (cx + rr * a.cos(), cy + rr * a.sin() * 0.8)
+                    })
+                    .collect();
+                cs.push(FlatContour {
+                    points: pts,
+                    closed: true,
+                });
+            }
+            for rule in [FillRule::NonZero, FillRule::EvenOdd] {
+                assert_matches_point_sampling(&cs, rule, &format!("case {case} {rule:?}"));
             }
         }
     }
