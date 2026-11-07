@@ -98,6 +98,28 @@ pub struct Renderer {
     /// [`GradientDither::Ordered`] trades a fixed ±½-level texture for
     /// banding-free wide, low-contrast ramps.
     pub gradient_dither: GradientDither,
+    /// Whole-scene supersampling factor per axis for
+    /// [`Renderer::render`] (`1`, the default, disables it; values are
+    /// clamped to `1..=8`).
+    ///
+    /// Per-shape anti-aliasing composites each shape's edge coverage
+    /// independently, so two shapes that share an edge let the
+    /// background bleed through the seam (*conflation*: two 50 %
+    /// coverages leave 25 % of the background). Rendering the scene at
+    /// `k×` and averaging `k × k` blocks bounds that bleed by `1/(4k)`
+    /// of the background (`k = 4`: ≤ 6 %, against up to 25 %), at
+    /// `k²` the time and memory.
+    pub scene_supersampling: u8,
+    /// Colour space of source-over compositing for painted paths,
+    /// strokes, images and patterns (with [`BlendMode::Normal`]).
+    /// Defaults to [`InterpolationSpace::Srgb`] — the SVG / CSS model,
+    /// where anti-aliased edges and translucent paints mix encoded sRGB
+    /// values. [`InterpolationSpace::LinearRgb`] mixes linear light
+    /// instead: edges keep their perceived weight (black text on white
+    /// no longer looks heavier than white on black) and translucent
+    /// colours blend like light. Group-opacity, soft-mask and cached
+    /// bitmap blits and non-normal blend modes stay in sRGB.
+    pub compositing_space: InterpolationSpace,
     /// Worker budget for internal parallelism (row bands of large
     /// shapes). `1` (the default) renders serially; set it through
     /// [`Renderer::with_execution_context`]. Output bytes never depend
@@ -179,6 +201,9 @@ pub enum ImageFilter {
     BSpline,
 }
 
+/// Largest [`Renderer::scene_supersampling`] factor.
+const MAX_SCENE_SUPERSAMPLING: u8 = 8;
+
 /// Paints one coverage row: `(dst, y, x0, coverage, scratch)`, `dst`
 /// being the RGBA bytes of device pixels `x0 .. x0 + coverage.len()` on
 /// row `y`.
@@ -212,6 +237,8 @@ impl Renderer {
             blend_mode: BlendMode::default(),
             preserve_aspect_ratio: PreserveAspectRatio::default(),
             gradient_dither: GradientDither::default(),
+            compositing_space: InterpolationSpace::default(),
+            scene_supersampling: 1,
             threads: 1,
             cache: SharedCache::with_capacity(DEFAULT_CACHE_CAPACITY),
         }
@@ -303,11 +330,53 @@ impl Renderer {
         } else {
             Transform2D::identity()
         };
-        self.draw_group(&frame.root, initial, 1.0, &mut buf, stride, None);
+        let k = self.scene_supersampling.clamp(1, MAX_SCENE_SUPERSAMPLING) as u32;
+        if k > 1 {
+            // Render the whole scene at k× in both axes, then box-filter
+            // it down in premultiplied space.
+            let mut big = self.clone();
+            big.width = self.width * k;
+            big.height = self.height * k;
+            big.scene_supersampling = 1;
+            let big_stride = big.width as usize * 4;
+            let mut hi = vec![0u8; big_stride * big.height as usize];
+            if self.background.a != 0 {
+                let bg = [
+                    self.background.r,
+                    self.background.g,
+                    self.background.b,
+                    self.background.a,
+                ];
+                for px in hi.as_chunks_mut::<4>().0 {
+                    *px = bg;
+                }
+            }
+            let up = Transform2D::scale(k as f32, k as f32).compose(&initial);
+            big.draw_group(&frame.root, up, 1.0, &mut hi, big_stride, None);
+            downsample_premultiplied(
+                &hi,
+                big_stride,
+                k,
+                &mut buf,
+                stride,
+                self.width,
+                self.height,
+            );
+        } else {
+            self.draw_group(&frame.root, initial, 1.0, &mut buf, stride, None);
+        }
         VideoFrame {
             pts: frame.pts,
             planes: vec![VideoPlane { stride, data: buf }],
         }
+    }
+
+    /// Render whole scenes at `k×` resolution per axis (clamped to
+    /// `1..=8`) and box-filter down (builder form of the
+    /// [`Renderer::scene_supersampling`] field).
+    pub fn with_scene_supersampling(mut self, k: u8) -> Self {
+        self.scene_supersampling = k.clamp(1, MAX_SCENE_SUPERSAMPLING);
+        self
     }
 
     /// Adopt the caller's thread budget (`oxideav-core`'s threading
@@ -317,6 +386,13 @@ impl Renderer {
     /// byte-identical to the serial render.
     pub fn with_execution_context(mut self, ctx: &ExecutionContext) -> Self {
         self.threads = ctx.effective_workers(usize::MAX).max(1);
+        self
+    }
+
+    /// Select the compositing space (builder form of the
+    /// [`Renderer::compositing_space`] field).
+    pub fn with_compositing_space(mut self, space: InterpolationSpace) -> Self {
+        self.compositing_space = space;
         self
     }
 
@@ -857,9 +933,10 @@ impl Renderer {
             return;
         }
         let blend = self.blend_mode;
+        let linear = matches!(self.compositing_space, InterpolationSpace::LinearRgb);
         match paint {
             Paint::Solid(c) if blend.is_normal() => {
-                let src = SolidSource::new(*c, extra_q);
+                let src = SolidSource::new_in(*c, extra_q, linear);
                 self.paint_rows(
                     buf,
                     stride,
@@ -878,7 +955,7 @@ impl Renderer {
                     fill_rule,
                     clip,
                     &|dst, y, x0, cov, _| {
-                        composite_row(dst, cov, x0, y, extra_q, blend, &mut |_, _| c)
+                        composite_row(dst, cov, x0, y, extra_q, blend, linear, &mut |_, _| c)
                     },
                 );
             }
@@ -901,7 +978,7 @@ impl Renderer {
                         clip,
                         &|dst, y, x0, cov, colors| {
                             rows.row(y, x0, cov.len(), colors);
-                            composite_row(dst, cov, x0, y, extra_q, blend, &mut |x, _| {
+                            composite_row(dst, cov, x0, y, extra_q, blend, linear, &mut |x, _| {
                                 colors[(x - x0) as usize]
                             });
                         },
@@ -915,7 +992,7 @@ impl Renderer {
                     fill_rule,
                     clip,
                     &|dst, y, x0, cov, _| {
-                        composite_row(dst, cov, x0, y, extra_q, blend, &mut |x, y| {
+                        composite_row(dst, cov, x0, y, extra_q, blend, linear, &mut |x, y| {
                             let p = inv.apply(Point::new(x as f32 + 0.5, y as f32 + 0.5));
                             sample_paint_in(other, p.x, p.y, space)
                         })
@@ -992,6 +1069,7 @@ impl Renderer {
             &mask,
             group_opacity,
             blend,
+            matches!(self.compositing_space, InterpolationSpace::LinearRgb),
             (bx0, by0, bx1, by1),
             move |x, y| {
                 let user = inv.apply(oxideav_core::Point::new(x as f32 + 0.5, y as f32 + 0.5));
@@ -1107,6 +1185,7 @@ impl Renderer {
                     mask,
                     group_opacity,
                     blend,
+                    matches!(self.compositing_space, InterpolationSpace::LinearRgb),
                     rect,
                     move |x, y| {
                         let (Some(px), Some(py)) =
@@ -1258,6 +1337,7 @@ impl Renderer {
             mask,
             group_opacity,
             self.blend_mode,
+            matches!(self.compositing_space, InterpolationSpace::LinearRgb),
             rect,
             move |x, y| {
                 let (Some((cpos, cw)), Some((rpos, rw))) =
@@ -1388,6 +1468,7 @@ impl Renderer {
             mask,
             group_opacity,
             self.blend_mode,
+            matches!(self.compositing_space, InterpolationSpace::LinearRgb),
             rect,
             |x, y| sampler.sample(x as f32 + 0.5, y as f32 + 0.5),
         );
@@ -1527,6 +1608,7 @@ impl Renderer {
                     mask,
                     group_opacity,
                     blend,
+                    matches!(self.compositing_space, InterpolationSpace::LinearRgb),
                     rect,
                     move |x, y| {
                         let px = cols[(x - rx0) as usize];
@@ -1550,6 +1632,7 @@ impl Renderer {
                     mask,
                     group_opacity,
                     blend,
+                    matches!(self.compositing_space, InterpolationSpace::LinearRgb),
                     rect,
                     move |x, y| {
                         crate::pattern::sample_tile_bilinear_taps(
@@ -1571,6 +1654,7 @@ impl Renderer {
             mask,
             group_opacity,
             blend,
+            matches!(self.compositing_space, InterpolationSpace::LinearRgb),
             rect,
             move |x, y| {
                 let q = inv.apply(oxideav_core::Point::new(x as f32 + 0.5, y as f32 + 0.5));
@@ -1753,6 +1837,46 @@ fn build_stroke_geometry(
         }
     }
     out
+}
+
+/// Average `k × k` blocks of the straight-alpha RGBA image `hi` into
+/// `out` (`width × height`), weighting colours by alpha (a
+/// premultiplied box filter), rounding to nearest.
+fn downsample_premultiplied(
+    hi: &[u8],
+    hi_stride: usize,
+    k: u32,
+    out: &mut [u8],
+    stride: usize,
+    width: u32,
+    height: u32,
+) {
+    let n = k * k;
+    for y in 0..height {
+        for x in 0..width {
+            let (mut sr, mut sg, mut sb, mut sa) = (0u32, 0u32, 0u32, 0u32);
+            for dy in 0..k {
+                let row = (y * k + dy) as usize * hi_stride;
+                for dx in 0..k {
+                    let i = row + (x * k + dx) as usize * 4;
+                    let a = hi[i + 3] as u32;
+                    sr += hi[i] as u32 * a;
+                    sg += hi[i + 1] as u32 * a;
+                    sb += hi[i + 2] as u32 * a;
+                    sa += a;
+                }
+            }
+            let o = y as usize * stride + x as usize * 4;
+            if sa == 0 {
+                out[o..o + 4].fill(0);
+                continue;
+            }
+            out[o] = ((sr + sa / 2) / sa) as u8;
+            out[o + 1] = ((sg + sa / 2) / sa) as u8;
+            out[o + 2] = ((sb + sa / 2) / sa) as u8;
+            out[o + 3] = ((sa + n / 2) / n) as u8;
+        }
+    }
 }
 
 /// Blit a packed straight-alpha RGBA source buffer over an RGBA

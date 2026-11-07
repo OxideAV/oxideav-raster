@@ -81,11 +81,11 @@ fn threshold(dither: GradientDither, x: u32, y: u32) -> f32 {
     }
 }
 
-const ENCODE_INTERVALS: usize = 4096;
+pub(crate) const ENCODE_INTERVALS: usize = 4096;
 
 /// sRGB encoding (scaled to 0..255) of linear light at
 /// `i / ENCODE_INTERVALS`.
-fn encode_table() -> &'static [f32; ENCODE_INTERVALS + 1] {
+pub(crate) fn encode_table() -> &'static [f32; ENCODE_INTERVALS + 1] {
     static T: std::sync::OnceLock<Box<[f32; ENCODE_INTERVALS + 1]>> = std::sync::OnceLock::new();
     T.get_or_init(|| {
         let mut t = Box::new([0f32; ENCODE_INTERVALS + 1]);
@@ -103,7 +103,7 @@ fn encode_table() -> &'static [f32; ENCODE_INTERVALS + 1] {
 }
 
 #[inline(always)]
-fn encode_linear(table: &[f32; ENCODE_INTERVALS + 1], c: f32) -> f32 {
+pub(crate) fn encode_linear(table: &[f32; ENCODE_INTERVALS + 1], c: f32) -> f32 {
     let x = c.clamp(0.0, 1.0) * ENCODE_INTERVALS as f32;
     let i = (x as usize).min(ENCODE_INTERVALS - 1);
     let f = x - i as f32;

@@ -121,6 +121,40 @@ pub(crate) fn composite_rgba_premultiplied_blend_rect(
     rect: (u32, u32, u32, u32),
     mut paint_at: impl FnMut(u32, u32) -> Rgba,
 ) {
+    composite_rect_in(
+        dst,
+        dst_stride,
+        dst_width,
+        dst_height,
+        mask,
+        offset_x,
+        offset_y,
+        extra_alpha,
+        blend,
+        false,
+        rect,
+        &mut paint_at,
+    )
+}
+
+/// [`composite_rgba_premultiplied_blend_rect`] with a choice of
+/// compositing space (`linear`: source-over in linear light, see
+/// [`composite_row`]).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn composite_rect_in(
+    dst: &mut [u8],
+    dst_stride: usize,
+    dst_width: u32,
+    dst_height: u32,
+    mask: &AlphaMask,
+    offset_x: i32,
+    offset_y: i32,
+    extra_alpha: f32,
+    blend: BlendMode,
+    linear: bool,
+    rect: (u32, u32, u32, u32),
+    mut paint_at: impl FnMut(u32, u32) -> Rgba,
+) {
     if mask.is_empty() {
         return;
     }
@@ -159,6 +193,7 @@ pub(crate) fn composite_rgba_premultiplied_blend_rect(
             dy as u32,
             extra_q,
             blend,
+            linear,
             &mut paint_at,
         );
     }
@@ -224,8 +259,41 @@ fn over_px(px: &mut [u8], sr: u32, sg: u32, sb: u32, sa: u32) {
     px[3] = oa.min(255) as u8;
 }
 
+/// sRGB byte → linear light.
+fn decode_table() -> &'static [f32; 256] {
+    static T: std::sync::OnceLock<[f32; 256]> = std::sync::OnceLock::new();
+    T.get_or_init(|| std::array::from_fn(|i| crate::gradient::srgb_to_linear(i as u8)))
+}
+
+/// Linear-light source-over of `src` with folded alpha `sa ∈ 1..=254`.
+#[inline]
+fn over_px_linear(px: &mut [u8], src: Rgba, sa: u32) {
+    let dec = decode_table();
+    let enc = crate::gradient_row::encode_table();
+    let a_s = sa as f32 / 255.0;
+    let a_d = px[3] as f32 / 255.0;
+    let inv = 1.0 - a_s;
+    let a_o = a_s + a_d * inv;
+    let mix = |s: u8, d: u8| -> u8 {
+        let v = (dec[s as usize] * a_s + dec[d as usize] * a_d * inv) / a_o;
+        (crate::gradient_row::encode_linear(enc, v) + 0.5) as u8
+    };
+    px[0] = mix(src.r, px[0]);
+    px[1] = mix(src.g, px[1]);
+    px[2] = mix(src.b, px[2]);
+    px[3] = (a_o * 255.0 + 0.5) as u8;
+}
+
 /// Composite one row: `dst` holds `cov.len()` packed RGBA pixels
 /// starting at device column `x0` of device row `y`.
+///
+/// With `linear` (and [`BlendMode::Normal`]) source-over is evaluated
+/// on linear-light values (IEC 61966-2-1 decode of both colours,
+/// premultiplied mix in `f32`, re-encode rounding to nearest): an
+/// anti-aliased edge or a translucent paint then mixes *light*, so a
+/// half-covered black-on-white pixel reads as half the luminance
+/// (sRGB 188) instead of the darker sRGB-space mix (128).
+#[allow(clippy::too_many_arguments)]
 #[inline]
 pub(crate) fn composite_row(
     dst: &mut [u8],
@@ -234,6 +302,7 @@ pub(crate) fn composite_row(
     y: u32,
     extra_q: u32,
     blend: BlendMode,
+    linear: bool,
     paint_at: &mut impl FnMut(u32, u32) -> Rgba,
 ) {
     for (k, (&c, px)) in cov.iter().zip(dst.as_chunks_mut::<4>().0).enumerate() {
@@ -254,6 +323,10 @@ pub(crate) fn composite_row(
                 continue;
             }
             let sa = combined;
+            if linear {
+                over_px_linear(px, src, sa);
+                continue;
+            }
             over_px(
                 px,
                 div255(src.r as u32 * sa),
@@ -279,12 +352,15 @@ pub(crate) fn composite_row(
 /// (bit-identical to evaluating them per pixel).
 pub(crate) struct SolidSource {
     color: Rgba,
+    linear: bool,
     /// `[sa, sr, sg, sb]` per coverage value.
     lut: [[u8; 4]; 256],
 }
 
 impl SolidSource {
-    pub(crate) fn new(color: Rgba, extra_q: u32) -> Self {
+    /// Prepare `color` at group opacity `extra_q / 255`, compositing in
+    /// linear light when `linear` (see [`composite_row`]).
+    pub(crate) fn new_in(color: Rgba, extra_q: u32, linear: bool) -> Self {
         let mut lut = [[0u8; 4]; 256];
         for (c, e) in lut.iter_mut().enumerate() {
             let sa = ((color.a as u32) * (c as u32) * extra_q + (255 * 255 / 2)) / (255 * 255);
@@ -295,7 +371,7 @@ impl SolidSource {
                 div255(color.b as u32 * sa) as u8,
             ];
         }
-        SolidSource { color, lut }
+        SolidSource { color, linear, lut }
     }
 
     /// Source-over one row (same contract as [`composite_row`] with a
@@ -324,6 +400,8 @@ impl SolidSource {
                 let [sa, sr, sg, sb] = self.lut[c as usize];
                 if sa == 255 {
                     dst[k * 4..k * 4 + 4].copy_from_slice(&opaque);
+                } else if sa != 0 && self.linear {
+                    over_px_linear(&mut dst[k * 4..k * 4 + 4], self.color, sa as u32);
                 } else if sa != 0 {
                     over_px(
                         &mut dst[k * 4..k * 4 + 4],
@@ -351,6 +429,7 @@ pub(crate) fn composite_coverage_rect(
     cov: &Coverage,
     extra_alpha: f32,
     blend: BlendMode,
+    linear: bool,
     rect: (u32, u32, u32, u32),
     paint_at: impl FnMut(u32, u32) -> Rgba,
 ) {
@@ -361,7 +440,7 @@ pub(crate) fn composite_coverage_rect(
     if rx1 < cov.x0 || ry1 < cov.y0 {
         return;
     }
-    composite_rgba_premultiplied_blend_rect(
+    composite_rect_in(
         dst,
         dst_stride,
         dst_width,
@@ -371,6 +450,7 @@ pub(crate) fn composite_coverage_rect(
         cov.y0 as i32,
         extra_alpha,
         blend,
+        linear,
         (
             rx0.saturating_sub(cov.x0),
             ry0.saturating_sub(cov.y0),
@@ -473,19 +553,22 @@ mod tests {
                 })
                 .collect();
             let dst: Vec<u8> = (0..97 * 4).map(|_| next()).collect();
-            let mut a = dst.clone();
-            let mut b = dst;
-            SolidSource::new(color, extra_q).over_row(&mut a, &cov);
-            composite_row(
-                &mut b,
-                &cov,
-                0,
-                0,
-                extra_q,
-                BlendMode::Normal,
-                &mut |_, _| color,
-            );
-            assert_eq!(a, b, "case {case}");
+            for linear in [false, true] {
+                let mut a = dst.clone();
+                let mut b = dst.clone();
+                SolidSource::new_in(color, extra_q, linear).over_row(&mut a, &cov);
+                composite_row(
+                    &mut b,
+                    &cov,
+                    0,
+                    0,
+                    extra_q,
+                    BlendMode::Normal,
+                    linear,
+                    &mut |_, _| color,
+                );
+                assert_eq!(a, b, "case {case} linear={linear}");
+            }
         }
     }
 
