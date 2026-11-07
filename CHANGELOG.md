@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.4](https://github.com/OxideAV/oxideav-raster/compare/v0.1.3...v0.1.4) - 2026-10-24
+
+### Added
+
+- *(gradient)* GradientPaint with gradientUnits + gradientTransform ([#6](https://github.com/OxideAV/oxideav-raster/pull/6))
+- *(fill)* exact-area anti-aliasing kernel, new default ([#6](https://github.com/OxideAV/oxideav-raster/pull/6))
+
+### Fixed
+
+- *(gradient)* sample gradient paints through the inverse CTM ([#6](https://github.com/OxideAV/oxideav-raster/pull/6))
+
+### Other
+
+- *(gradient)* pin the oxideav-svg local-space paint contract ([#6](https://github.com/OxideAV/oxideav-raster/pull/6))
+- edition 2024, MSRV 1.95
+- README examples use the current registry API
+
 ### Added
 
 - `GradientPaint` (#6): a gradient paint server with its own coordinate
