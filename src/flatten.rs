@@ -37,6 +37,9 @@ pub(crate) const FLATTEN_TOLERANCE_PX: f64 = 1.0 / 32.0;
 /// halves be culled.
 const MAX_UNIFORM_SEGMENTS: u32 = 16;
 
+/// Work bound for one curve (see [`flatten_cubic`]).
+const MAX_SEGMENTS_PER_CURVE: f64 = 65_536.0;
+
 /// Hard cap on subdivision depth — protects against pathological
 /// control points (and bounds the work for astronomically large
 /// on-canvas curves).
@@ -334,18 +337,45 @@ fn flatten_cubic(
             return;
         }
     }
-    let tol = opts.tolerance.max(1e-6);
+    let mut tol = opts.tolerance.max(1e-6);
     let d1 = hypot64(p0.0 - 2.0 * p1.0 + p2.0, p0.1 - 2.0 * p1.1 + p2.1);
     let d2 = hypot64(p1.0 - 2.0 * p2.0 + p3.0, p1.1 - 2.0 * p2.1 + p3.1);
     let m = d1.max(d2);
-    let mut n = (0.75 * m / tol).sqrt().ceil();
-    if opts.stroke_half > 0.0 {
-        let total_turn = turn(p0, p1, p2) + turn(p1, p2, p3)
+    // Per-step turning-angle bound for strokes (see below).
+    let total_turn = if opts.stroke_half > 0.0 {
+        turn(p0, p1, p2) + turn(p1, p2, p3)
             // Degenerate middle leg: measure across it.
-            + if p1 == p2 { turn(p0, p1, p3) } else { 0.0 };
-        let delta_max = (8.0 * tol / opts.stroke_half).sqrt();
-        n = n.max((total_turn / delta_max).ceil());
+            + if p1 == p2 { turn(p0, p1, p3) } else { 0.0 }
+    } else {
+        0.0
+    };
+    let turn_steps = |tol: f64| -> f64 {
+        if opts.stroke_half > 0.0 {
+            total_turn / (8.0 * tol / opts.stroke_half).sqrt()
+        } else {
+            0.0
+        }
+    };
+    if depth == 0 {
+        // Bound the work for one curve: a curve that would need more
+        // than MAX_SEGMENTS_PER_CURVE chords at full precision (a
+        // control polygon millions of pixels across with no culling
+        // rectangle to discard it, or a stroke pen of astronomical
+        // width) is flattened at the tolerance that budget affords —
+        // both step counts scale as tol^(-1/2), and a sub-pixel
+        // accuracy claim is meaningless at that scale anyway.
+        let need = (0.75 * m / tol).sqrt().max(turn_steps(tol));
+        if need > MAX_SEGMENTS_PER_CURVE {
+            tol *= (need / MAX_SEGMENTS_PER_CURVE).powi(2);
+            let capped = FlattenOptions {
+                tolerance: tol,
+                ..*opts
+            };
+            flatten_cubic(out, p0, p1, p2, p3, &capped, depth + 1);
+            return;
+        }
     }
+    let mut n = (0.75 * m / tol).sqrt().max(turn_steps(tol)).ceil();
     if !n.is_finite() || n < 1.0 {
         n = 1.0;
     }

@@ -114,21 +114,32 @@ impl ExtendedStroke {
 
 /// Build the fillable stroke geometry for a flattened input contour.
 ///
-/// `width_px` is the stroke width in raster pixels (the caller has
-/// already mapped the user-space width through the active transform —
-/// for non-uniform scale we approximate with the average of x/y scale
-/// factors at flatten time).
+/// `width_px` is the stroke width in the contour's units (raster
+/// pixels when the contour is in device space; the
+/// [`Renderer`](crate::Renderer) strokes in user space and maps the
+/// outline afterwards).
 pub fn stroke_to_fill_path(
     input: &FlatContour,
     stroke: &Stroke,
     width_px: f32,
+) -> Vec<FlatContour> {
+    stroke_to_fill_path_bounded(input, stroke, width_px, MAX_DASH_PERIODS)
+}
+
+/// [`stroke_to_fill_path`] with an explicit bound on the number of dash
+/// periods (past it the stroke is drawn solid, see [`apply_dash`]).
+pub(crate) fn stroke_to_fill_path_bounded(
+    input: &FlatContour,
+    stroke: &Stroke,
+    width_px: f32,
+    max_dash_periods: f32,
 ) -> Vec<FlatContour> {
     if input.points.len() < 2 || width_px <= 0.0 {
         return Vec::new();
     }
     let half = width_px * 0.5;
     let segments = if let Some(dash) = &stroke.dash {
-        apply_dash(&input.points, input.closed, dash)
+        apply_dash(&input.points, input.closed, dash, max_dash_periods)
     } else {
         // No dash → a single piece with the original closed-ness.
         vec![DashSegment {
@@ -158,7 +169,7 @@ pub fn stroke_to_fill_path_ext(
     let half = width_px * 0.5;
     let base = &stroke.base;
     let segments = if let Some(dash) = &base.dash {
-        apply_dash(&input.points, input.closed, dash)
+        apply_dash(&input.points, input.closed, dash, MAX_DASH_PERIODS)
     } else {
         vec![DashSegment {
             points: input.points.clone(),
@@ -618,6 +629,10 @@ struct DashSegment {
     closed: bool,
 }
 
+/// Most dash-pattern periods one stroked sub-path is split into (see
+/// [`apply_dash`]).
+const MAX_DASH_PERIODS: f32 = 100_000.0;
+
 /// Walk `points` along their length, splitting into "on" sub-polylines
 /// according to `dash`.
 ///
@@ -634,7 +649,12 @@ struct DashSegment {
 /// This function detects that case and splices the leading and trailing
 /// sub-polylines into a single segment that passes through the seam
 /// vertex (so the caller's join logic, not a cap, is applied there).
-fn apply_dash(points: &[(f32, f32)], closed: bool, dash: &DashPattern) -> Vec<DashSegment> {
+fn apply_dash(
+    points: &[(f32, f32)],
+    closed: bool,
+    dash: &DashPattern,
+    max_periods: f32,
+) -> Vec<DashSegment> {
     if dash.array.is_empty() || dash.array.iter().all(|&v| v <= 0.0) {
         return vec![DashSegment {
             points: points.to_vec(),
@@ -645,6 +665,22 @@ fn apply_dash(points: &[(f32, f32)], closed: bool, dash: &DashPattern) -> Vec<Da
     let mut walk: Vec<(f32, f32)> = points.to_vec();
     if closed {
         walk.push(points[0]);
+    }
+    // Work bound: a pattern far finer than the path (e.g. `1e-6 1e-6`
+    // on a long path) would emit millions of dashes, each finer than a
+    // pixel can show; past `max_periods` (at most MAX_DASH_PERIODS)
+    // periods the stroke is drawn solid instead.
+    let path_len: f32 = walk
+        .windows(2)
+        .map(|w| ((w[1].0 - w[0].0).powi(2) + (w[1].1 - w[0].1).powi(2)).sqrt())
+        .sum();
+    let period: f32 = dash.array.iter().map(|&v| v.max(0.0)).sum();
+    let periods = path_len / period;
+    if periods.is_nan() || periods > max_periods.min(MAX_DASH_PERIODS) {
+        return vec![DashSegment {
+            points: points.to_vec(),
+            closed,
+        }];
     }
 
     // Skip negative array entries (treat as zero) — SVG validator.
@@ -1113,6 +1149,9 @@ fn clip_segment(
 /// 255 levels at the chord midpoints of a thick cap).
 const ARC_FLATTEN_TOLERANCE: f32 = crate::flatten::FLATTEN_TOLERANCE_PX as f32;
 
+/// Most chords one round join / cap arc is split into.
+const MAX_ARC_CHORDS: usize = 1024;
+
 /// Number of chord subdivisions needed to flatten a circular arc of
 /// radius `r` sweeping `|delta|` radians while keeping the per-chord
 /// sagitta at or below [`ARC_FLATTEN_TOLERANCE`].
@@ -1143,7 +1182,9 @@ fn arc_chord_count(r: f32, delta: f32) -> usize {
         // above); fall back to a fine fixed subdivision.
         return ((sweep / 0.05).ceil() as usize).max(1);
     }
-    ((sweep / delta_max).ceil() as usize).max(1)
+    // Capped: past a few thousand chords per arc (a pen thousands of
+    // pixels wide) the sub-pixel bound is meaningless and only costs.
+    ((sweep / delta_max).ceil() as usize).clamp(1, MAX_ARC_CHORDS)
 }
 
 /// Radius for the interior vertices of a polygonised arc of radius `r`
@@ -1329,7 +1370,7 @@ mod tests {
     /// Count the "on" sub-polylines produced by the dash walker for a
     /// given contour + dash, before any caps/joins are applied.
     fn dash_segment_count(c: &FlatContour, dash: &DashPattern) -> usize {
-        apply_dash(&c.points, c.closed, dash).len()
+        apply_dash(&c.points, c.closed, dash, MAX_DASH_PERIODS).len()
     }
 
     #[test]
@@ -1349,7 +1390,7 @@ mod tests {
         };
         // Naively this would be 3 runs (0..5, 15..25, 35..40); after the
         // seam splice the 0..5 and 35..40 runs merge → 2 runs.
-        let segs = apply_dash(&c.points, c.closed, &dash);
+        let segs = apply_dash(&c.points, c.closed, &dash, MAX_DASH_PERIODS);
         assert_eq!(
             segs.len(),
             2,
@@ -1411,8 +1452,8 @@ mod tests {
             array: vec![10.0, 10.0],
             offset: 5.0,
         };
-        let open = apply_dash(&pts, false, &dash);
-        let closed = apply_dash(&pts, true, &dash);
+        let open = apply_dash(&pts, false, &dash, MAX_DASH_PERIODS);
+        let closed = apply_dash(&pts, true, &dash, MAX_DASH_PERIODS);
         assert!(
             seam_is_joined(&closed),
             "closed seam dash must be joined through the start vertex"
@@ -1437,7 +1478,7 @@ mod tests {
             array: vec![100.0, 10.0],
             offset: 0.0,
         };
-        let segs = apply_dash(&c.points, c.closed, &dash);
+        let segs = apply_dash(&c.points, c.closed, &dash, MAX_DASH_PERIODS);
         assert_eq!(segs.len(), 1, "a perimeter-spanning dash is one run");
         assert!(
             segs[0].closed,

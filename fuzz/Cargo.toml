@@ -23,6 +23,7 @@ cargo-fuzz = true
 # hang.
 [dependencies]
 libfuzzer-sys = "0.4"
+oxideav-core = "0.1"
 
 [dependencies.oxideav-raster]
 path = ".."
@@ -54,5 +55,15 @@ doc = false
 [[bin]]
 name = "filter_graph"
 path = "fuzz_targets/filter_graph.rs"
+test = false
+doc = false
+
+# Scene-rendering target — fuzzer-built filled / stroked / dashed paths
+# under an arbitrary transform (raw f32 bits everywhere) through the
+# exact-area and supersampled kernels, sRGB / linear compositing and
+# the band-parallel path, which must match the serial render.
+[[bin]]
+name = "render_paths"
+path = "fuzz_targets/render_paths.rs"
 test = false
 doc = false

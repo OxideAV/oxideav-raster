@@ -13,21 +13,21 @@ produces a packed `Rgba` `VideoFrame`.
 
 | Capability                                | Status               |
 | ----------------------------------------- | -------------------- |
-| Path flattening (line/quad/cubic)         | done                 |
+| Path flattening (line/quad/cubic)         | done — segment count from a rigorous 1/32 device-px error bound (no faceting at any zoom, a few hundred segments for a radius-1000 px circle); off-canvas curves culled to chords (exact for fills); transform in f64 |
 | SVG elliptic-arc → cubic Bezier           | done                 |
-| Exact-area AA fill (even-odd / NZ)        | done — default `CoverageMode::Analytic`: sparse scan conversion with sub-strips at vertices + edge crossings and closed-form trapezoid integration per pixel; exact for self-intersecting / overlapping outlines; matches the closed-form pixel area to ±1 level, rsvg-convert edges within 16 levels (its coverage is quantised in 1/30 steps) |
+| Exact-area AA fill (even-odd / NZ)        | done — default `CoverageMode::Analytic`: y-monotone-chain scan conversion, closed-form per-boundary area integration on provably ordered strips, vertex + crossing subdivision only where chains cross; exact for self-intersecting / overlapping outlines; windowed to the shape's bbox with f64 edge clipping (precise at 10⁶ px off-canvas); rows streamed straight into the compositor |
 | Supersampled AA fill 1/2/4/8×             | done — `CoverageMode::Supersampled`: analytic horizontal coverage + vertical sub-scanlines; kept for byte-stable callers |
 | Open subpaths implicitly closed for fill (SVG 2 §13.4.1) | done |
-| Stroke geometry (caps + joins)            | done — round joins/caps tessellate with a radius-adaptive sagitta-bounded chord count (sub-pixel-smooth at every width) |
+| Stroke geometry (caps + joins)            | done — built in user space (exact under rotation / non-uniform scale, SVG 2 §13.5); offset outline where provably exact, positively wound union of pieces where it is not (thick strokes on tight curves have no holes); round joins / caps / zero-length dots straddle the circle at 1/32 px; matches a brute-force distance field |
 | SVG 2 `stroke-linejoin: miter-clip` / `arcs` (§13.5.5) | done — `ExtendedStroke` + `stroke_to_fill_path_ext`; miter-clip trims the apex at `miterlimit/2 · width` instead of bevelling; `arcs` falls through to miter-clip on flattened (zero-curvature) input per spec |
-| Dash patterns                             | done — closed-subpath seam dash joins continuously (SVG 1.1 §11.4 / SVG 2 §13.5.6) |
+| Dash patterns                             | done — user-space lengths; closed-subpath seam dash joins continuously (SVG 1.1 §11.4 / SVG 2 §13.5.6); zero-length dashes paint their caps (dotted lines) |
 | Linear + radial gradients                 | done — geometry in the node's user space, sampled through the inverse CTM (viewBox scale, group / element transforms, elliptical radial rings under non-uniform scale — SVG 2 §14.2.2.1 / §14.2.3.1) |
 | Off-centre focal radial                   | done                 |
 | Two-circle radial (`fr` focal radius)     | done (SVG 2 §13.2.4 / CSS Images 3) |
 | Pad / Reflect / Repeat spread             | done                 |
 | `color-interpolation: sRGB` (default)     | done                 |
 | `color-interpolation: linearRGB`          | done                 |
-| Gradient stops LUT (256-entry pre-bake)   | done — sub-entry linear interpolation between LUT entries (no 256-step banding) |
+| Gradient evaluation                       | done — row-wise, `t` affine in device position (f64 set-up), stops evaluated exactly per pixel (hard stops stay 1 px sharp at any length); optional 8×8 Bayer `GradientDither::Ordered` |
 | Single-path clip                          | done                 |
 | Top-level `viewBox` → viewport `preserveAspectRatio` (SVG 1.1 §7.8 / §8.2 / §8.6) | done — all 10 alignments × meet/slice + `none`; default `xMidYMid meet`; slice overflow cropped at canvas edge; degenerate viewBox disables render |
 | Group opacity                             | done — isolated offscreen composite (SVG 2 §3.4); overlapping children no longer double-darken |
@@ -50,8 +50,10 @@ produces a packed `Rgba` `VideoFrame`.
 | Filter primitive tree (Filter Effects 1 §9.2 / §9.3) | done — `FilterGraph` evaluates ordered primitives with `in`/`in2` resolution (`SourceGraphic` / `SourceAlpha` / named `result` back-references, closest-preceding rule, forward-reference degradation), per-step §9.4 subregion clip, one-pass linearRGB working space, anchored §9.20 `feTile` |
 | CSS filter shorthand functions (Filter Effects 1 §6 / §13.1) | done — all 10 `<filter-function>`s expanded to their §13.1 primitive equivalents (exact grayscale/sepia matrices, table/linear transfer forms, blur with `edgeMode` `none`); `apply_filter_functions` runs a `<filter-value-list>` pinned to sRGB per §10 |
 | CSS `filter` value parser (Filter Effects 1 §5 / §6.1) | done — `<filter-value-list>` → `FilterFunction`s with §6.1 defaults, negative/unit/overflow rejection, `drop-shadow()` `<color>? && <length>{2,3}`, `currentColor` substitution; panic-free on hostile input, byte-offset errors |
-| Fuzz + benches                            | done — cargo-fuzz targets on the CSS parser (~17M execs) + filter graph (~4.5M execs) with daily CI; three Criterion harnesses (`render` / `filter` / `sampling`) covering fill, stroke, scenes, all seven resampling kernels, patterns, soft masks, gradients, cache hits, and the filter kernels — see `BENCHMARKS.md` |
+| Fuzz + benches                            | done — cargo-fuzz targets on the CSS parser (~17M execs), filter graph (~4.5M execs) and scene rendering (`render_paths`: raw-f32 paths / strokes / dashes / transforms, serial = parallel) with daily CI; four Criterion harnesses (`render` / `filter` / `sampling` / `scenes`) covering fill, stroke, scenes, all seven resampling kernels, patterns, soft masks, gradients, cache hits, and the filter kernels — see `BENCHMARKS.md` |
 | r449 perf pass (zero behaviour change)    | done — 1.79× geo-mean over 32 benches, byte-exact by differential tests + 31-scene frame-hash A/B; caption-density scene 32.5×, small-shape composite O(shape) not O(canvas), Lanczos ~2–2.4×, morphology O(1)/px, component-transfer 4.2× |
+| Rendering options                         | done — `with_execution_context` (band-parallel large shapes, byte-identical to serial), `with_compositing_space(LinearRgb)` (linear-light AA + translucency; default sRGB per SVG / CSS), `with_scene_supersampling(k)` (bounds conflation seams between abutting shapes by 1/(4k)) |
+| r484 quality + performance pass           | done — 1080p illustration 769 → 168 ms, 20 000 small shapes on 4K 731 → 26 ms, 4K gradients 55 / 63 → 33 / 47 ms (4 workers: 11 ms) — see `BENCHMARKS.md` |
 | Full ICC color-managed pipeline           | not yet              |
 
 ## Usage

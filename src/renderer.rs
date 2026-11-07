@@ -21,7 +21,7 @@ use crate::paint::sample_paint_in;
 use crate::pattern::{
     Pattern, sample_tile_bilinear_wrap, sample_tile_nearest_wrap, view_box_fit_transform,
 };
-use crate::stroke::stroke_to_fill_path;
+use crate::stroke::stroke_to_fill_path_bounded;
 
 /// Top-level vector→raster renderer.
 ///
@@ -1828,7 +1828,25 @@ fn build_stroke_geometry(
     }
     let mut out = Vec::new();
     for c in &contours {
-        out.extend(stroke_to_fill_path(c, &st, width_pre as f32));
+        // Dash periods are bounded by the *device* length (four per
+        // device pixel on average): a pattern finer than that cannot be
+        // seen, and pre-space lengths can be arbitrarily longer than
+        // device ones under a strongly anisotropic CTM.
+        let device_len: f64 = c
+            .points
+            .windows(2)
+            .map(|w| {
+                let (dx, dy) = ((w[1].0 - w[0].0) as f64, (w[1].1 - w[0].1) as f64);
+                (fa * dx + fc * dy).hypot(fb * dx + fd * dy)
+            })
+            .sum();
+        let max_periods = (4.0 * device_len + 16.0).min(f32::MAX as f64) as f32;
+        out.extend(stroke_to_fill_path_bounded(
+            c,
+            &st,
+            width_pre as f32,
+            max_periods,
+        ));
     }
     for c in &mut out {
         for p in &mut c.points {
