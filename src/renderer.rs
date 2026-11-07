@@ -10,12 +10,10 @@ use oxideav_core::{
 
 use crate::blend::BlendMode;
 use crate::cache::{CacheStats, RasterizedSubtree, SharedCache, composite_key};
-use crate::composite::composite_rgba_premultiplied_blend_rect;
-use crate::fill::{
-    AlphaMask, CoverageMode, rasterize_fill_analytic_with_bounds, rasterize_fill_with_bounds,
-};
+use crate::composite::composite_coverage_rect;
+use crate::fill::{AlphaMask, Coverage, CoverageMode, rasterize_fill_with_bounds};
 use crate::filter::PreserveAspectRatio;
-use crate::flatten::{FlatContour, flatten_path};
+use crate::flatten::{FLATTEN_TOLERANCE_PX, FlatContour, FlattenOptions, flatten_path_with};
 use crate::gradient::InterpolationSpace;
 use crate::gradient_paint::{GradientPaint, GradientSampler, invert_2d, path_bounding_box};
 use crate::paint::{build_paint_lut, sample_paint_in, sample_paint_with_lut};
@@ -300,19 +298,51 @@ impl Renderer {
         &self,
         contours: &[FlatContour],
         fill_rule: FillRule,
-    ) -> (AlphaMask, Option<(u32, u32, u32, u32)>) {
-        match self.coverage {
+    ) -> (Coverage, Option<(u32, u32, u32, u32)>) {
+        let cov = match self.coverage {
             CoverageMode::Analytic => {
-                rasterize_fill_analytic_with_bounds(contours, self.width, self.height, fill_rule)
+                Coverage::analytic(contours, self.width, self.height, fill_rule)
             }
-            _ => rasterize_fill_with_bounds(
-                contours,
-                self.width,
-                self.height,
-                fill_rule,
-                self.supersampling,
-            ),
-        }
+            _ => {
+                let (m, b) = rasterize_fill_with_bounds(
+                    contours,
+                    self.width,
+                    self.height,
+                    fill_rule,
+                    self.supersampling,
+                );
+                Coverage::from_canvas_mask(m, b)
+            }
+        };
+        let b = cov.bounds;
+        (cov, b)
+    }
+
+    /// Flatten a path for **filling** on this canvas: device-space
+    /// tolerance flattening with off-canvas curves replaced by their
+    /// chords (exact for a fill — see [`FlattenOptions::cull`]).
+    fn flatten_fill(
+        &self,
+        commands: &[oxideav_core::PathCommand],
+        t: &Transform2D,
+    ) -> Vec<FlatContour> {
+        let opts = FlattenOptions {
+            cull: Some((
+                -1.0,
+                -1.0,
+                self.width as f64 + 1.0,
+                self.height as f64 + 1.0,
+            )),
+            ..FlattenOptions::default()
+        };
+        flatten_path_with(commands, t, &opts)
+    }
+
+    /// Rasterize `contours` into a canvas-sized mask (clip paths).
+    fn rasterize_canvas_mask(&self, contours: &[FlatContour], fill_rule: FillRule) -> AlphaMask {
+        self.rasterize_with_bounds(contours, fill_rule)
+            .0
+            .to_canvas_mask(self.width, self.height)
     }
 
     /// Render a single node at the given transform. Returns a packed
@@ -412,8 +442,8 @@ impl Renderer {
         // *current* (post-transform) coordinate system, intersected
         // with whatever clip mask is being inherited.
         let group_clip_storage: Option<AlphaMask> = g.clip.as_ref().map(|clip_path| {
-            let cs = flatten_path(&clip_path.commands, &local);
-            let m = self.rasterize_with_bounds(&cs, FillRule::NonZero).0;
+            let cs = self.flatten_fill(&clip_path.commands, &local);
+            let m = self.rasterize_canvas_mask(&cs, FillRule::NonZero);
             match clip_mask {
                 Some(parent) => intersect_masks(parent, &m),
                 None => m,
@@ -451,8 +481,8 @@ impl Renderer {
         // Apply the group's own clip mask only — the parent clip is
         // handled at blit time.
         let group_clip_storage: Option<AlphaMask> = g.clip.as_ref().map(|clip_path| {
-            let cs = flatten_path(&clip_path.commands, &local);
-            self.rasterize_with_bounds(&cs, FillRule::NonZero).0
+            let cs = self.flatten_fill(&clip_path.commands, &local);
+            self.rasterize_canvas_mask(&cs, FillRule::NonZero)
         });
         let effective_clip = group_clip_storage.as_ref();
         for child in &g.children {
@@ -616,20 +646,21 @@ impl Renderer {
     ) {
         // Fill pass.
         if let Some(fill) = &node.fill {
-            let contours = flatten_path(&node.path.commands, &transform);
+            let contours = self.flatten_fill(&node.path.commands, &transform);
             let (mask, bounds) = self.rasterize_with_bounds(&contours, node.fill_rule);
             let mask = match clip_mask {
-                Some(c) => intersect_masks(c, &mask),
+                Some(c) => mask.intersect_clip(c),
                 None => mask,
             };
             self.composite_with_paint(buf, stride, &mask, bounds, fill, &transform, group_opacity);
         }
         // Stroke pass.
         if let Some(stroke) = &node.stroke {
-            let stroke_geom = build_stroke_geometry(&node.path, &transform, stroke);
+            let stroke_geom =
+                build_stroke_geometry(&node.path, &transform, stroke, (self.width, self.height));
             let (mask, bounds) = self.rasterize_with_bounds(&stroke_geom, FillRule::NonZero);
             let mask = match clip_mask {
-                Some(c) => intersect_masks(c, &mask),
+                Some(c) => mask.intersect_clip(c),
                 None => mask,
             };
             self.composite_with_paint(
@@ -663,13 +694,13 @@ impl Renderer {
         &self,
         buf: &mut [u8],
         stride: usize,
-        mask: &AlphaMask,
+        mask: &Coverage,
         bounds: Option<(u32, u32, u32, u32)>,
         paint: &Paint,
         transform: &Transform2D,
         group_opacity: f32,
     ) {
-        if mask.is_empty() {
+        if mask.mask.is_empty() {
             return;
         }
         // No span was rasterised: the mask is all-zero, so the
@@ -684,14 +715,12 @@ impl Renderer {
         match paint {
             Paint::Solid(c) => {
                 let c = *c;
-                composite_rgba_premultiplied_blend_rect(
+                composite_coverage_rect(
                     buf,
                     stride,
                     self.width,
                     self.height,
                     mask,
-                    0,
-                    0,
                     group_opacity,
                     blend,
                     rect,
@@ -725,14 +754,12 @@ impl Renderer {
                     inv.apply(Point::new(x as f32 + 0.5, y as f32 + 0.5))
                 };
                 match lut {
-                    Some(lut) => composite_rgba_premultiplied_blend_rect(
+                    Some(lut) => composite_coverage_rect(
                         buf,
                         stride,
                         self.width,
                         self.height,
                         mask,
-                        0,
-                        0,
                         group_opacity,
                         blend,
                         rect,
@@ -741,14 +768,12 @@ impl Renderer {
                             sample_paint_with_lut(&other, p.x, p.y, &lut)
                         },
                     ),
-                    None => composite_rgba_premultiplied_blend_rect(
+                    None => composite_coverage_rect(
                         buf,
                         stride,
                         self.width,
                         self.height,
                         mask,
-                        0,
-                        0,
                         group_opacity,
                         blend,
                         rect,
@@ -779,10 +804,10 @@ impl Renderer {
         // replication.
         let rect_path = rect_to_path(img.bounds);
         let local = transform.compose(&img.transform);
-        let contours = flatten_path(&rect_path.commands, &local);
+        let contours = self.flatten_fill(&rect_path.commands, &local);
         let (mask, fill_bounds) = self.rasterize_with_bounds(&contours, FillRule::NonZero);
         let mask = match clip_mask {
-            Some(c) => intersect_masks(c, &mask),
+            Some(c) => mask.intersect_clip(c),
             None => mask,
         };
         let Some((bx0, by0, bx1, by1)) = fill_bounds else {
@@ -821,14 +846,12 @@ impl Renderer {
             );
             return;
         }
-        composite_rgba_premultiplied_blend_rect(
+        composite_coverage_rect(
             buf,
             stride,
             self.width,
             self.height,
             &mask,
-            0,
-            0,
             group_opacity,
             blend,
             (bx0, by0, bx1, by1),
@@ -857,7 +880,7 @@ impl Renderer {
         &self,
         buf: &mut [u8],
         stride: usize,
-        mask: &AlphaMask,
+        mask: &Coverage,
         rect: (u32, u32, u32, u32),
         group_opacity: f32,
         frame: &VideoFrame,
@@ -938,14 +961,12 @@ impl Renderer {
                         )
                     })
                     .collect();
-                composite_rgba_premultiplied_blend_rect(
+                composite_coverage_rect(
                     buf,
                     stride,
                     self.width,
                     self.height,
                     mask,
-                    0,
-                    0,
                     group_opacity,
                     blend,
                     rect,
@@ -1074,7 +1095,7 @@ impl Renderer {
         &self,
         buf: &mut [u8],
         stride: usize,
-        mask: &AlphaMask,
+        mask: &Coverage,
         rect: (u32, u32, u32, u32),
         group_opacity: f32,
         data: &[u8],
@@ -1091,14 +1112,12 @@ impl Renderer {
             (bx0..=bx1).map(|x| Some(taps(col_t(x)?, tex_w))).collect();
         let rows: Vec<Option<([usize; W], [f32; W])>> =
             (by0..=by1).map(|y| Some(taps(row_t(y)?, tex_h))).collect();
-        composite_rgba_premultiplied_blend_rect(
+        composite_coverage_rect(
             buf,
             stride,
             self.width,
             self.height,
             mask,
-            0,
-            0,
             group_opacity,
             self.blend_mode,
             rect,
@@ -1168,7 +1187,7 @@ impl Renderer {
             path_bounding_box(path),
             self.color_interpolation,
         ) {
-            let contours = flatten_path(&path.commands, &transform);
+            let contours = self.flatten_fill(&path.commands, &transform);
             let (mask, bounds) = self.rasterize_with_bounds(&contours, fill_rule);
             self.composite_with_gradient(&mut buf, stride, &mask, bounds, &sampler, 1.0);
         }
@@ -1196,7 +1215,7 @@ impl Renderer {
             path_bounding_box(path),
             self.color_interpolation,
         ) {
-            let geom = build_stroke_geometry(path, &transform, stroke);
+            let geom = build_stroke_geometry(path, &transform, stroke, (self.width, self.height));
             let (mask, bounds) = self.rasterize_with_bounds(&geom, FillRule::NonZero);
             self.composite_with_gradient(&mut buf, stride, &mask, bounds, &sampler, 1.0);
         }
@@ -1212,25 +1231,23 @@ impl Renderer {
         &self,
         buf: &mut [u8],
         stride: usize,
-        mask: &AlphaMask,
+        mask: &Coverage,
         bounds: Option<(u32, u32, u32, u32)>,
         sampler: &GradientSampler,
         group_opacity: f32,
     ) {
-        if mask.is_empty() {
+        if mask.mask.is_empty() {
             return;
         }
         let Some(rect) = bounds else {
             return;
         };
-        composite_rgba_premultiplied_blend_rect(
+        composite_coverage_rect(
             buf,
             stride,
             self.width,
             self.height,
             mask,
-            0,
-            0,
             group_opacity,
             self.blend_mode,
             rect,
@@ -1261,7 +1278,7 @@ impl Renderer {
     ) -> VideoFrame {
         let stride = (self.width as usize) * 4;
         let mut buf = vec![0u8; stride * (self.height as usize)];
-        let contours = flatten_path(&path.commands, &transform);
+        let contours = self.flatten_fill(&path.commands, &transform);
         let (mask, bounds) = self.rasterize_with_bounds(&contours, fill_rule);
         self.composite_with_pattern(&mut buf, stride, &mask, bounds, pattern, transform, 1.0);
         VideoFrame {
@@ -1287,7 +1304,7 @@ impl Renderer {
     ) -> VideoFrame {
         let stride = (self.width as usize) * 4;
         let mut buf = vec![0u8; stride * (self.height as usize)];
-        let geom = build_stroke_geometry(path, &transform, stroke);
+        let geom = build_stroke_geometry(path, &transform, stroke, (self.width, self.height));
         let (mask, bounds) = self.rasterize_with_bounds(&geom, FillRule::NonZero);
         self.composite_with_pattern(&mut buf, stride, &mask, bounds, pattern, transform, 1.0);
         VideoFrame {
@@ -1309,13 +1326,13 @@ impl Renderer {
         &self,
         buf: &mut [u8],
         stride: usize,
-        mask: &AlphaMask,
+        mask: &Coverage,
         bounds: Option<(u32, u32, u32, u32)>,
         pattern: &Pattern,
         transform: Transform2D,
         group_opacity: f32,
     ) {
-        if mask.is_empty() || pattern.is_degenerate() {
+        if mask.mask.is_empty() || pattern.is_degenerate() {
             return;
         }
         let Some(rect) = bounds else {
@@ -1364,14 +1381,12 @@ impl Renderer {
                 let rows: Vec<usize> = (ry0..=ry1)
                     .map(|y| crate::pattern::tile_nearest_axis(row_v(y), th_px))
                     .collect();
-                composite_rgba_premultiplied_blend_rect(
+                composite_coverage_rect(
                     buf,
                     stride,
                     self.width,
                     self.height,
                     mask,
-                    0,
-                    0,
                     group_opacity,
                     blend,
                     rect,
@@ -1389,14 +1404,12 @@ impl Renderer {
                 let rows: Vec<(usize, usize, f32)> = (ry0..=ry1)
                     .map(|y| crate::pattern::tile_bilinear_axis(row_v(y), th_px))
                     .collect();
-                composite_rgba_premultiplied_blend_rect(
+                composite_coverage_rect(
                     buf,
                     stride,
                     self.width,
                     self.height,
                     mask,
-                    0,
-                    0,
                     group_opacity,
                     blend,
                     rect,
@@ -1412,14 +1425,12 @@ impl Renderer {
             }
             return;
         }
-        composite_rgba_premultiplied_blend_rect(
+        composite_coverage_rect(
             buf,
             stride,
             self.width,
             self.height,
             mask,
-            0,
-            0,
             group_opacity,
             blend,
             rect,
@@ -1482,26 +1493,126 @@ impl Renderer {
 const MAX_PATTERN_TILE_DIM: i64 = 4096;
 
 /// Build the stroke geometry for `path` under `transform`, producing
-/// closed contours ready for a NonZero fill.
+/// closed device-space contours ready for a NonZero fill.
+///
+/// # Stroking space
+///
+/// SVG 2 §13.5 defines the stroke in the element's **user space**
+/// (width, dashes, joins and caps are all user-space geometry), and
+/// the result is then mapped by the CTM. Stroking the device-space
+/// polyline instead is only right for a similarity transform, and even
+/// then needs the right scale factor (the mean of `|a|` and `|d|`
+/// vanishes under a 90° rotation).
+///
+/// So the outline is built in a *pre-space*: user space scaled
+/// uniformly by `s`, the CTM's largest singular value, and then mapped
+/// to device space by `F = CTM ∘ scale(1/s)`. `F` never stretches a
+/// length (its singular values are ≤ 1), so every pixel-unit tolerance
+/// the flattener and the round-join / cap tessellation use in
+/// pre-space bounds the device error too — while a non-uniform CTM
+/// still turns the round pen into the correct ellipse, and dash
+/// lengths stay in user units.
 fn build_stroke_geometry(
     path: &Path,
     transform: &Transform2D,
     stroke: &Stroke,
+    canvas: (u32, u32),
 ) -> Vec<FlatContour> {
-    let contours = flatten_path(&path.commands, transform);
+    let (a, b, c, d) = (
+        transform.a as f64,
+        transform.b as f64,
+        transform.c as f64,
+        transform.d as f64,
+    );
+    let det = a * d - b * c;
+    let e2 = a * a + b * b + c * c + d * d;
+    let s_max = ((e2 + (e2 * e2 - 4.0 * det * det).max(0.0).sqrt()) * 0.5).sqrt();
+    if !(s_max.is_finite() && s_max > 1e-12) || det.abs() <= 1e-18 * e2.max(1e-300) {
+        // A singular CTM collapses the stroke to zero area.
+        return Vec::new();
+    }
+    // Pre-space → device: F = CTM · diag(1/s).
+    let (fa, fb, fc, fd) = (a / s_max, b / s_max, c / s_max, d / s_max);
+    let (fe, ff) = (transform.e as f64, transform.f as f64);
+    let width_pre = stroke.width as f64 * s_max;
+    if !(width_pre > 0.0 && width_pre.is_finite()) {
+        return Vec::new();
+    }
+    let half = width_pre * 0.5;
+    let mut st = stroke.clone();
+    if let Some(dash) = &mut st.dash {
+        for v in &mut dash.array {
+            *v = (*v as f64 * s_max) as f32;
+        }
+        dash.offset = (dash.offset as f64 * s_max) as f32;
+    }
+    // Off-canvas culling (undashed strokes only: a dash pattern depends
+    // on the arc length of everything before it). The device rectangle
+    // grown by the stroke's reach — a miter apex lies at most
+    // `miter_limit · half` from its vertex, a square cap `√2 · half` —
+    // is pulled back to a pre-space bounding box.
+    let cull = if st.dash.is_none() {
+        let reach_dev = 2.0;
+        let (w, h) = (canvas.0 as f64, canvas.1 as f64);
+        let fdet = fa * fd - fb * fc;
+        let inv = |x: f64, y: f64| -> (f64, f64) {
+            let (x, y) = (x - fe, y - ff);
+            ((fd * x - fc * y) / fdet, (-fb * x + fa * y) / fdet)
+        };
+        let corners = [
+            inv(-reach_dev, -reach_dev),
+            inv(w + reach_dev, -reach_dev),
+            inv(-reach_dev, h + reach_dev),
+            inv(w + reach_dev, h + reach_dev),
+        ];
+        let reach = half * (stroke.miter_limit as f64).max(1.5) + 1.0;
+        let (mut x0, mut y0, mut x1, mut y1) = (
+            f64::INFINITY,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NEG_INFINITY,
+        );
+        for (x, y) in corners {
+            x0 = x0.min(x);
+            y0 = y0.min(y);
+            x1 = x1.max(x);
+            y1 = y1.max(y);
+        }
+        (x0.is_finite() && y0.is_finite() && x1.is_finite() && y1.is_finite()).then_some((
+            x0 - reach,
+            y0 - reach,
+            x1 + reach,
+            y1 + reach,
+        ))
+    } else {
+        None
+    };
+    let opts = FlattenOptions {
+        // Dashing walks the polyline's arc length, which a chord
+        // shortens by ~δ²/24 per segment; a finer polyline keeps the
+        // dash phase from drifting along long curved paths.
+        tolerance: if st.dash.is_some() {
+            FLATTEN_TOLERANCE_PX / 4.0
+        } else {
+            FLATTEN_TOLERANCE_PX
+        },
+        cull,
+        stroke_half: half,
+    };
+    let pre = Transform2D::scale(s_max as f32, s_max as f32);
+    let contours = flatten_path_with(&path.commands, &pre, &opts);
     if contours.is_empty() {
         return Vec::new();
     }
-    // Approximate the per-pixel stroke width as `stroke.width *
-    // average_scale` where `average_scale = 0.5 * (|a| + |d|)` for the
-    // diagonal portion of the affine matrix. Adequate for uniform /
-    // near-uniform scales; non-uniform scales get a slight bias that
-    // round 2 may refine via a true principal-axis decomposition.
-    let avg_scale = 0.5 * (transform.a.abs() + transform.d.abs());
-    let width_px = stroke.width * avg_scale.max(1e-6);
     let mut out = Vec::new();
     for c in &contours {
-        out.extend(stroke_to_fill_path(c, stroke, width_px));
+        out.extend(stroke_to_fill_path(c, &st, width_pre as f32));
+    }
+    for c in &mut out {
+        for p in &mut c.points {
+            let (x, y) = (p.0 as f64, p.1 as f64);
+            *p = ((fa * x + fc * y + fe) as f32, (fb * x + fd * y + ff) as f32);
+        }
     }
     out
 }

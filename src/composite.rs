@@ -17,7 +17,7 @@
 //! the mask.
 
 use crate::blend::{BlendMode, blend_over};
-use crate::fill::AlphaMask;
+use crate::fill::{AlphaMask, Coverage};
 use oxideav_core::Rgba;
 
 /// Composite a source mask + paint onto an `Rgba` byte buffer using
@@ -222,6 +222,48 @@ pub(crate) fn composite_rgba_premultiplied_blend_rect(
             }
         }
     }
+}
+
+/// [`composite_rgba_premultiplied_blend_rect`] for a windowed
+/// [`Coverage`]: `rect` is an inclusive **device** rectangle (normally
+/// the coverage's own bounds); `paint_at` receives device coordinates.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn composite_coverage_rect(
+    dst: &mut [u8],
+    dst_stride: usize,
+    dst_width: u32,
+    dst_height: u32,
+    cov: &Coverage,
+    extra_alpha: f32,
+    blend: BlendMode,
+    rect: (u32, u32, u32, u32),
+    paint_at: impl FnMut(u32, u32) -> Rgba,
+) {
+    if cov.mask.is_empty() {
+        return;
+    }
+    let (rx0, ry0, rx1, ry1) = rect;
+    if rx1 < cov.x0 || ry1 < cov.y0 {
+        return;
+    }
+    composite_rgba_premultiplied_blend_rect(
+        dst,
+        dst_stride,
+        dst_width,
+        dst_height,
+        &cov.mask,
+        cov.x0 as i32,
+        cov.y0 as i32,
+        extra_alpha,
+        blend,
+        (
+            rx0.saturating_sub(cov.x0),
+            ry0.saturating_sub(cov.y0),
+            rx1 - cov.x0,
+            ry1 - cov.y0,
+        ),
+        paint_at,
+    )
 }
 
 #[cfg(test)]

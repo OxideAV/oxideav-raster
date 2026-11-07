@@ -433,187 +433,474 @@ pub(crate) fn rasterize_fill_analytic_with_bounds(
     height: u32,
     fill_rule: FillRule,
 ) -> (AlphaMask, Option<(u32, u32, u32, u32)>) {
-    if width == 0 || height == 0 || contours.is_empty() {
-        return (AlphaMask::new(width, height), None);
-    }
+    let mut mask = AlphaMask::new(width, height);
+    let Some(table) = EdgeTable::build(contours, width, height, None) else {
+        return (mask, None);
+    };
     let w = width as usize;
-    let hf = height as f32;
+    let mut bounds = BoundsAcc::default();
+    table.scan(fill_rule, |y, x0, row| {
+        let off = y as usize * w + x0 as usize;
+        mask.data[off..off + row.len()].copy_from_slice(row);
+        bounds.add(y, x0, row.len());
+    });
+    (mask, bounds.get())
+}
 
-    // Edge table in pixel space.
-    let mut edges: Vec<Edge> = Vec::with_capacity(contours.iter().map(|c| c.points.len()).sum());
-    for c in contours {
-        if c.points.len() < 2 {
-            continue;
+/// The coverage of one painted element, stored only over the device
+/// window its geometry can touch (a small shape on a 4K canvas costs a
+/// mask the size of the shape, not of the canvas).
+///
+/// `mask` is `window`-sized; `bounds` is the inclusive device-pixel box
+/// of every row range the scan emitted (every pixel outside it is 0).
+#[derive(Debug, Clone)]
+pub(crate) struct Coverage {
+    pub mask: AlphaMask,
+    pub x0: u32,
+    pub y0: u32,
+    pub bounds: Option<(u32, u32, u32, u32)>,
+}
+
+impl Coverage {
+    /// An empty coverage (nothing painted).
+    pub(crate) fn empty() -> Self {
+        Coverage {
+            mask: AlphaMask::default(),
+            x0: 0,
+            y0: 0,
+            bounds: None,
         }
-        let n = c.points.len();
-        for i in 0..n {
-            let (x0, y0) = c.points[i];
-            let (x1, y1) = c.points[(i + 1) % n];
-            if !(x0.is_finite() && y0.is_finite() && x1.is_finite() && y1.is_finite()) {
+    }
+
+    /// Exact-area coverage of `contours` on a `width × height` canvas.
+    pub(crate) fn analytic(
+        contours: &[FlatContour],
+        width: u32,
+        height: u32,
+        fill_rule: FillRule,
+    ) -> Self {
+        let Some(table) = EdgeTable::build(contours, width, height, None) else {
+            return Coverage::empty();
+        };
+        let win = table.window();
+        let ww = (win.x1 - win.x0) as usize;
+        let mut mask = AlphaMask::new(win.x1 - win.x0, win.y1 - win.y0);
+        let mut bounds = BoundsAcc::default();
+        table.scan(fill_rule, |y, x0, row| {
+            let off = (y - win.y0) as usize * ww + (x0 - win.x0) as usize;
+            mask.data[off..off + row.len()].copy_from_slice(row);
+            bounds.add(y, x0, row.len());
+        });
+        Coverage {
+            mask,
+            x0: win.x0,
+            y0: win.y0,
+            bounds: bounds.get(),
+        }
+    }
+
+    /// Wrap a canvas-sized mask, cropping it to `bounds`.
+    pub(crate) fn from_canvas_mask(full: AlphaMask, bounds: Option<(u32, u32, u32, u32)>) -> Self {
+        let Some((bx0, by0, bx1, by1)) = bounds else {
+            return Coverage::empty();
+        };
+        let (cw, ch) = (bx1 - bx0 + 1, by1 - by0 + 1);
+        let mut mask = AlphaMask::new(cw, ch);
+        for y in 0..ch {
+            let src = ((by0 + y) * full.width + bx0) as usize;
+            let dst = (y * cw) as usize;
+            mask.data[dst..dst + cw as usize].copy_from_slice(&full.data[src..src + cw as usize]);
+        }
+        Coverage {
+            mask,
+            x0: bx0,
+            y0: by0,
+            bounds,
+        }
+    }
+
+    /// Expand to a canvas-sized mask.
+    pub(crate) fn to_canvas_mask(&self, width: u32, height: u32) -> AlphaMask {
+        let mut full = AlphaMask::new(width, height);
+        let mw = self.mask.width as usize;
+        for y in 0..self.mask.height {
+            let dy = self.y0 + y;
+            if dy >= height {
+                break;
+            }
+            let n = (self.mask.width).min(width.saturating_sub(self.x0)) as usize;
+            let src = y as usize * mw;
+            let dst = (dy * width + self.x0) as usize;
+            full.data[dst..dst + n].copy_from_slice(&self.mask.data[src..src + n]);
+        }
+        full
+    }
+
+    /// Multiply in (per-pixel minimum with) a canvas-sized clip mask.
+    pub(crate) fn intersect_clip(mut self, clip: &AlphaMask) -> Self {
+        let mw = self.mask.width as usize;
+        for y in 0..self.mask.height {
+            let dy = self.y0 + y;
+            if dy >= clip.height {
+                self.mask.data[y as usize * mw..(y as usize + 1) * mw].fill(0);
                 continue;
             }
-            if y0 == y1 {
-                continue; // horizontal: contributes no area boundary
+            let crow = (dy * clip.width) as usize;
+            let row = &mut self.mask.data[y as usize * mw..(y as usize + 1) * mw];
+            for (x, v) in row.iter_mut().enumerate() {
+                let dx = self.x0 as usize + x;
+                let c = if dx < clip.width as usize {
+                    clip.data[crow + dx]
+                } else {
+                    0
+                };
+                *v = (*v).min(c);
             }
-            let (top_y, bot_y) = if y0 < y1 { (y0, y1) } else { (y1, y0) };
-            if bot_y <= 0.0 || top_y >= hf {
+        }
+        self
+    }
+}
+
+/// Running union of touched row ranges (inclusive pixel bounds).
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct BoundsAcc(Option<(u32, u32, u32, u32)>);
+
+impl BoundsAcc {
+    #[inline]
+    pub(crate) fn add(&mut self, y: u32, x0: u32, len: usize) {
+        if len == 0 {
+            return;
+        }
+        let x1 = x0 + len as u32 - 1;
+        self.0 = Some(match self.0 {
+            None => (x0, y, x1, y),
+            Some((a, b, c, d)) => (a.min(x0), b.min(y), c.max(x1), d.max(y)),
+        });
+    }
+
+    #[inline]
+    pub(crate) fn get(&self) -> Option<(u32, u32, u32, u32)> {
+        self.0
+    }
+}
+
+/// Half-open device-pixel rectangle `x0..x1 × y0..y1`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Window {
+    pub x0: u32,
+    pub y0: u32,
+    pub x1: u32,
+    pub y1: u32,
+}
+
+impl Window {
+    /// The whole `width × height` canvas.
+    pub(crate) fn canvas(width: u32, height: u32) -> Self {
+        Window {
+            x0: 0,
+            y0: 0,
+            x1: width,
+            y1: height,
+        }
+    }
+
+    /// Intersection, or `None` when empty.
+    pub(crate) fn intersect(&self, o: &Window) -> Option<Window> {
+        let w = Window {
+            x0: self.x0.max(o.x0),
+            y0: self.y0.max(o.y0),
+            x1: self.x1.min(o.x1),
+            y1: self.y1.min(o.y1),
+        };
+        (w.x0 < w.x1 && w.y0 < w.y1).then_some(w)
+    }
+}
+
+/// An edge table clipped to a device window, in window-local
+/// coordinates — the set-up half of the exact-area scan converter.
+///
+/// # Edge set-up in double precision
+///
+/// Every segment is clipped in `f64` against the window before it is
+/// stored in `f32`, so the stored coordinates never exceed the window
+/// size and keep ~2⁻²⁴ · size precision no matter how far off-canvas
+/// the source vertices lie (an `f32` edge running from x = −10⁷ to
+/// +10⁷ would otherwise carry a whole-pixel error into the canvas).
+///
+/// * Rows: the part of a segment above / below the window contributes
+///   no area inside it and is dropped.
+/// * Columns: the part of a segment left of the window is replaced by
+///   its projection onto the window's left side (a vertical edge with
+///   the same y-extent and direction), and likewise on the right. A
+///   horizontal ray from any point inside the window crosses the
+///   projection exactly when it crossed the original part, so every
+///   winding number inside the window — and therefore every coverage
+///   value — is unchanged.
+pub(crate) struct EdgeTable {
+    edges: Vec<Edge>,
+    win: Window,
+}
+
+impl EdgeTable {
+    /// Build the table for `contours` on a `width × height` canvas,
+    /// restricted to `limit` when given. The window is shrunk to the
+    /// contours' bounding box; `None` when nothing can be covered.
+    pub(crate) fn build(
+        contours: &[FlatContour],
+        width: u32,
+        height: u32,
+        limit: Option<Window>,
+    ) -> Option<EdgeTable> {
+        if width == 0 || height == 0 {
+            return None;
+        }
+        let (mut min_x, mut min_y) = (f64::INFINITY, f64::INFINITY);
+        let (mut max_x, mut max_y) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+        let mut count = 0usize;
+        for c in contours {
+            if c.points.len() < 2 {
                 continue;
             }
-            let winding = if y1 > y0 { 1i32 } else { -1 };
-            let (mx0, my0, mx1, my1) = if y0 < y1 {
-                (x0, y0, x1, y1)
-            } else {
-                (x1, y1, x0, y0)
-            };
-            let dxdy = (mx1 - mx0) / (my1 - my0);
+            count += c.points.len();
+            for &(x, y) in &c.points {
+                if x.is_finite() && y.is_finite() {
+                    let (x, y) = (x as f64, y as f64);
+                    min_x = min_x.min(x);
+                    max_x = max_x.max(x);
+                    min_y = min_y.min(y);
+                    max_y = max_y.max(y);
+                }
+            }
+        }
+        if !(min_x <= max_x && min_y <= max_y) {
+            return None;
+        }
+        let clamp = |v: f64, hi: u32| -> u32 { v.clamp(0.0, hi as f64) as u32 };
+        let bbox = Window {
+            x0: clamp(min_x.floor(), width),
+            y0: clamp(min_y.floor(), height),
+            x1: clamp(max_x.ceil(), width),
+            y1: clamp(max_y.ceil(), height),
+        };
+        let mut win = bbox.intersect(&Window::canvas(width, height))?;
+        if let Some(l) = limit {
+            win = win.intersect(&l)?;
+        }
+        let (wx0, wy0, wx1, wy1) = (win.x0 as f64, win.y0 as f64, win.x1 as f64, win.y1 as f64);
+
+        let mut edges: Vec<Edge> = Vec::with_capacity(count + 8);
+        let mut push = |xa: f64, ya: f64, xb: f64, yb: f64, winding: i32| {
+            let (lya, lyb) = ((ya - wy0) as f32, (yb - wy0) as f32);
+            if lya >= lyb {
+                return;
+            }
+            let (lxa, lxb) = ((xa - wx0) as f32, (xb - wx0) as f32);
+            let dxdy = ((xb - xa) / (yb - ya)) as f32;
             if !dxdy.is_finite() {
-                continue;
+                return;
             }
             edges.push(Edge {
-                y_min: my0,
-                y_max: my1,
-                x_at_y_min: mx0,
-                dxdy,
+                y_min: lya,
+                y_max: lyb,
+                x_at_y_min: lxa,
+                dxdy: if lxa == lxb { 0.0 } else { dxdy },
                 winding,
             });
-        }
-    }
-    if edges.is_empty() {
-        return (AlphaMask::new(width, height), None);
-    }
-    edges.sort_by(|a, b| {
-        a.y_min
-            .partial_cmp(&b.y_min)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-
-    let mut mask = AlphaMask::new(width, height);
-    // Per-row accumulators: `area` holds boundary-cell areas written
-    // directly, `run` is a difference array for the fully-covered
-    // interior runs of each span (prefix-summed at row end). Both have
-    // one spare slot so a run ending at the canvas edge can close.
-    let mut area: Vec<f32> = vec![0.0; w + 1];
-    let mut run: Vec<f32> = vec![0.0; w + 1];
-    let mut active: Vec<Edge> = Vec::new();
-    let mut next_edge = 0usize;
-    let mut events: Vec<f32> = Vec::new();
-    let mut strip: Vec<StripEdge> = Vec::new();
-    let mut bounds: Option<(u32, u32, u32, u32)> = None;
-
-    for py in 0..height {
-        let row_top = py as f32;
-        let row_bot = row_top + 1.0;
-
-        while next_edge < edges.len() && edges[next_edge].y_min < row_bot {
-            active.push(edges[next_edge]);
-            next_edge += 1;
-        }
-        active.retain(|e| e.y_max > row_top);
-        if active.is_empty() {
-            continue;
-        }
-
-        // Sub-strip boundaries: the row edges plus every edge endpoint
-        // strictly inside the row.
-        events.clear();
-        events.push(row_top);
-        events.push(row_bot);
-        for e in &active {
-            if e.y_min > row_top && e.y_min < row_bot {
-                events.push(e.y_min);
-            }
-            if e.y_max > row_top && e.y_max < row_bot {
-                events.push(e.y_max);
-            }
-        }
-        events.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        events.dedup();
-
-        let mut touched = Touched { lo: w, hi: 0 };
-        let mut splits = 0usize;
-        let mut i = 0usize;
-        while i + 1 < events.len() {
-            let ya = events[i];
-            let yb = events[i + 1];
-            let h = yb - ya;
-            if h <= 1e-7 {
-                i += 1;
+        };
+        for c in contours {
+            if c.points.len() < 2 {
                 continue;
             }
-            // Edges spanning this whole strip, with their x at top and
-            // bottom.
-            strip.clear();
-            for e in &active {
-                if e.y_min <= ya && e.y_max >= yb {
-                    strip.push(StripEdge {
-                        xa: e.x_at_y_min + (ya - e.y_min) * e.dxdy,
-                        xb: e.x_at_y_min + (yb - e.y_min) * e.dxdy,
-                        winding: e.winding,
-                    });
-                }
-            }
-            if strip.len() < 2 {
-                i += 1;
-                continue;
-            }
-            // Order by x at the top of the strip. Edges that meet at the
-            // top (a vertex, or the crossing a previous split was made
-            // at — equal up to rounding) diverge downwards, so they are
-            // ordered by their bottom x instead; without the tolerance
-            // rounding noise could put them in the wrong order with a
-            // crossing too close to the top to split on.
-            strip.sort_by(|p, q| {
-                let key = if (p.xa - q.xa).abs() <= COINCIDENT_EPS {
-                    p.xb.partial_cmp(&q.xb)
-                } else {
-                    p.xa.partial_cmp(&q.xa)
-                };
-                key.unwrap_or(std::cmp::Ordering::Equal)
-            });
-            // Neighbours that swap order between top and bottom cross
-            // inside the strip: split at the highest crossing and redo.
-            if splits < MAX_CROSSING_SPLITS_PER_ROW {
-                let mut first_cross: Option<f32> = None;
-                for pair in strip.windows(2) {
-                    let (p, q) = (&pair[0], &pair[1]);
-                    if p.xb > q.xb + 1e-5 {
-                        let da = q.xa - p.xa; // ≥ 0 by the sort
-                        let db = p.xb - q.xb; // > 0 by the test
-                        let t = da / (da + db);
-                        let yc = ya + t * h;
-                        if yc > ya + 1e-6 && yc < yb - 1e-6 {
-                            first_cross = Some(first_cross.map_or(yc, |c: f32| c.min(yc)));
-                        }
-                    }
-                }
-                if let Some(yc) = first_cross {
-                    events.insert(i + 1, yc);
-                    splits += 1;
+            let n = c.points.len();
+            for i in 0..n {
+                let (x0, y0) = c.points[i];
+                let (x1, y1) = c.points[(i + 1) % n];
+                if !(x0.is_finite() && y0.is_finite() && x1.is_finite() && y1.is_finite()) {
                     continue;
                 }
-            }
-            // Fill-rule span walk over the ordered strip edges.
-            match fill_rule {
-                FillRule::EvenOdd => {
-                    let mut k = 0;
-                    while k + 1 < strip.len() {
-                        accumulate_trapezoid(
-                            &mut area,
-                            &mut run,
-                            &mut touched,
-                            w,
-                            h,
-                            &strip[k],
-                            &strip[k + 1],
-                        );
-                        k += 2;
+                if y0 == y1 {
+                    continue; // horizontal: contributes no area boundary
+                }
+                let winding = if y1 > y0 { 1i32 } else { -1 };
+                let (mut xa, mut ya, mut xb, mut yb) = if y0 < y1 {
+                    (x0 as f64, y0 as f64, x1 as f64, y1 as f64)
+                } else {
+                    (x1 as f64, y1 as f64, x0 as f64, y0 as f64)
+                };
+                if yb <= wy0 || ya >= wy1 {
+                    continue;
+                }
+                let slope = (xb - xa) / (yb - ya);
+                if ya < wy0 {
+                    xa += (wy0 - ya) * slope;
+                    ya = wy0;
+                }
+                if yb > wy1 {
+                    xb -= (yb - wy1) * slope;
+                    yb = wy1;
+                }
+                let inside = |x: f64| (wx0..=wx1).contains(&x);
+                if inside(xa) && inside(xb) {
+                    push(xa, ya, xb, yb, winding);
+                    continue;
+                }
+                // Split where the segment crosses the window's left /
+                // right sides; clamping each piece's endpoints then
+                // projects the outside pieces onto the sides.
+                let mut ts = [0.0f64, 1.0, 1.0, 1.0];
+                let mut nt = 1usize;
+                for side in [wx0, wx1] {
+                    if (xa - side) * (xb - side) < 0.0 {
+                        ts[nt] = (side - xa) / (xb - xa);
+                        nt += 1;
                     }
                 }
-                FillRule::NonZero => {
-                    let mut winding = 0i32;
-                    for k in 0..strip.len() - 1 {
-                        winding += strip[k].winding;
-                        if winding != 0 {
+                ts[nt] = 1.0;
+                ts[1..nt].sort_unstable_by(f64::total_cmp);
+                for k in 0..nt {
+                    let (t0, t1) = (ts[k], ts[k + 1]);
+                    let pya = ya + (yb - ya) * t0;
+                    let pyb = if k + 1 == nt { yb } else { ya + (yb - ya) * t1 };
+                    let pxa = (xa + (xb - xa) * t0).clamp(wx0, wx1);
+                    let pxb = if k + 1 == nt {
+                        xb.clamp(wx0, wx1)
+                    } else {
+                        (xa + (xb - xa) * t1).clamp(wx0, wx1)
+                    };
+                    if pyb > pya {
+                        push(pxa, pya, pxb, pyb, winding);
+                    }
+                }
+            }
+        }
+        if edges.is_empty() {
+            return None;
+        }
+        edges.sort_unstable_by(|a, b| a.y_min.total_cmp(&b.y_min));
+        Some(EdgeTable { edges, win })
+    }
+
+    /// The device window the table was clipped to.
+    #[inline]
+    pub(crate) fn window(&self) -> Window {
+        self.win
+    }
+
+    /// Run the exact-area scan, calling `emit(y, x0, coverage)` once
+    /// per device row that received any coverage, with the 8-bit
+    /// coverage of the touched columns `x0 .. x0 + coverage.len()`
+    /// (device coordinates). Rows are emitted top to bottom.
+    pub(crate) fn scan(&self, fill_rule: FillRule, mut emit: impl FnMut(u32, u32, &[u8])) {
+        let w = (self.win.x1 - self.win.x0) as usize;
+        let height = self.win.y1 - self.win.y0;
+        let edges = &self.edges;
+        // Per-row accumulators: `area` holds boundary-cell areas written
+        // directly, `run` is a difference array for the fully-covered
+        // interior runs of each span (prefix-summed at row end). Both have
+        // one spare slot so a run ending at the window edge can close.
+        let mut area: Vec<f32> = vec![0.0; w + 1];
+        let mut run: Vec<f32> = vec![0.0; w + 1];
+        let mut out_row: Vec<u8> = vec![0; w];
+        let mut active: Vec<Edge> = Vec::new();
+        let mut next_edge = 0usize;
+        let mut events: Vec<f32> = Vec::new();
+        let mut strip: Vec<StripEdge> = Vec::new();
+
+        for py in 0..height {
+            let row_top = py as f32;
+            let row_bot = row_top + 1.0;
+
+            while next_edge < edges.len() && edges[next_edge].y_min < row_bot {
+                active.push(edges[next_edge]);
+                next_edge += 1;
+            }
+            active.retain(|e| e.y_max > row_top);
+            if active.is_empty() {
+                if next_edge >= edges.len() {
+                    break;
+                }
+                continue;
+            }
+
+            // Sub-strip boundaries: the row edges plus every edge endpoint
+            // strictly inside the row.
+            events.clear();
+            events.push(row_top);
+            events.push(row_bot);
+            for e in &active {
+                if e.y_min > row_top && e.y_min < row_bot {
+                    events.push(e.y_min);
+                }
+                if e.y_max > row_top && e.y_max < row_bot {
+                    events.push(e.y_max);
+                }
+            }
+            if events.len() > 2 {
+                events.sort_unstable_by(f32::total_cmp);
+                events.dedup();
+            }
+
+            let mut touched = Touched { lo: w, hi: 0 };
+            let mut splits = 0usize;
+            let mut i = 0usize;
+            while i + 1 < events.len() {
+                let ya = events[i];
+                let yb = events[i + 1];
+                let h = yb - ya;
+                if h <= 1e-7 {
+                    i += 1;
+                    continue;
+                }
+                // Edges spanning this whole strip, with their x at top and
+                // bottom.
+                strip.clear();
+                for e in &active {
+                    if e.y_min <= ya && e.y_max >= yb {
+                        strip.push(StripEdge {
+                            xa: e.x_at_y_min + (ya - e.y_min) * e.dxdy,
+                            xb: e.x_at_y_min + (yb - e.y_min) * e.dxdy,
+                            winding: e.winding,
+                        });
+                    }
+                }
+                if strip.len() < 2 {
+                    i += 1;
+                    continue;
+                }
+                // Order by x at the top of the strip. Edges that meet at the
+                // top (a vertex, or the crossing a previous split was made
+                // at — equal up to rounding) diverge downwards, so they are
+                // ordered by their bottom x instead; without the tolerance
+                // rounding noise could put them in the wrong order with a
+                // crossing too close to the top to split on.
+                sort_strip(&mut strip);
+                // Neighbours that swap order between top and bottom cross
+                // inside the strip: split at the highest crossing and redo.
+                if splits < MAX_CROSSING_SPLITS_PER_ROW {
+                    let mut first_cross: Option<f32> = None;
+                    for pair in strip.windows(2) {
+                        let (p, q) = (&pair[0], &pair[1]);
+                        if p.xb > q.xb + 1e-5 {
+                            let da = q.xa - p.xa; // ≥ 0 by the sort
+                            let db = p.xb - q.xb; // > 0 by the test
+                            let t = da / (da + db);
+                            let yc = ya + t * h;
+                            if yc > ya + 1e-6 && yc < yb - 1e-6 {
+                                first_cross = Some(first_cross.map_or(yc, |c: f32| c.min(yc)));
+                            }
+                        }
+                    }
+                    if let Some(yc) = first_cross {
+                        events.insert(i + 1, yc);
+                        splits += 1;
+                        continue;
+                    }
+                }
+                // Fill-rule span walk over the ordered strip edges.
+                match fill_rule {
+                    FillRule::EvenOdd => {
+                        let mut k = 0;
+                        while k + 1 < strip.len() {
                             accumulate_trapezoid(
                                 &mut area,
                                 &mut run,
@@ -623,41 +910,90 @@ pub(crate) fn rasterize_fill_analytic_with_bounds(
                                 &strip[k],
                                 &strip[k + 1],
                             );
+                            k += 2;
+                        }
+                    }
+                    FillRule::NonZero => {
+                        let mut winding = 0i32;
+                        for k in 0..strip.len() - 1 {
+                            winding += strip[k].winding;
+                            if winding != 0 {
+                                accumulate_trapezoid(
+                                    &mut area,
+                                    &mut run,
+                                    &mut touched,
+                                    w,
+                                    h,
+                                    &strip[k],
+                                    &strip[k + 1],
+                                );
+                            }
                         }
                     }
                 }
+                i += 1;
             }
-            i += 1;
-        }
 
-        if touched.lo > touched.hi {
-            continue;
+            if touched.lo > touched.hi {
+                continue;
+            }
+            // `touched.hi` may be `w` (a run marker in the spare slot).
+            let lo = touched.lo;
+            let hi = touched.hi.min(w - 1);
+            let mut running = 0.0f32;
+            for x in lo..=hi {
+                running += run[x];
+                let cov = area[x] + running;
+                out_row[x] = (cov.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+            }
+            area[lo..=touched.hi].fill(0.0);
+            run[lo..=touched.hi].fill(0.0);
+            emit(self.win.y0 + py, self.win.x0 + lo as u32, &out_row[lo..=hi]);
         }
-        // `touched.hi` may be `w` (a run marker in the spare slot).
-        let lo = touched.lo;
-        let hi = touched.hi.min(w - 1);
-        let row_off = (py as usize) * w;
-        let mut running = 0.0f32;
-        for x in lo..=hi {
-            running += run[x];
-            let cov = area[x] + running;
-            mask.data[row_off + x] = (cov.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
-        }
-        area[lo..=touched.hi].fill(0.0);
-        run[lo..=touched.hi].fill(0.0);
-
-        bounds = Some(match bounds {
-            None => (lo as u32, py, hi as u32, py),
-            Some((bx0, by0, bx1, by1)) => (
-                bx0.min(lo as u32),
-                by0.min(py),
-                bx1.max(hi as u32),
-                by1.max(py),
-            ),
-        });
     }
+}
 
-    (mask, bounds)
+/// Sort a strip's edges left to right (see the call site).
+///
+/// The order must be a genuine total order (the standard library sorts
+/// may panic otherwise), so the tolerance rule is applied in two
+/// passes: sort by top `x`, then re-sort every maximal run of
+/// neighbours whose top `x` values chain within [`COINCIDENT_EPS`] by
+/// their bottom `x`.
+#[inline]
+fn sort_strip(strip: &mut [StripEdge]) {
+    fn insertion_by(s: &mut [StripEdge], key: impl Fn(&StripEdge) -> f32) {
+        for i in 1..s.len() {
+            let mut j = i;
+            while j > 0 && key(&s[j]) < key(&s[j - 1]) {
+                s.swap(j, j - 1);
+                j -= 1;
+            }
+        }
+    }
+    // Strips are short and usually already ordered from the previous
+    // strip, so a straight insertion sort is the fast path.
+    if strip.len() <= 24 {
+        insertion_by(strip, |e| e.xa);
+    } else {
+        strip.sort_unstable_by(|p, q| p.xa.total_cmp(&q.xa));
+    }
+    let n = strip.len();
+    let mut i = 0;
+    while i < n {
+        let mut j = i + 1;
+        while j < n && strip[j].xa - strip[j - 1].xa <= COINCIDENT_EPS {
+            j += 1;
+        }
+        if j - i > 1 {
+            if j - i <= 24 {
+                insertion_by(&mut strip[i..j], |e| e.xb);
+            } else {
+                strip[i..j].sort_unstable_by(|p, q| p.xb.total_cmp(&q.xb));
+            }
+        }
+        i = j;
+    }
 }
 
 /// One active edge restricted to a sub-strip: its x at the strip's top

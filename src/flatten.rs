@@ -18,16 +18,59 @@
 
 use oxideav_core::{PathCommand, Point, Transform2D};
 
-/// Maximum chord length (in raster pixels) we tolerate before splitting
-/// a Bezier segment further. Matches `oxideav_scribe`'s default — at
-/// 0.5 px the residual approximation error is below the 4× supersample
-/// AA threshold so it's invisible after the box average.
-const FLATTEN_TOLERANCE_PX: f32 = 0.5;
+/// Maximum distance, in device pixels, between a curve and the
+/// polyline that replaces it.
+///
+/// Coverage is an area integral, so moving an edge by `d` pixels moves
+/// the coverage of the pixels along it by at most `d` (of a full
+/// pixel). At 1/32 px the worst pixel on a flattened curve is off by at
+/// most 8 of 255 levels (typically 2–3: the chord error is a parabola
+/// that peaks only at the chord midpoint), so faceting is invisible at
+/// every scale — the bound is in *device* pixels, after the transform,
+/// so a curve zoomed 1000× gets proportionally more segments, and a
+/// tiny one gets very few.
+pub(crate) const FLATTEN_TOLERANCE_PX: f64 = 1.0 / 32.0;
+
+/// A cubic whose uniform-step segment count exceeds this is split in
+/// half (de Casteljau) and each half re-measured, which makes the
+/// segment density follow the local curvature and lets off-canvas
+/// halves be culled.
+const MAX_UNIFORM_SEGMENTS: u32 = 16;
 
 /// Hard cap on subdivision depth — protects against pathological
-/// control points. 16 levels = 65536 intermediate samples, way past
-/// anything sensible.
+/// control points (and bounds the work for astronomically large
+/// on-canvas curves).
 const MAX_SUBDIV_DEPTH: u8 = 16;
+
+/// Internal flattening controls.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FlattenOptions {
+    /// Maximum curve-to-polyline distance in device pixels.
+    pub tolerance: f64,
+    /// Optional device-space rectangle `(x0, y0, x1, y1)`. A curve (or
+    /// sub-curve) whose control hull lies entirely beyond one side of
+    /// it is replaced by its chord. For a **fill** this is exact
+    /// inside the rectangle: the closed loop formed by the curve and
+    /// its chord lies in the outside half-plane, so it winds zero
+    /// times around every point of the rectangle. Strokes pass a
+    /// rectangle grown by the stroke's reach.
+    pub cull: Option<(f64, f64, f64, f64)>,
+    /// Stroke half-width in device pixels (0 for fills). The offset
+    /// curve of a polyline deviates from the true offset by roughly
+    /// `half · δ² / 8` for a turn of `δ` radians per segment, so a
+    /// non-zero value also bounds the per-segment turning angle.
+    pub stroke_half: f64,
+}
+
+impl Default for FlattenOptions {
+    fn default() -> Self {
+        FlattenOptions {
+            tolerance: FLATTEN_TOLERANCE_PX,
+            cull: None,
+            stroke_half: 0.0,
+        }
+    }
+}
 
 /// One flattened contour: a list of points forming an open or closed
 /// polyline in raster (Y-down, pixel-units) coordinates.
@@ -48,18 +91,45 @@ pub struct FlatContour {
 /// through. Returns one [`FlatContour`] per source subpath
 /// (sub-paths are introduced by every `MoveTo` after the first).
 ///
+/// Curves are replaced by polylines whose distance to the true curve
+/// is at most 1/32 device pixel (see the module docs), with the
+/// segment count derived from a rigorous bound on the curve's second
+/// derivative — so the density adapts to curvature and to the zoom.
+///
 /// Empty paths return an empty `Vec`.
 pub fn flatten_path(commands: &[PathCommand], transform: &Transform2D) -> Vec<FlatContour> {
+    flatten_path_with(commands, transform, &FlattenOptions::default())
+}
+
+type P64 = (f64, f64);
+
+/// [`flatten_path`] with explicit [`FlattenOptions`].
+pub(crate) fn flatten_path_with(
+    commands: &[PathCommand],
+    transform: &Transform2D,
+    opts: &FlattenOptions,
+) -> Vec<FlatContour> {
     let mut out: Vec<FlatContour> = Vec::new();
     let mut cur: FlatContour = FlatContour::default();
     let mut pen = Point::new(0.0, 0.0);
     let mut subpath_start = Point::new(0.0, 0.0);
     let mut have_subpath = false;
 
-    let map = |p: Point| -> (f32, f32) {
-        let q = transform.apply(p);
-        (q.x, q.y)
+    // The affine map is evaluated in f64 so a large translation that
+    // cancels a large user-space coordinate keeps its fractional part.
+    let (ta, tb, tc, td, te, tf) = (
+        transform.a as f64,
+        transform.b as f64,
+        transform.c as f64,
+        transform.d as f64,
+        transform.e as f64,
+        transform.f as f64,
+    );
+    let map = |p: Point| -> P64 {
+        let (x, y) = (p.x as f64, p.y as f64);
+        (ta * x + tc * y + te, tb * x + td * y + tf)
     };
+    let to32 = |p: P64| -> (f32, f32) { (p.0 as f32, p.1 as f32) };
 
     for cmd in commands {
         match *cmd {
@@ -74,45 +144,59 @@ pub fn flatten_path(commands: &[PathCommand], transform: &Transform2D) -> Vec<Fl
                 pen = p;
                 subpath_start = p;
                 have_subpath = true;
-                cur.points.push(map(p));
+                cur.points.push(to32(map(p)));
                 cur.closed = false;
             }
             PathCommand::LineTo(p) => {
                 if !have_subpath {
                     // Implicit start at (0, 0) per SVG 1.1 §8.3.2.
-                    cur.points.push(map(Point::new(0.0, 0.0)));
+                    cur.points.push(to32(map(Point::new(0.0, 0.0))));
                     pen = Point::new(0.0, 0.0);
                     subpath_start = pen;
                     have_subpath = true;
                 }
-                cur.points.push(map(p));
+                cur.points.push(to32(map(p)));
                 pen = p;
             }
             PathCommand::QuadCurveTo { control, end } => {
                 if !have_subpath {
-                    cur.points.push(map(Point::new(0.0, 0.0)));
+                    cur.points.push(to32(map(Point::new(0.0, 0.0))));
                     pen = Point::new(0.0, 0.0);
                     subpath_start = pen;
                     have_subpath = true;
                 }
+                // Exact degree elevation: the quadratic is the cubic
+                // with controls at 2/3 of the way to its control point.
                 let p0 = map(pen);
-                let p1 = map(control);
-                let p2 = map(end);
-                subdivide_quad(&mut cur.points, p0, p1, p2, 0);
+                let q = map(control);
+                let p3 = map(end);
+                let p1 = (
+                    p0.0 + (q.0 - p0.0) * (2.0 / 3.0),
+                    p0.1 + (q.1 - p0.1) * (2.0 / 3.0),
+                );
+                let p2 = (
+                    p3.0 + (q.0 - p3.0) * (2.0 / 3.0),
+                    p3.1 + (q.1 - p3.1) * (2.0 / 3.0),
+                );
+                flatten_cubic(&mut cur.points, p0, p1, p2, p3, opts, 0);
                 pen = end;
             }
             PathCommand::CubicCurveTo { c1, c2, end } => {
                 if !have_subpath {
-                    cur.points.push(map(Point::new(0.0, 0.0)));
+                    cur.points.push(to32(map(Point::new(0.0, 0.0))));
                     pen = Point::new(0.0, 0.0);
                     subpath_start = pen;
                     have_subpath = true;
                 }
-                let p0 = map(pen);
-                let p1 = map(c1);
-                let p2 = map(c2);
-                let p3 = map(end);
-                subdivide_cubic(&mut cur.points, p0, p1, p2, p3, 0);
+                flatten_cubic(
+                    &mut cur.points,
+                    map(pen),
+                    map(c1),
+                    map(c2),
+                    map(end),
+                    opts,
+                    0,
+                );
                 pen = end;
             }
             PathCommand::ArcTo {
@@ -124,21 +208,24 @@ pub fn flatten_path(commands: &[PathCommand], transform: &Transform2D) -> Vec<Fl
                 end,
             } => {
                 if !have_subpath {
-                    cur.points.push(map(Point::new(0.0, 0.0)));
+                    cur.points.push(to32(map(Point::new(0.0, 0.0))));
                     pen = Point::new(0.0, 0.0);
                     subpath_start = pen;
                     have_subpath = true;
                 }
-                // Arc → cubics in user space (so the per-cubic
-                // tolerance-driven subdivision below sees the user-
-                // space curvature), then map each to raster space.
+                // Arc → cubics in user space, then each cubic is
+                // flattened in device space against the tolerance.
                 let cubics = flatten_arc_to_cubics(pen, rx, ry, x_axis_rot, large_arc, sweep, end);
                 for [c1, c2, e] in &cubics {
-                    let p0 = map(pen);
-                    let p1 = map(*c1);
-                    let p2 = map(*c2);
-                    let p3 = map(*e);
-                    subdivide_cubic(&mut cur.points, p0, p1, p2, p3, 0);
+                    flatten_cubic(
+                        &mut cur.points,
+                        map(pen),
+                        map(*c1),
+                        map(*c2),
+                        map(*e),
+                        opts,
+                        0,
+                    );
                     pen = *e;
                 }
             }
@@ -165,85 +252,130 @@ pub fn flatten_path(commands: &[PathCommand], transform: &Transform2D) -> Vec<Fl
     out
 }
 
-/// Recursively subdivide a quadratic Bezier (`p0`, `p1`, `p2`). Pushes
-/// output points (excluding `p0`, including `p2`).
-fn subdivide_quad(
-    out: &mut Vec<(f32, f32)>,
-    p0: (f32, f32),
-    p1: (f32, f32),
-    p2: (f32, f32),
-    depth: u8,
-) {
-    let dx = p2.0 - p0.0;
-    let dy = p2.1 - p0.1;
-    let chord_sq = dx * dx + dy * dy;
-    let d_pdx = p1.0 - p0.0;
-    let d_pdy = p1.1 - p0.1;
-    let cross = d_pdx * dy - d_pdy * dx;
-    let chord_len = chord_sq.sqrt();
-    let perp = if chord_len > 1e-6 {
-        (cross / chord_len).abs()
-    } else {
-        (d_pdx * d_pdx + d_pdy * d_pdy).sqrt()
-    };
-
-    if depth >= MAX_SUBDIV_DEPTH
-        || (chord_sq <= FLATTEN_TOLERANCE_PX * FLATTEN_TOLERANCE_PX && perp <= FLATTEN_TOLERANCE_PX)
-    {
-        out.push(p2);
-        return;
-    }
-
-    let m01 = ((p0.0 + p1.0) * 0.5, (p0.1 + p1.1) * 0.5);
-    let m12 = ((p1.0 + p2.0) * 0.5, (p1.1 + p2.1) * 0.5);
-    let m = ((m01.0 + m12.0) * 0.5, (m01.1 + m12.1) * 0.5);
-
-    subdivide_quad(out, p0, m01, m, depth + 1);
-    subdivide_quad(out, m, m12, p2, depth + 1);
+#[inline]
+fn hypot64(x: f64, y: f64) -> f64 {
+    (x * x + y * y).sqrt()
 }
 
-/// Recursively subdivide a cubic Bezier (`p0`, `p1`, `p2`, `p3`).
-fn subdivide_cubic(
+/// Turning angle (radians, ≥ 0) between the directions `a → b` and
+/// `b → c`; zero when either leg is degenerate.
+#[inline]
+fn turn(a: P64, b: P64, c: P64) -> f64 {
+    let (ux, uy) = (b.0 - a.0, b.1 - a.1);
+    let (vx, vy) = (c.0 - b.0, c.1 - b.1);
+    if (ux == 0.0 && uy == 0.0) || (vx == 0.0 && vy == 0.0) {
+        return 0.0;
+    }
+    (ux * vy - uy * vx).atan2(ux * vx + uy * vy).abs()
+}
+
+/// Flatten the cubic `p0 p1 p2 p3` (device space), appending every
+/// output point after `p0` (so `p3` is always the last one pushed).
+///
+/// # Segment count
+///
+/// Split `[0, 1]` into `n` equal parameter steps and join the samples
+/// with chords. On each step of length `h = 1/n` the chord is the
+/// linear interpolant of `B`, whose error is bounded by
+/// `h² / 8 · max |B''|` (the Green's-function bound for linear
+/// interpolation; it holds for the vector-valued curve in Euclidean
+/// norm). `B''` is the linear interpolation of
+/// `6 (p0 − 2p1 + p2)` and `6 (p1 − 2p2 + p3)`, so with
+/// `M = max(|p0 − 2p1 + p2|, |p1 − 2p2 + p3|)` the distance to the
+/// curve stays below `tol` when `n ≥ √(3M / (4 tol))`.
+///
+/// For strokes the per-step turning angle `δ` is also bounded so the
+/// stroke's offset outline (which turns with the polyline) stays within
+/// `tol` of the true offset curve: the offset edge at distance `half`
+/// sags by `half · δ² / 8`, giving `δ ≤ √(8 tol / half)`. The curve's
+/// total turning is bounded by its control polygon's (variation
+/// diminishing).
+///
+/// When more than [`MAX_UNIFORM_SEGMENTS`] steps would be needed the
+/// curve is split at `t = ½` instead and each half re-measured: the
+/// second differences shrink 4× per split, so the recursion converges
+/// on the locally required density.
+fn flatten_cubic(
     out: &mut Vec<(f32, f32)>,
-    p0: (f32, f32),
-    p1: (f32, f32),
-    p2: (f32, f32),
-    p3: (f32, f32),
+    p0: P64,
+    p1: P64,
+    p2: P64,
+    p3: P64,
+    opts: &FlattenOptions,
     depth: u8,
 ) {
-    let dx = p3.0 - p0.0;
-    let dy = p3.1 - p0.1;
-    let chord_sq = dx * dx + dy * dy;
-    let chord_len = chord_sq.sqrt();
-    let perp = |p: (f32, f32)| -> f32 {
-        let dpx = p.0 - p0.0;
-        let dpy = p.1 - p0.1;
-        let cross = dpx * dy - dpy * dx;
-        if chord_len > 1e-6 {
-            (cross / chord_len).abs()
-        } else {
-            (dpx * dpx + dpy * dpy).sqrt()
-        }
-    };
-    let max_perp = perp(p1).max(perp(p2));
-
-    if depth >= MAX_SUBDIV_DEPTH
-        || (chord_sq <= FLATTEN_TOLERANCE_PX * FLATTEN_TOLERANCE_PX
-            && max_perp <= FLATTEN_TOLERANCE_PX)
-    {
-        out.push(p3);
+    let finite = p0.0.is_finite()
+        && p0.1.is_finite()
+        && p1.0.is_finite()
+        && p1.1.is_finite()
+        && p2.0.is_finite()
+        && p2.1.is_finite()
+        && p3.0.is_finite()
+        && p3.1.is_finite();
+    if !finite {
+        out.push((p3.0 as f32, p3.1 as f32));
         return;
     }
+    if let Some((cx0, cy0, cx1, cy1)) = opts.cull {
+        let min_x = p0.0.min(p1.0).min(p2.0).min(p3.0);
+        let max_x = p0.0.max(p1.0).max(p2.0).max(p3.0);
+        let min_y = p0.1.min(p1.1).min(p2.1).min(p3.1);
+        let max_y = p0.1.max(p1.1).max(p2.1).max(p3.1);
+        if max_x < cx0 || min_x > cx1 || max_y < cy0 || min_y > cy1 {
+            out.push((p3.0 as f32, p3.1 as f32));
+            return;
+        }
+    }
+    let tol = opts.tolerance.max(1e-6);
+    let d1 = hypot64(p0.0 - 2.0 * p1.0 + p2.0, p0.1 - 2.0 * p1.1 + p2.1);
+    let d2 = hypot64(p1.0 - 2.0 * p2.0 + p3.0, p1.1 - 2.0 * p2.1 + p3.1);
+    let m = d1.max(d2);
+    let mut n = (0.75 * m / tol).sqrt().ceil();
+    if opts.stroke_half > 0.0 {
+        let total_turn = turn(p0, p1, p2) + turn(p1, p2, p3)
+            // Degenerate middle leg: measure across it.
+            + if p1 == p2 { turn(p0, p1, p3) } else { 0.0 };
+        let delta_max = (8.0 * tol / opts.stroke_half).sqrt();
+        n = n.max((total_turn / delta_max).ceil());
+    }
+    if !n.is_finite() || n < 1.0 {
+        n = 1.0;
+    }
+    if n > MAX_UNIFORM_SEGMENTS as f64 && depth < MAX_SUBDIV_DEPTH {
+        let q0 = mid(p0, p1);
+        let q1 = mid(p1, p2);
+        let q2 = mid(p2, p3);
+        let r0 = mid(q0, q1);
+        let r1 = mid(q1, q2);
+        let s = mid(r0, r1);
+        flatten_cubic(out, p0, q0, r0, s, opts, depth + 1);
+        flatten_cubic(out, s, r1, q2, p3, opts, depth + 1);
+        return;
+    }
+    let n = (n as u32).min(1 << 12);
+    // Power-basis form B(t) = p0 + t·a + t²·b + t³·c.
+    let a = (3.0 * (p1.0 - p0.0), 3.0 * (p1.1 - p0.1));
+    let b = (
+        3.0 * (p0.0 - 2.0 * p1.0 + p2.0),
+        3.0 * (p0.1 - 2.0 * p1.1 + p2.1),
+    );
+    let c = (
+        p3.0 - p0.0 + 3.0 * (p1.0 - p2.0),
+        p3.1 - p0.1 + 3.0 * (p1.1 - p2.1),
+    );
+    let inv = 1.0 / n as f64;
+    for i in 1..n {
+        let t = i as f64 * inv;
+        let x = p0.0 + t * (a.0 + t * (b.0 + t * c.0));
+        let y = p0.1 + t * (a.1 + t * (b.1 + t * c.1));
+        out.push((x as f32, y as f32));
+    }
+    out.push((p3.0 as f32, p3.1 as f32));
+}
 
-    let q0 = ((p0.0 + p1.0) * 0.5, (p0.1 + p1.1) * 0.5);
-    let q1 = ((p1.0 + p2.0) * 0.5, (p1.1 + p2.1) * 0.5);
-    let q2 = ((p2.0 + p3.0) * 0.5, (p2.1 + p3.1) * 0.5);
-    let r0 = ((q0.0 + q1.0) * 0.5, (q0.1 + q1.1) * 0.5);
-    let r1 = ((q1.0 + q2.0) * 0.5, (q1.1 + q2.1) * 0.5);
-    let s = ((r0.0 + r1.0) * 0.5, (r0.1 + r1.1) * 0.5);
-
-    subdivide_cubic(out, p0, q0, r0, s, depth + 1);
-    subdivide_cubic(out, s, r1, q2, p3, depth + 1);
+#[inline]
+fn mid(a: P64, b: P64) -> P64 {
+    ((a.0 + b.0) * 0.5, (a.1 + b.1) * 0.5)
 }
 
 /// Convert an SVG elliptic-arc segment into a sequence of cubic-Bezier

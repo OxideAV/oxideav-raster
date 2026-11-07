@@ -11,6 +11,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `#[non_exhaustive]`: the enums `BlendMode`, `BlendFilterMode`, `CompositeOp`, `FilterColorSpace`, `InterpolationSpace`, `OffsetSampling`, `DisplacementSampling`, `ImageSourceSampling`, `ImageFilter`, `FilterFunction`, `FilterInput`, `FilterPrimitive` and `FilterParseError`; the records `Renderer`, `Pattern`, `ExtendedStroke`, `FilterStep`, `ComponentTransfer`, `ConvolveMatrix`, `Turbulence`, `DiffuseLighting`, `SpecularLighting`, `RasterizedSubtree` and `CacheStats`. Code outside the crate builds the records through their existing constructors / `Default` and `with_*` setters (fields stay public and assignable) and needs a `_ =>` arm when matching the enums. Enums whose value set the SVG filter / painting model fixes (`MorphologyOp`, `ColorMatrixOp`, `TransferFunc`, `ConvolveEdgeMode`, `TurbulenceType`, `StitchTiles`, `DisplacementChannel`, `LightSource`, `AspectRatioAlign`, `MeetOrSlice`, `ExtendedLineJoin`) and the value types (`AlphaMask`, `Subregion`, `PreserveAspectRatio`, `FlatContour`, `FocalRadialGradient`) are unchanged.
 
+### Performance
+
+- curve flattening is driven by a rigorous device-pixel error bound (1/32 px, from the second-difference bound on the cubic's second derivative) instead of a 0.5 px chord-length rule: a radius-1000 px circle drops from ~12 600 to a few hundred segments while staying facet-free at any zoom. Curves whose control hull lies wholly beyond one side of the canvas are replaced by their chord (exact for fills; strokes use a reach-grown rectangle, dashed strokes are never culled).
+- the exact-area kernel rasterizes into a window clipped to the shape's bounding box instead of a canvas-sized mask per path, so per-shape cost no longer scales with the canvas: 20 000 small shapes on a 4K canvas 731 → 26 ms, a 1080p text page 91 → 16 ms, a 1080p path-heavy illustration 769 → 275 ms (`benches/scenes.rs`, new).
+
+### Fixed
+
+- strokes are built in user space (SVG 2 §13.5) and mapped by the CTM: a 90° rotation no longer collapses the stroke width to zero (the width used the mean of the matrix diagonal), a 45° rotation no longer thins it by 1/√2, a non-uniform scale stretches the pen into the correct ellipse, and `stroke-dasharray` / `stroke-dashoffset` lengths are user units instead of device pixels.
+- the strip-sort comparator used a tolerance rule that is not a total order, which the standard library may answer with a panic on large strips; the tolerance is now applied as a second pass over runs of coincident edges.
+- edges are clipped to the raster window in double precision before they are stored, so vertices millions of pixels off-canvas no longer shift the visible part of their edges by a fraction of a pixel; the path transform is applied in double precision too.
+
 ### Added
 
 - `DiffuseLighting::with_*` and `SpecularLighting::with_*` setters for every field (start from `Default`).
