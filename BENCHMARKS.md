@@ -7,10 +7,58 @@ across three harnesses:
 cargo bench --bench render    # flatten / scanline fill / scene walks
 cargo bench --bench filter    # filter-primitive kernels (r401)
 cargo bench --bench sampling  # image resampling + pattern paint (r449)
+cargo bench --bench scenes    # realistic 1080p / 4K workloads (r484)
 ```
 
 All inputs are synthesised in the setup step (LCG pixel soup +
 procedural scenes); no fixture files.
+
+## Results (r484 quality + performance pass)
+
+Apple Silicon (aarch64-apple-darwin), rustc stable, `--release`.
+"before" is commit `69253a5` (start of the round), "after" the end of
+the round. Unlike r449 this pass changes output within justified
+tolerances (curves flattened to a 1/32 px bound instead of a 0.5 px
+chord rule, exact stroke geometry, exact gradient stops) — see the
+CHANGELOG for every behaviour change and the regression test pinning
+it. Band-parallel rendering is byte-identical to serial.
+
+### `scenes` — realistic workloads (new)
+
+| bench | before | after | speedup |
+|---|---|---|---|
+| `paths_1080p` (2 400 blobs, 600 strokes — a third dashed — 1 800 glyphs) | 768.7 ms | 166.1 ms | **4.6×** |
+| `text_page_1080p` (6 000 glyph outlines) | 91.2 ms | 14.2 ms | **6.4×** |
+| `gradient_linear_4k` (3-stop, full canvas) | 54.6 ms | 32.8 ms | 1.7× |
+| `gradient_radial_4k` (3-stop reflect, full canvas) | 63.0 ms | 46.7 ms | 1.3× |
+| `many_small_4k` (20 000 shapes of 3–10 px) | 731.4 ms | 28.8 ms | **25×** |
+| `big_circle_4k` (r = 1000 fill + 24 px stroke) | 27.3 ms | 17.2 ms | 1.6× |
+| `gradient_linear_4k_mt4` (4-worker `ExecutionContext`) | — | 8.9 ms | 6.1× vs before |
+| `big_circle_4k_mt4` | — | 5.4 ms | 5.0× vs before |
+| `paths_1080p_mt4` (shapes too small to band) | — | 165.6 ms | — |
+
+### `render` — 256×256 kernels (2 s measurement)
+
+| bench | before | after | speedup |
+|---|---|---|---|
+| `flatten_star_128pt` | 131.4 µs | 9.2 µs | 14× (curvature-driven segment count) |
+| `fill_star_256_ss1` | 705.7 µs | 142.4 µs | 5.0× (fewer input edges) |
+| `fill_star_256_ss4` | 925.6 µs | 281.7 µs | 3.3× |
+| `render_scene_256` | 315.4 µs | 149.3 µs | 2.1× |
+| `stroke_star_256` | 131.3 ms | 1.93 ms | **68×** |
+| `render_glyphlike_400_256` | 1.47 ms | 0.55 ms | 2.7× |
+| `render_softmask_256` | 398.9 µs | 247.2 µs | 1.6× |
+| `render_gradient_linear_256` | 445.3 µs | 263.9 µs | 1.7× |
+| `render_gradient_radial_256` | 523.3 µs | 392.3 µs | 1.3× |
+| `render_cached_group_hit_256` | 46.4 µs | 46.3 µs | 1.0× |
+
+Where the time went: a canvas-sized coverage mask per shape (the
+small-shape scenes), 0.5 px-chord over-flattening (≈ 50× more edges
+than a 1/32 px error bound needs on large curves), polyline vertices
+splitting every scan row into sub-strips (now y-monotone chains), the
+pivot loops of inner round joins (now trimmed), per-pixel divisions
+in source-over (now exact shift / reciprocal forms), and a 256-entry
+gradient table lookup per pixel (now row-wise exact evaluation).
 
 ## Results (r449 optimisation pass)
 

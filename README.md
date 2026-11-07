@@ -53,7 +53,7 @@ produces a packed `Rgba` `VideoFrame`.
 | Fuzz + benches                            | done — cargo-fuzz targets on the CSS parser (~17M execs), filter graph (~4.5M execs) and scene rendering (`render_paths`: raw-f32 paths / strokes / dashes / transforms, serial = parallel) with daily CI; four Criterion harnesses (`render` / `filter` / `sampling` / `scenes`) covering fill, stroke, scenes, all seven resampling kernels, patterns, soft masks, gradients, cache hits, and the filter kernels — see `BENCHMARKS.md` |
 | r449 perf pass (zero behaviour change)    | done — 1.79× geo-mean over 32 benches, byte-exact by differential tests + 31-scene frame-hash A/B; caption-density scene 32.5×, small-shape composite O(shape) not O(canvas), Lanczos ~2–2.4×, morphology O(1)/px, component-transfer 4.2× |
 | Rendering options                         | done — `with_execution_context` (band-parallel large shapes, byte-identical to serial), `with_compositing_space(LinearRgb)` (linear-light AA + translucency; default sRGB per SVG / CSS), `with_scene_supersampling(k)` (bounds conflation seams between abutting shapes by 1/(4k)) |
-| r484 quality + performance pass           | done — 1080p illustration 769 → 168 ms, 20 000 small shapes on 4K 731 → 26 ms, 4K gradients 55 / 63 → 33 / 47 ms (4 workers: 11 ms) — see `BENCHMARKS.md` |
+| r484 quality + performance pass           | done — 1080p illustration 769 → 166 ms, 20 000 small shapes on 4K 731 → 29 ms, 4K gradients 55 / 63 → 33 / 47 ms (4 workers: 9 ms), 256² star stroke 131 → 1.9 ms — see `BENCHMARKS.md` |
 | Full ICC color-managed pipeline           | not yet              |
 
 ## Usage

@@ -363,19 +363,23 @@ pub(crate) fn rasterize_fill_with_bounds(
 ///
 /// # Algorithm — sparse exact scan conversion
 ///
-/// 1. Build an edge table (one entry per non-horizontal segment, with
-///    its winding direction; subpaths are implicitly closed per SVG 2
-///    §13.4.1), sorted by top `y`.
-/// 2. For each pixel row, gather the active edges and cut the row into
-///    **sub-strips** at every edge endpoint inside the row. Inside a
-///    sub-strip every active edge spans its full height, so each edge
-///    is a straight segment from `x(y_top)` to `x(y_bot)`.
-/// 3. Sort the strip's edges by `x`. If two neighbours swap order
-///    between the top and bottom of the strip they intersect inside
-///    it: the strip is split again at the lowest such crossing (and
-///    re-examined), so every strip that is finally processed has a
-///    consistent left-to-right edge order and therefore constant
-///    winding between consecutive edges.
+/// 1. Clip every segment to the shape's window in double precision and
+///    group consecutive segments of one contour that go the same
+///    vertical direction into **y-monotone chains** (subpaths are
+///    implicitly closed per SVG 2 §13.4.1), sorted by top `y`.
+/// 2. For each pixel row, gather the active chains and cut the row into
+///    **sub-strips** at every chain top / bottom inside the row (chain
+///    vertices are *not* cuts). Inside a sub-strip every active chain
+///    spans its full height.
+/// 3. Sort the strip's chains by `x`. When no two neighbours can cross
+///    (disjoint x-extents, or a piecewise-linear x difference that
+///    never changes sign) the order — hence the winding between
+///    consecutive chains — is constant, and each chain contributes
+///    `±(area left of it)` per cell in closed form (step 5), signed by
+///    whether it enters or leaves the filled region. Otherwise the
+///    cluster of chains involved is subdivided at every vertex and at
+///    the lowest crossing (and re-examined) into strips of straight
+///    edges in a consistent order, handled by steps 4–5.
 /// 4. Walk the ordered edges with the fill rule exactly as a classic
 ///    scanline filler does — even-odd pairs crossings, non-zero tracks
 ///    the running winding sum — producing *trapezoid spans*: regions

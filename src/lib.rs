@@ -16,11 +16,13 @@
 //! 3. **Rasterize** each contour set into an alpha mask. The default
 //!    kernel ([`CoverageMode::Analytic`], [`rasterize_fill_analytic`])
 //!    computes the exact pixel area inside the outline — a sparse scan
-//!    converter that splits each pixel row into sub-strips at vertices
-//!    and edge crossings and integrates trapezoid spans per cell in
-//!    closed form, so coverage is continuous up to the 8-bit output and
-//!    exact for self-intersecting / overlapping outlines (every stroke
-//!    is one). The historical vertically supersampled kernel
+//!    converter over y-monotone edge chains that integrates the area
+//!    left of each boundary per cell in closed form (subdividing only
+//!    where chains cross), so coverage is continuous up to the 8-bit
+//!    output and exact for self-intersecting / overlapping outlines.
+//!    Each shape is scanned over its own bounding window and its rows
+//!    are composited as they are produced (in parallel row bands under
+//!    an `ExecutionContext` thread budget). The historical vertically supersampled kernel
 //!    ([`CoverageMode::Supersampled`], [`rasterize_fill`], 1 / 2 / 4 /
 //!    8 sub-scanlines) is kept selectable.
 //! 4. **Paint** the mask: solid colors, linear/radial gradients (sRGB
