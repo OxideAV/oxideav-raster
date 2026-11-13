@@ -343,20 +343,7 @@ impl Renderer {
     /// assumed to be `(0, 0, frame.width, frame.height)`.
     pub fn render(&self, frame: &VectorFrame) -> VideoFrame {
         let stride = (self.width as usize) * 4;
-        let mut buf = vec![0u8; stride * (self.height as usize)];
-        // Background fill.
-        if self.background.a != 0 {
-            for y in 0..self.height {
-                let row = (y as usize) * stride;
-                for x in 0..self.width {
-                    let i = row + (x as usize) * 4;
-                    buf[i] = self.background.r;
-                    buf[i + 1] = self.background.g;
-                    buf[i + 2] = self.background.b;
-                    buf[i + 3] = self.background.a;
-                }
-            }
-        }
+        let mut buf = self.cleared_canvas();
         // Compute the user-space → raster transform from the view box
         // (or default to "user space already in pixels"). The viewBox is
         // fitted into the (0, 0, width, height) viewport rectangle under
@@ -479,6 +466,25 @@ impl Renderer {
         self
     }
 
+    /// A canvas-sized RGBA buffer cleared to [`Renderer::background`]
+    /// (a transparent background costs only the zeroed allocation).
+    fn cleared_canvas(&self) -> Vec<u8> {
+        let len = (self.width as usize) * 4 * (self.height as usize);
+        let bg = self.background;
+        if bg.a == 0 {
+            return vec![0u8; len];
+        }
+        let px = [bg.r, bg.g, bg.b, bg.a];
+        if px[0] == px[1] && px[1] == px[2] && px[2] == px[3] {
+            return vec![px[0]; len];
+        }
+        let mut buf = vec![0u8; len];
+        for p in buf.as_chunks_mut::<4>().0 {
+            *p = px;
+        }
+        buf
+    }
+
     /// Rasterize `contours` into a canvas-sized alpha mask with the
     /// configured coverage kernel, reporting the touched bounds.
     fn rasterize_with_bounds(
@@ -537,19 +543,7 @@ impl Renderer {
     /// only that node painted onto the `background` clear.
     pub fn render_node(&self, node: &Node, transform: Transform2D) -> VideoFrame {
         let stride = (self.width as usize) * 4;
-        let mut buf = vec![0u8; stride * (self.height as usize)];
-        if self.background.a != 0 {
-            for y in 0..self.height {
-                let row = (y as usize) * stride;
-                for x in 0..self.width {
-                    let i = row + (x as usize) * 4;
-                    buf[i] = self.background.r;
-                    buf[i + 1] = self.background.g;
-                    buf[i + 2] = self.background.b;
-                    buf[i + 3] = self.background.a;
-                }
-            }
-        }
+        let mut buf = self.cleared_canvas();
         self.draw_node(node, transform, 1.0, &mut buf, stride, None);
         VideoFrame {
             pts: None,

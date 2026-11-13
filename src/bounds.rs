@@ -18,9 +18,9 @@
 //!   path's bounds; a soft mask is its content intersected with its
 //!   mask.
 //!
-//! One pixel of margin on every side absorbs anti-aliasing, the
-//! flattening tolerance, and the sub-pixel snapping of nested cached
-//! groups. Anything non-finite makes the affected bounds
+//! One pixel of margin on every side absorbs anti-aliasing and the
+//! flattening tolerance; a group with a cache key adds half a pixel for
+//! the sub-pixel snapping of its position. Anything non-finite makes the affected bounds
 //! [`Bounds::EVERYTHING`], which callers treat as "the whole canvas".
 
 use oxideav_core::{Group, Node, Path, PathCommand, Point, Stroke, Transform2D};
@@ -29,6 +29,10 @@ use crate::flatten::flatten_arc_to_cubics;
 
 /// Margin, in device pixels, added around the analytic geometry bounds.
 const PIXEL_MARGIN: f64 = 1.0;
+
+/// Largest displacement, per axis, of a keyed group from its nominal
+/// position (the coarsest sub-pixel grid snaps to whole pixels).
+const KEYED_GROUP_SNAP: f64 = 0.5;
 
 /// Pixel boxes are only reported for bounds within this many pixels of
 /// the origin (far beyond any canvas, and exactly representable).
@@ -331,7 +335,18 @@ pub(crate) fn node_bounds(node: &Node, t: &Transform2D) -> Bounds {
                 None => b,
             }
         }
-        Node::Group(g) => group_content_bounds(g, &t.compose(&g.transform)),
+        Node::Group(g) => {
+            let b = group_content_bounds(g, &t.compose(&g.transform));
+            // A keyed group is drawn at a translation snapped to the
+            // cache's sub-pixel grid: up to half a pixel per axis away
+            // (per level of keyed nesting, hence here and not in the
+            // fixed margin).
+            if g.cache_key.is_some() {
+                b.grown(KEYED_GROUP_SNAP)
+            } else {
+                b
+            }
+        }
         Node::Image(img) => {
             let m = t.compose(&img.transform);
             let r = &img.bounds;
@@ -471,6 +486,25 @@ mod tests {
         let b = node_bounds(&mask, &Transform2D::identity());
         assert_eq!((b.x0, b.y0, b.x1, b.y1), (105.0, 5.0, 112.0, 30.0));
         assert!(group_content_bounds(&Group::default(), &Transform2D::identity()).is_empty());
+    }
+
+    #[test]
+    fn keyed_groups_add_their_snapping_range_per_nesting_level() {
+        let inner = Group {
+            cache_key: Some(1),
+            children: vec![filled(rect(10.0, 10.0, 4.0, 4.0))],
+            ..Group::default()
+        };
+        let outer = Group {
+            cache_key: Some(2),
+            children: vec![Node::Group(inner.clone())],
+            ..Group::default()
+        };
+        let id = Transform2D::identity();
+        let b = node_bounds(&Node::Group(inner), &id);
+        assert_eq!((b.x0, b.y0, b.x1, b.y1), (9.5, 9.5, 14.5, 14.5));
+        let b = node_bounds(&Node::Group(outer), &id);
+        assert_eq!((b.x0, b.y0, b.x1, b.y1), (9.0, 9.0, 15.0, 15.0));
     }
 
     #[test]

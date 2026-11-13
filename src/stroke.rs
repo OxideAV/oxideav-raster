@@ -138,16 +138,24 @@ pub(crate) fn stroke_to_fill_path_bounded(
         return Vec::new();
     }
     let half = width_px * 0.5;
-    let segments = if let Some(dash) = &stroke.dash {
-        apply_dash(&input.points, input.closed, dash, max_dash_periods)
-    } else {
+    let mut join = ExtendedLineJoin::from_core(stroke.join);
+    let segments = match &stroke.dash {
+        Some(dash) if round_dashes_merge(&input.points, input.closed, dash, half, stroke.cap) => {
+            // The union of the dashes' round caps is the solid stroke
+            // with round joins (see `round_dashes_merge`).
+            join = ExtendedLineJoin::Round;
+            vec![DashSegment {
+                points: input.points.clone(),
+                closed: input.closed,
+            }]
+        }
+        Some(dash) => apply_dash(&input.points, input.closed, dash, max_dash_periods),
         // No dash → a single piece with the original closed-ness.
-        vec![DashSegment {
+        None => vec![DashSegment {
             points: input.points.clone(),
             closed: input.closed,
-        }]
+        }],
     };
-    let join = ExtendedLineJoin::from_core(stroke.join);
     build_segments(segments, half, stroke, join)
 }
 
@@ -168,15 +176,22 @@ pub fn stroke_to_fill_path_ext(
     }
     let half = width_px * 0.5;
     let base = &stroke.base;
-    let segments = if let Some(dash) = &base.dash {
-        apply_dash(&input.points, input.closed, dash, MAX_DASH_PERIODS)
-    } else {
-        vec![DashSegment {
+    let mut join = stroke.join;
+    let segments = match &base.dash {
+        Some(dash) if round_dashes_merge(&input.points, input.closed, dash, half, base.cap) => {
+            join = ExtendedLineJoin::Round;
+            vec![DashSegment {
+                points: input.points.clone(),
+                closed: input.closed,
+            }]
+        }
+        Some(dash) => apply_dash(&input.points, input.closed, dash, MAX_DASH_PERIODS),
+        None => vec![DashSegment {
             points: input.points.clone(),
             closed: input.closed,
-        }]
+        }],
     };
-    build_segments(segments, half, base, stroke.join)
+    build_segments(segments, half, base, join)
 }
 
 /// Shared outline builder for both entry points: turn dash-split
@@ -226,6 +241,10 @@ fn build_segments(
     join: ExtendedLineJoin,
 ) -> Vec<FlatContour> {
     let mut out: Vec<FlatContour> = Vec::with_capacity(segments.len());
+    // Every vertex can carry a round join and every piece two round
+    // caps; share the stroke's chord budget between them.
+    let arcs: usize = segments.iter().map(|s| s.points.len() + 2).sum();
+    let _chord_limit = ArcChordLimit::for_arcs(arcs);
     for mut seg in segments {
         dedup_points(&mut seg.points, seg.closed);
         if seg.points.len() == 1 {
@@ -632,6 +651,73 @@ struct DashSegment {
 /// Most dash-pattern periods one stroked sub-path is split into (see
 /// [`apply_dash`]).
 const MAX_DASH_PERIODS: f32 = 100_000.0;
+
+/// Past this many dash periods, round-capped dashes whose caps merge
+/// are drawn as one solid stroke (see [`round_dashes_merge`]).
+const MERGED_DASH_PERIODS: f32 = 1024.0;
+
+/// Length of `points` (plus the closing edge of a closed contour).
+fn polyline_length(points: &[(f32, f32)], closed: bool) -> f32 {
+    let seg = |a: (f32, f32), b: (f32, f32)| ((b.0 - a.0).powi(2) + (b.1 - a.1).powi(2)).sqrt();
+    let open: f32 = points.windows(2).map(|w| seg(w[0], w[1])).sum();
+    match (closed, points.first(), points.last()) {
+        (true, Some(&first), Some(&last)) => open + seg(last, first),
+        _ => open,
+    }
+}
+
+/// Whether a round-capped dash pattern on a pen of half-width `half`
+/// is, within the flattening tolerance, a solid stroke with round
+/// joins — and long enough for that to be worth exploiting.
+///
+/// A round cap is a disc of radius `half` around the dash end, so the
+/// dashed stroke is the union of the discs centred on every "on" point
+/// of the path. Across a gap of length `g ≤ 2·half` the two facing
+/// caps overlap, and the stroke's edge dips between them by the
+/// sagitta `half − √(half² − g²/4) ≤ g² / (4·half)`. When that is
+/// below the tolerance for the largest gap of the pattern, the union
+/// equals — to within the tolerance — the union of discs centred on
+/// *every* point of the path: the solid stroke with round joins and
+/// round caps. (Its two ends may sit up to one gap further out than the
+/// last dash's cap; a gap is then at most `2·√(half · tolerance)`, far
+/// inside the pen.)
+///
+/// A pen millions of pixels wide over a pattern a few pixels long is
+/// such a stroke, and dashing it would produce one overlapping disc per
+/// period; it is only treated as solid past [`MERGED_DASH_PERIODS`]
+/// periods, so ordinary dashed strokes are never affected.
+fn round_dashes_merge(
+    points: &[(f32, f32)],
+    closed: bool,
+    dash: &DashPattern,
+    half: f32,
+    cap: LineCap,
+) -> bool {
+    if !matches!(cap, LineCap::Round) || half <= 0.0 || half.is_nan() {
+        return false;
+    }
+    // Gaps are the odd entries; an odd-length array is repeated, which
+    // makes every entry a gap in one of its two copies.
+    let odd = dash.array.len() % 2 == 1;
+    let (mut period, mut gap, mut any_on) = (0.0f32, 0.0f32, false);
+    for (i, &v) in dash.array.iter().enumerate() {
+        let v = v.max(0.0);
+        period += v;
+        if odd || i % 2 == 1 {
+            gap = gap.max(v);
+        }
+        // A zero-length dash still paints its caps.
+        any_on |= odd || i % 2 == 0;
+    }
+    if !(any_on && period > 0.0 && period.is_finite()) {
+        return false;
+    }
+    let periods = polyline_length(points, closed) / period;
+    periods > MERGED_DASH_PERIODS
+        && periods.is_finite()
+        && gap <= 2.0 * half
+        && gap * gap <= 4.0 * half * ARC_FLATTEN_TOLERANCE
+}
 
 /// Walk `points` along their length, splitting into "on" sub-polylines
 /// according to `dash`.
@@ -1152,6 +1238,42 @@ const ARC_FLATTEN_TOLERANCE: f32 = crate::flatten::FLATTEN_TOLERANCE_PX as f32;
 /// Most chords one round join / cap arc is split into.
 const MAX_ARC_CHORDS: usize = 1024;
 
+/// Chords available to all the round joins and caps of one stroked
+/// contour. A stroke with more than `ARC_CHORD_BUDGET / MAX_ARC_CHORDS`
+/// (4 096) vertices and dash ends shares it out evenly, so a hundred
+/// thousand round dots under a huge pen cost megabytes, not gigabytes.
+const ARC_CHORD_BUDGET: usize = 1 << 22;
+
+/// Fewest chords the budget leaves a round join or cap.
+const MIN_ARC_CHORDS: usize = 4;
+
+thread_local! {
+    /// Per-arc chord cap of the stroke being built on this thread (set
+    /// by [`ArcChordLimit`] for the duration of one `build_segments`).
+    static ARC_CHORD_LIMIT: std::cell::Cell<usize> = const { std::cell::Cell::new(MAX_ARC_CHORDS) };
+}
+
+/// Scope guard holding the per-arc chord cap for one stroke.
+struct ArcChordLimit {
+    previous: usize,
+}
+
+impl ArcChordLimit {
+    /// Share [`ARC_CHORD_BUDGET`] between `arcs` potential arcs.
+    fn for_arcs(arcs: usize) -> Self {
+        let limit = (ARC_CHORD_BUDGET / arcs.max(1)).clamp(MIN_ARC_CHORDS, MAX_ARC_CHORDS);
+        ArcChordLimit {
+            previous: ARC_CHORD_LIMIT.replace(limit),
+        }
+    }
+}
+
+impl Drop for ArcChordLimit {
+    fn drop(&mut self) {
+        ARC_CHORD_LIMIT.set(self.previous);
+    }
+}
+
 /// Number of chord subdivisions needed to flatten a circular arc of
 /// radius `r` sweeping `|delta|` radians while keeping the per-chord
 /// sagitta at or below [`ARC_FLATTEN_TOLERANCE`].
@@ -1180,11 +1302,12 @@ fn arc_chord_count(r: f32, delta: f32) -> usize {
     if delta_max <= 1e-6 {
         // Degenerate guard (shouldn't trigger given the radius check
         // above); fall back to a fine fixed subdivision.
-        return ((sweep / 0.05).ceil() as usize).max(1);
+        return ((sweep / 0.05).ceil() as usize).clamp(1, ARC_CHORD_LIMIT.get());
     }
     // Capped: past a few thousand chords per arc (a pen thousands of
     // pixels wide) the sub-pixel bound is meaningless and only costs.
-    ((sweep / delta_max).ceil() as usize).clamp(1, MAX_ARC_CHORDS)
+    // The stroke's shared budget may lower the cap further.
+    ((sweep / delta_max).ceil() as usize).clamp(1, ARC_CHORD_LIMIT.get())
 }
 
 /// Radius for the interior vertices of a polygonised arc of radius `r`
