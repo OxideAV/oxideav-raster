@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.6](https://github.com/OxideAV/oxideav-raster/compare/v0.1.5...v0.1.6) - 2026-11-13
+
+### Fixed
+
+- *(stroke)* shared chord budget for round joins and caps, merged round dashes drawn solid
+- total edge order in the supersampled kernel, explicit chord budgets, typed scene validation
+
+### Other
+
+- *(parallel)* render_node shape bands against serial; trim the scene-band matrix
+- *(renderer)* soft-mask windows render only the rows their scene band owns
+- *(renderer)* scene-band parallelism under ExecutionContext, byte-identical at every budget
+- *(cache)* cold-cache cost bound; GroupCache Debug prints statistics, not pixels
+- *(clip)* windowed clip masks, nested clips intersect over their overlap
+- *(cache)* bounded group offscreens, translation-independent keys, shareable byte-budgeted cache
+
 ### Added
 
 - `Renderer::try_render` / `validate_frame`: a typed `RenderError::NonFiniteGeometry` (naming the offending part of the scene) for callers that want a NaN / ±∞ coordinate, transform, stroke parameter, gradient or opacity rejected at the API boundary instead of rendered with the affected segments dropped.
