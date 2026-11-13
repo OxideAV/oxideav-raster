@@ -152,6 +152,68 @@ fn large_groups(keyed: bool) -> VectorFrame {
     frame(root)
 }
 
+/// 200 small groups, each clipped to its own disc, inside a root group
+/// clipped to a rounded panel (so every inner clip is intersected with
+/// an inherited one), half of them translucent.
+fn clipped_groups() -> VectorFrame {
+    let disc = |cx: f32, cy: f32, r: f32| {
+        let mut p = Path::new();
+        p.move_to(Point::new(cx + r, cy));
+        for q in 1..=8 {
+            let a = q as f32 / 8.0 * std::f32::consts::TAU;
+            let am = a - std::f32::consts::TAU / 16.0;
+            p.quad_to(
+                Point::new(cx + r * 1.0824 * am.cos(), cy + r * 1.0824 * am.sin()),
+                Point::new(cx + r * a.cos(), cy + r * a.sin()),
+            );
+        }
+        p.close();
+        p
+    };
+    let mut panel = Path::new();
+    panel
+        .move_to(Point::new(60.0, 20.0))
+        .line_to(Point::new(1146.0, 20.0))
+        .quad_to(Point::new(1186.0, 20.0), Point::new(1186.0, 60.0))
+        .line_to(Point::new(1186.0, 2560.0))
+        .quad_to(Point::new(1186.0, 2600.0), Point::new(1146.0, 2600.0))
+        .line_to(Point::new(60.0, 2600.0))
+        .quad_to(Point::new(20.0, 2600.0), Point::new(20.0, 2560.0))
+        .line_to(Point::new(20.0, 60.0))
+        .quad_to(Point::new(20.0, 20.0), Point::new(60.0, 20.0))
+        .close();
+    let mut root = Group {
+        clip: Some(panel),
+        ..Group::default()
+    };
+    for i in 0..200u32 {
+        let (x, y) = (
+            30.0 + (i % 10) as f32 * 115.0,
+            30.0 + (i / 10) as f32 * 128.0,
+        );
+        let mut square = Path::new();
+        square
+            .move_to(Point::new(0.0, 0.0))
+            .line_to(Point::new(64.0, 0.0))
+            .line_to(Point::new(64.0, 64.0))
+            .line_to(Point::new(0.0, 64.0))
+            .close();
+        root.children.push(Node::Group(Group {
+            transform: Transform2D::translate(x, y),
+            opacity: if i % 2 == 0 { 1.0 } else { 0.7 },
+            clip: Some(disc(32.0, 32.0, 30.0)),
+            children: vec![Node::Path(PathNode {
+                path: square,
+                fill: Some(Paint::Solid(Rgba::opaque(200, 60 + (i % 5) as u8 * 30, 90))),
+                stroke: None,
+                fill_rule: FillRule::NonZero,
+            })],
+            ..Group::default()
+        }));
+    }
+    frame(root)
+}
+
 fn frame(root: Group) -> VectorFrame {
     VectorFrame {
         width: CANVAS_W as f32,
@@ -214,6 +276,13 @@ fn bench_group_cache(c: &mut Criterion) {
             })
         });
     }
+
+    // Clip masks: 200 clipped groups under an inherited clip.
+    g.bench_function("clipped_groups200_nested", |b| {
+        let scene = clipped_groups();
+        let r = Renderer::new(CANVAS_W, CANVAS_H);
+        b.iter(|| black_box(r.render(black_box(&scene))))
+    });
 
     // Steady state while the page scrolls: every frame moves every pen
     // position by a whole number of pixels vertically.

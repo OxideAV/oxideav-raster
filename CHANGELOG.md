@@ -19,12 +19,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - group cache keys no longer include the whole-pixel part of the translation, and are compared structurally (key, linear transform bits, sub-pixel phase, pixel-affecting renderer settings) instead of through a 64-bit hash. A keyed group is drawn at its translation snapped to the sub-pixel grid (≤ ⅛ px per axis at the default; none on the grid) and is always composited as an isolated group, cached or not.
 - the default cache is bounded by bytes, not by 256 entries; `Renderer::with_cache_capacity` still adds an entry limit. `CacheStats::capacity` reports `usize::MAX` without one.
-- group-opacity and soft-mask offscreen images are rasterised at a window origin instead of the canvas origin, which can move an anti-aliased pixel by one 8-bit step (f32 rounding of device coordinates).
+- group-opacity and soft-mask offscreen images are rasterised at a window origin instead of the canvas origin, which can move a handful of anti-aliased pixels by one 8-bit coverage step (f32 rounding of device coordinates; measured on six nested clipped / translucent / masked 160 × 120 scenes: 1 differing byte in total with the exact-area kernel).
 
 ### Performance
 
 - group cache miss: the offscreen bitmap is the size of the group's analytic bounds (control-point hull, stroke reach, clip) instead of the canvas, with no bounding-box scan; hits share the bitmap instead of copying it. 300 keyed 16 px glyph groups on a 1206 × 2622 canvas: first frame 1 245 → 1.1 ms, steady state 1 227 → 0.26 ms (0.18 ms with a renderer per frame around a shared cache); four ~600 px keyed panels: first frame 24.1 → 6.9 ms, steady 2.2 → 1.1 ms (`BENCHMARKS.md`).
 - group opacity and soft masks render into bounds ∩ canvas windows instead of canvas-sized buffers.
+- clip masks are windowed coverages (the clip path's own pixel box) instead of canvas-sized masks, and nested clips intersect over the overlap of their windows rather than over the whole canvas; output is byte-identical. 200 disc-clipped groups under an inherited clip on 1206 × 2622: 19.4 → 9.7 ms (`group_cache/clipped_groups200_nested`).
 
 ### Fixed
 

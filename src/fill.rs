@@ -536,45 +536,90 @@ impl Coverage {
         }
     }
 
-    /// Expand to a canvas-sized mask.
-    pub(crate) fn to_canvas_mask(&self, width: u32, height: u32) -> AlphaMask {
-        let mut full = AlphaMask::new(width, height);
-        let mw = self.mask.width as usize;
-        for y in 0..self.mask.height {
-            let dy = self.y0 + y;
-            if dy >= height {
-                break;
-            }
-            let n = (self.mask.width).min(width.saturating_sub(self.x0)) as usize;
-            let src = y as usize * mw;
-            let dst = (dy * width + self.x0) as usize;
-            full.data[dst..dst + n].copy_from_slice(&self.mask.data[src..src + n]);
+    /// Coverage at device pixel `(x, y)`; 0 outside the window.
+    pub(crate) fn get(&self, x: u32, y: u32) -> u8 {
+        match (x.checked_sub(self.x0), y.checked_sub(self.y0)) {
+            (Some(lx), Some(ly)) => self.mask.get(lx, ly),
+            _ => 0,
         }
-        full
     }
 
-    /// Multiply in (per-pixel minimum with) a canvas-sized clip mask.
-    pub(crate) fn intersect_clip(mut self, clip: &AlphaMask) -> Self {
+    /// The mask row of device row `y` (covering device columns
+    /// `x0 .. x0 + mask.width`), or `None` when the row is outside the
+    /// window.
+    pub(crate) fn row(&self, y: u32) -> Option<&[u8]> {
+        let ly = y.checked_sub(self.y0)?;
+        if ly >= self.mask.height {
+            return None;
+        }
+        let w = self.mask.width as usize;
+        Some(&self.mask.data[ly as usize * w..(ly as usize + 1) * w])
+    }
+
+    /// The mask together with the device position of its pixel
+    /// `(0, 0)`.
+    pub(crate) fn as_blit_mask(&self) -> (&AlphaMask, i64, i64) {
+        (&self.mask, self.x0 as i64, self.y0 as i64)
+    }
+
+    /// Per-pixel minimum with `clip` (which reads as 0 outside its
+    /// window), in place: the window is kept, pixels outside `clip`'s
+    /// window become 0.
+    pub(crate) fn intersect_clip(mut self, clip: &Coverage) -> Self {
         let mw = self.mask.width as usize;
-        for y in 0..self.mask.height {
-            let dy = self.y0 + y;
-            if dy >= clip.height {
-                self.mask.data[y as usize * mw..(y as usize + 1) * mw].fill(0);
-                continue;
-            }
-            let crow = (dy * clip.width) as usize;
-            let row = &mut self.mask.data[y as usize * mw..(y as usize + 1) * mw];
-            for (x, v) in row.iter_mut().enumerate() {
-                let dx = self.x0 as usize + x;
-                let c = if dx < clip.width as usize {
-                    clip.data[crow + dx]
-                } else {
-                    0
-                };
-                *v = (*v).min(c);
+        if mw == 0 {
+            return self;
+        }
+        // Columns of this window that `clip`'s window covers.
+        let lo = clip.x0.clamp(self.x0, self.x0 + self.mask.width);
+        let hi = (clip.x0 + clip.mask.width).clamp(lo, self.x0 + self.mask.width);
+        let (l, h) = ((lo - self.x0) as usize, (hi - self.x0) as usize);
+        for (y, row) in self.mask.data.chunks_exact_mut(mw).enumerate() {
+            match clip.row(self.y0 + y as u32) {
+                Some(crow) if l < h => {
+                    row[..l].fill(0);
+                    row[h..].fill(0);
+                    let c0 = (lo - clip.x0) as usize;
+                    for (v, c) in row[l..h].iter_mut().zip(&crow[c0..c0 + (h - l)]) {
+                        *v = (*v).min(*c);
+                    }
+                }
+                _ => row.fill(0),
             }
         }
         self
+    }
+
+    /// The intersection of two clips: per-pixel minimum over the
+    /// overlap of the two windows (each reads as 0 outside its own).
+    pub(crate) fn intersect(&self, other: &Coverage) -> Coverage {
+        let x0 = self.x0.max(other.x0);
+        let y0 = self.y0.max(other.y0);
+        let x1 = (self.x0 + self.mask.width).min(other.x0 + other.mask.width);
+        let y1 = (self.y0 + self.mask.height).min(other.y0 + other.mask.height);
+        if x0 >= x1 || y0 >= y1 {
+            return Coverage::empty();
+        }
+        let (w, h) = (x1 - x0, y1 - y0);
+        let mut mask = AlphaMask::new(w, h);
+        for (y, out) in mask.data.chunks_exact_mut(w as usize).enumerate() {
+            let dy = y0 + y as u32;
+            // Both rows exist: `dy` lies in both windows.
+            let (Some(a), Some(b)) = (self.row(dy), other.row(dy)) else {
+                continue;
+            };
+            let a = &a[(x0 - self.x0) as usize..][..w as usize];
+            let b = &b[(x0 - other.x0) as usize..][..w as usize];
+            for ((o, a), b) in out.iter_mut().zip(a).zip(b) {
+                *o = (*a).min(*b);
+            }
+        }
+        Coverage {
+            mask,
+            x0,
+            y0,
+            bounds: Some((x0, y0, x1 - 1, y1 - 1)),
+        }
     }
 }
 
@@ -1849,6 +1894,69 @@ mod tests {
     }
 
     // ---- exact-area kernel -------------------------------------------
+
+    /// A windowed coverage of constant value `v`.
+    fn window(x0: u32, y0: u32, w: u32, h: u32, v: u8) -> Coverage {
+        Coverage {
+            mask: AlphaMask {
+                width: w,
+                height: h,
+                data: vec![v; (w * h) as usize],
+            },
+            x0,
+            y0,
+            bounds: Some((x0, y0, x0 + w - 1, y0 + h - 1)),
+        }
+    }
+
+    #[test]
+    fn windowed_clip_intersection_matches_the_canvas_sized_minimum() {
+        let canvas = |c: &Coverage| -> Vec<u8> {
+            let mut out = vec![0u8; 16 * 12];
+            for y in 0..12u32 {
+                for x in 0..16u32 {
+                    out[(y * 16 + x) as usize] = c.get(x, y);
+                }
+            }
+            out
+        };
+        let cases = [
+            (window(2, 1, 6, 5, 200), window(5, 3, 9, 8, 120)),
+            (window(0, 0, 16, 12, 90), window(4, 4, 3, 3, 255)),
+            (window(1, 1, 3, 3, 255), window(8, 6, 4, 4, 255)), // disjoint
+            (window(3, 2, 5, 5, 10), window(3, 2, 5, 5, 20)),
+            (window(6, 0, 2, 12, 77), window(0, 5, 16, 2, 33)),
+        ];
+        for (a, b) in cases {
+            let want: Vec<u8> = canvas(&a)
+                .iter()
+                .zip(canvas(&b))
+                .map(|(p, q)| (*p).min(q))
+                .collect();
+            assert_eq!(canvas(&a.intersect(&b)), want);
+            assert_eq!(canvas(&b.intersect(&a)), want);
+            assert_eq!(canvas(&a.clone().intersect_clip(&b)), want);
+            assert_eq!(canvas(&b.clone().intersect_clip(&a)), want);
+        }
+        let e = Coverage::empty();
+        let a = window(2, 2, 4, 4, 255);
+        assert!(canvas(&a.intersect(&e)).iter().all(|&v| v == 0));
+        assert!(
+            canvas(&a.clone().intersect_clip(&e))
+                .iter()
+                .all(|&v| v == 0)
+        );
+        assert!(
+            canvas(&e.clone().intersect_clip(&a))
+                .iter()
+                .all(|&v| v == 0)
+        );
+        assert_eq!(a.row(1), None);
+        assert_eq!(a.row(6), None);
+        assert_eq!(a.row(5).map(<[u8]>::len), Some(4));
+        assert_eq!(a.get(1, 3), 0);
+        assert_eq!(a.get(5, 5), 255);
+    }
 
     #[test]
     fn analytic_pixel_aligned_rectangle_is_exact() {

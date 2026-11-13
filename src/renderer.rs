@@ -525,11 +525,11 @@ impl Renderer {
         flatten_path_with(commands, t, &opts)
     }
 
-    /// Rasterize `contours` into a canvas-sized mask (clip paths).
-    fn rasterize_canvas_mask(&self, contours: &[FlatContour], fill_rule: FillRule) -> AlphaMask {
-        self.rasterize_with_bounds(contours, fill_rule)
-            .0
-            .to_canvas_mask(self.width, self.height)
+    /// Rasterize a clip path's `contours` (non-zero rule) into a
+    /// windowed coverage: the mask spans only the pixels the path can
+    /// touch and reads as 0 everywhere else.
+    fn rasterize_clip(&self, contours: &[FlatContour]) -> Coverage {
+        self.rasterize_with_bounds(contours, FillRule::NonZero).0
     }
 
     /// Render a single node at the given transform. Returns a packed
@@ -564,7 +564,7 @@ impl Renderer {
         parent_opacity: f32,
         buf: &mut [u8],
         stride: usize,
-        clip_mask: Option<&AlphaMask>,
+        clip_mask: Option<&Coverage>,
     ) {
         let mut local = parent_transform.compose(&g.transform);
         // Bitmap-cache fast path: a group tagged with a `cache_key` is
@@ -619,7 +619,7 @@ impl Renderer {
                 h,
                 ox,
                 oy,
-                clip_mask.map(|c| (c, 0, 0)),
+                clip_mask.map(Coverage::as_blit_mask),
                 opacity,
                 None,
             );
@@ -629,15 +629,15 @@ impl Renderer {
         // mask is filled with NonZero of the clip path under the
         // *current* (post-transform) coordinate system, intersected
         // with whatever clip mask is being inherited.
-        let group_clip_storage: Option<AlphaMask> = g.clip.as_ref().map(|clip_path| {
+        let group_clip_storage: Option<Coverage> = g.clip.as_ref().map(|clip_path| {
             let cs = self.flatten_fill(&clip_path.commands, &local);
-            let m = self.rasterize_canvas_mask(&cs, FillRule::NonZero);
+            let m = self.rasterize_clip(&cs);
             match clip_mask {
-                Some(parent) => intersect_masks(parent, &m),
+                Some(parent) => m.intersect(parent),
                 None => m,
             }
         });
-        let effective_clip: Option<&AlphaMask> = group_clip_storage.as_ref().or(clip_mask);
+        let effective_clip: Option<&Coverage> = group_clip_storage.as_ref().or(clip_mask);
         // Reached only when `g.opacity == 1.0` (the partially-transparent
         // case isolated offscreen above), so the group contributes no
         // extra alpha and children inherit the parent opacity directly.
@@ -681,7 +681,7 @@ impl Renderer {
         parent_opacity: f32,
         buf: &mut [u8],
         stride: usize,
-        clip_mask: Option<&AlphaMask>,
+        clip_mask: Option<&Coverage>,
     ) -> Option<Transform2D> {
         let grid = self.cache_subpixel_grid;
         let (Some((ix, fx)), Some((iy, fy))) = (snap_axis(local.e, grid), snap_axis(local.f, grid))
@@ -760,7 +760,7 @@ impl Renderer {
             bitmap.height,
             ix + bitmap.dx,
             iy + bitmap.dy,
-            clip_mask.map(|c| (c, 0, 0)),
+            clip_mask.map(Coverage::as_blit_mask),
             parent_opacity * g.opacity,
             None,
         );
@@ -819,9 +819,9 @@ impl Renderer {
         let mut off = vec![0u8; stride * (h as usize)];
         // The group's own clip only — the inherited clip is applied
         // when the window is blitted.
-        let clip: Option<AlphaMask> = g.clip.as_ref().map(|clip_path| {
+        let clip: Option<Coverage> = g.clip.as_ref().map(|clip_path| {
             let cs = sub.flatten_fill(&clip_path.commands, &t);
-            sub.rasterize_canvas_mask(&cs, FillRule::NonZero)
+            sub.rasterize_clip(&cs)
         });
         for child in &g.children {
             sub.draw_node(child, t, 1.0, &mut off, stride, clip.as_ref());
@@ -844,7 +844,7 @@ impl Renderer {
         group_opacity: f32,
         buf: &mut [u8],
         stride: usize,
-        clip_mask: Option<&AlphaMask>,
+        clip_mask: Option<&Coverage>,
     ) {
         match node {
             Node::Path(p) => self.draw_path(p, transform, group_opacity, buf, stride, clip_mask),
@@ -891,7 +891,7 @@ impl Renderer {
         group_opacity: f32,
         buf: &mut [u8],
         stride: usize,
-        clip_mask: Option<&AlphaMask>,
+        clip_mask: Option<&Coverage>,
     ) {
         // Both subtrees are rasterised into a window covering only the
         // pixels where the content *and* the mask can be non-zero
@@ -971,7 +971,7 @@ impl Renderer {
         group_opacity: f32,
         buf: &mut [u8],
         stride: usize,
-        clip_mask: Option<&AlphaMask>,
+        clip_mask: Option<&Coverage>,
     ) {
         // Fill pass.
         if let Some(fill) = &node.fill {
@@ -1025,7 +1025,7 @@ impl Renderer {
         stride: usize,
         contours: &[FlatContour],
         fill_rule: FillRule,
-        clip: Option<&AlphaMask>,
+        clip: Option<&Coverage>,
         paint_row: &RowPainter<'_>,
     ) {
         // Clip, then hand a row to the painter.
@@ -1036,22 +1036,27 @@ impl Renderer {
                        row: &[u8],
                        tmp: &mut Vec<u8>,
                        scratch: &mut Vec<Rgba>| {
-            let cov: &[u8] = match clip {
-                None => row,
+            // Under a clip only the part of the row inside the clip's
+            // window can be painted (the clip is 0 outside it).
+            let (x0, cov): (u32, &[u8]) = match clip {
+                None => (x0, row),
                 Some(c) => {
-                    if y >= c.height {
+                    let Some(crow) = c.row(y) else {
+                        return;
+                    };
+                    let lo = x0.max(c.x0);
+                    let hi = (x0 + row.len() as u32).min(c.x0 + c.mask.width);
+                    if lo >= hi {
                         return;
                     }
-                    let off = (y * c.width + x0) as usize;
-                    let n = row.len().min(c.width.saturating_sub(x0) as usize);
                     tmp.clear();
                     tmp.extend(
-                        row[..n]
+                        row[(lo - x0) as usize..(hi - x0) as usize]
                             .iter()
-                            .zip(&c.data[off..off + n])
+                            .zip(&crow[(lo - c.x0) as usize..(hi - c.x0) as usize])
                             .map(|(a, b)| (*a).min(*b)),
                     );
-                    tmp
+                    (lo, tmp)
                 }
             };
             let off = (y - row_base) as usize * stride + x0 as usize * 4;
@@ -1134,7 +1139,7 @@ impl Renderer {
         stride: usize,
         contours: &[FlatContour],
         fill_rule: FillRule,
-        clip: Option<&AlphaMask>,
+        clip: Option<&Coverage>,
         paint: &Paint,
         transform: &Transform2D,
         group_opacity: f32,
@@ -1220,7 +1225,7 @@ impl Renderer {
         group_opacity: f32,
         buf: &mut [u8],
         stride: usize,
-        clip_mask: Option<&AlphaMask>,
+        clip_mask: Option<&Coverage>,
     ) {
         // Build a rectangle for the image's user-space bounds, fill
         // it with NonZero, then sample the embedded frame as the
@@ -2208,6 +2213,9 @@ fn blit_rgba_at(
         let n = (x_hi - x_lo) as i64;
         let k_lo = (-c0).clamp(0, n);
         let k_hi = (m.width as i64 - c0).clamp(k_lo, n);
+        if k_lo >= k_hi {
+            continue; // the mask's columns miss the blit entirely
+        }
         let (k_lo, k_hi) = (k_lo as usize, k_hi as usize);
         let m0 = my as usize * m.width as usize + (c0 + k_lo as i64) as usize;
         let cov_row = &m.data[m0..m0 + (k_hi - k_lo)];
@@ -2351,19 +2359,6 @@ fn alpha_bbox(buf: &[u8], stride: usize, width: u32, height: u32) -> Option<(u32
         max_y = y;
     }
     any.then_some((min_x, min_y, max_x, max_y))
-}
-
-/// Intersect two alpha masks (per-pixel min). Both must have the same
-/// dimensions; mismatched inputs return an empty mask.
-fn intersect_masks(a: &AlphaMask, b: &AlphaMask) -> AlphaMask {
-    if a.width != b.width || a.height != b.height {
-        return AlphaMask::default();
-    }
-    let mut out = AlphaMask::new(a.width, a.height);
-    for i in 0..a.data.len() {
-        out.data[i] = a.data[i].min(b.data[i]);
-    }
-    out
 }
 
 /// Build a closed rectangular [`Path`] for `r`.
@@ -3179,6 +3174,55 @@ mod tests {
         let q = inv.apply(t.apply(p));
         assert!((q.x - p.x).abs() < 1e-4);
         assert!((q.y - p.y).abs() < 1e-4);
+    }
+
+    #[test]
+    fn blit_clips_negative_offsets_and_windowed_masks() {
+        // 4×4 opaque source at (-2, -1) on a 6×6 destination: only its
+        // lower-right 2×3 lands, at the top-left corner.
+        let src = [9u8, 8, 7, 255].repeat(16);
+        let mut dst = vec![0u8; 6 * 6 * 4];
+        blit_rgba_at(&mut dst, 24, 6, 6, &src, 4, 4, -2, -1, None, 1.0, None);
+        let painted: Vec<usize> = (0..36).filter(|i| dst[i * 4 + 3] != 0).collect();
+        assert_eq!(painted, vec![0, 1, 6, 7, 12, 13]);
+        // A 2×2 mask window at (3, 3) lets through only the pixels it
+        // covers; a window that misses the blit lets through nothing.
+        for (mx, my, want) in [
+            (3i64, 3i64, vec![21usize, 22, 27, 28]),
+            (0, 0, vec![]),
+            (5, 2, vec![17, 23]),
+            (-7, 3, vec![]),
+            (40, 40, vec![]),
+        ] {
+            let mask = AlphaMask {
+                width: 2,
+                height: 2,
+                data: vec![255; 4],
+            };
+            let mut dst = vec![0u8; 6 * 6 * 4];
+            blit_rgba_at(
+                &mut dst,
+                24,
+                6,
+                6,
+                &src,
+                4,
+                4,
+                2,
+                2,
+                Some((&mask, mx, my)),
+                1.0,
+                None,
+            );
+            let painted: Vec<usize> = (0..36).filter(|i| dst[i * 4 + 3] != 0).collect();
+            assert_eq!(painted, want, "mask at ({mx}, {my})");
+        }
+        // Entirely off the destination: nothing happens.
+        let mut dst = vec![0u8; 6 * 6 * 4];
+        for (ox, oy) in [(-4, 0), (6, 0), (0, -4), (0, 6), (i64::MIN / 4, 0)] {
+            blit_rgba_at(&mut dst, 24, 6, 6, &src, 4, 4, ox, oy, None, 1.0, None);
+        }
+        assert!(dst.iter().all(|&b| b == 0));
     }
 
     #[test]

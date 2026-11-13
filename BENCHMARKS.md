@@ -33,6 +33,7 @@ figure is the median of the quietest of five passes and the unkeyed rows
 | `large4_keyed_first_frame` | 24.1 ms | 6.9 ms |
 | `large4_keyed_steady_same_renderer` | 2.2 ms | 1.1 ms |
 | `large4_keyed_steady_shared_cache` | n/a | 1.3 ms |
+| `clipped_groups200_nested` (windowed clip masks) | 19.4 ms | 9.7 ms |
 
 What changed: a cache miss used to zero a canvas-sized buffer (12.6 MB
 here), rasterise into it and scan all of it for the touched bounding
