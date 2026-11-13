@@ -23,7 +23,7 @@
 //! the sub-pixel snapping of its position. Anything non-finite makes the affected bounds
 //! [`Bounds::EVERYTHING`], which callers treat as "the whole canvas".
 
-use oxideav_core::{Group, Node, Path, PathCommand, Point, Stroke, Transform2D};
+use oxideav_core::{Group, Node, Path, PathCommand, PathNode, Point, Stroke, Transform2D};
 
 use crate::flatten::flatten_arc_to_cubics;
 
@@ -320,21 +320,25 @@ fn stroke_reach(stroke: &Stroke, t: &Transform2D) -> Option<f64> {
     Some(0.5 * w * limit * max_stretch(t))
 }
 
+/// Bounds of a path node's fill and stroke under the device transform
+/// `t`.
+pub(crate) fn path_node_bounds(p: &PathNode, t: &Transform2D) -> Bounds {
+    let reach = p.stroke.as_ref().and_then(|s| stroke_reach(s, t));
+    if p.fill.is_none() && reach.is_none() {
+        return Bounds::EMPTY;
+    }
+    let b = path_points_bounds(&p.path, t);
+    match reach {
+        Some(r) => b.grown(r),
+        None => b,
+    }
+}
+
 /// Bounds of everything `node` can paint under the device transform
 /// `t`.
 pub(crate) fn node_bounds(node: &Node, t: &Transform2D) -> Bounds {
     match node {
-        Node::Path(p) => {
-            let reach = p.stroke.as_ref().and_then(|s| stroke_reach(s, t));
-            if p.fill.is_none() && reach.is_none() {
-                return Bounds::EMPTY;
-            }
-            let b = path_points_bounds(&p.path, t);
-            match reach {
-                Some(r) => b.grown(r),
-                None => b,
-            }
-        }
+        Node::Path(p) => path_node_bounds(p, t),
         Node::Group(g) => {
             let b = group_content_bounds(g, &t.compose(&g.transform));
             // A keyed group is drawn at a translation snapped to the
@@ -389,7 +393,7 @@ pub(crate) fn group_content_bounds(g: &Group, local: &Transform2D) -> Bounds {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oxideav_core::{FillRule, Paint, PathNode, Rgba};
+    use oxideav_core::{FillRule, Paint, Rgba};
 
     fn rect(x: f32, y: f32, w: f32, h: f32) -> Path {
         let mut p = Path::new();

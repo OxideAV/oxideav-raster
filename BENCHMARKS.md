@@ -35,6 +35,21 @@ figure is the median of the quietest of five passes and the unkeyed rows
 | `large4_keyed_steady_shared_cache` | n/a | 1.3 ms |
 | `clipped_groups200_nested` (windowed clip masks) | 19.4 ms | 9.7 ms |
 
+Scene bands (`scenes` harness, same loaded machine, back-to-back runs):
+
+| bench | before | after |
+| ----- | -----: | ----: |
+| `paths_1080p` (serial) | 197 ms | 184–216 ms |
+| `paths_1080p_mt4` | 208 ms | 68–70 ms |
+| `gradient_linear_4k_mt4` | 12.2 ms | 10.9–11.3 ms |
+| `big_circle_4k_mt4` | 10.0 ms | 8.4 ms |
+
+Until now a thread budget only split the scan of one large shape into
+row bands, so a scene of thousands of small shapes ran serially whatever
+the budget. The scene walk itself is now banded: each worker owns a
+horizontal band of the canvas, processes every node's geometry exactly
+as the serial walk does and scans / composites only its own rows.
+
 What changed: a cache miss used to zero a canvas-sized buffer (12.6 MB
 here), rasterise into it and scan all of it for the touched bounding
 box; and it missed almost always, because the key included the

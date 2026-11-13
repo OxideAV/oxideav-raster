@@ -11,9 +11,9 @@ use oxideav_core::{
 };
 
 use crate::blend::BlendMode;
-use crate::bounds::{group_content_bounds, node_bounds};
+use crate::bounds::{group_content_bounds, node_bounds, path_node_bounds};
 use crate::cache::{BitmapKey, CacheStats, CachedBitmap, GroupCache, RenderSettings, snap_axis};
-use crate::composite::{SolidSource, composite_coverage_rect, composite_row};
+use crate::composite::{SolidSource, composite_coverage_rect, composite_rect_in, composite_row};
 use crate::fill::{AlphaMask, Coverage, CoverageMode, EdgeTable, rasterize_fill_with_bounds};
 use crate::filter::PreserveAspectRatio;
 use crate::flatten::{FLATTEN_TOLERANCE_PX, FlatContour, FlattenOptions, flatten_path_with};
@@ -147,6 +147,12 @@ pub struct Renderer {
     /// Bitmap cache for memoised group subtrees (a shared handle, so
     /// it survives `Clone` and can be handed to other renderers).
     cache: GroupCache,
+    /// `Some((y0, y1))` on a scene-band worker: this renderer owns
+    /// canvas rows `y0..y1` only, and the pixel buffer handed through
+    /// the scene walk holds exactly those rows. Geometry is still
+    /// processed in full canvas coordinates, so every row comes out as
+    /// in a serial render.
+    band: Option<(u32, u32)>,
 }
 
 /// Texture sampling filter for `Node::Image` paints.
@@ -233,6 +239,9 @@ const PARALLEL_MIN_AREA: u64 = 1 << 18;
 /// Minimum rows per parallel band.
 const PARALLEL_MIN_ROWS: u32 = 64;
 
+/// Minimum rows per scene band (see [`Renderer::draw_scene`]).
+const SCENE_BAND_MIN_ROWS: u32 = 16;
+
 /// Historical default entry count of the group cache.
 ///
 /// The cache is now bounded by bytes
@@ -273,6 +282,7 @@ impl Renderer {
             threads: 1,
             cache_subpixel_grid: DEFAULT_CACHE_SUBPIXEL_GRID,
             cache: GroupCache::new(),
+            band: None,
         }
     }
 
@@ -398,7 +408,7 @@ impl Renderer {
                 }
             }
             let up = Transform2D::scale(k as f32, k as f32).compose(&initial);
-            big.draw_group(&frame.root, up, 1.0, &mut hi, big_stride, None);
+            big.draw_scene(&frame.root, up, &mut hi, big_stride);
             downsample_premultiplied(
                 &hi,
                 big_stride,
@@ -409,12 +419,125 @@ impl Renderer {
                 self.height,
             );
         } else {
-            self.draw_group(&frame.root, initial, 1.0, &mut buf, stride, None);
+            self.draw_scene(&frame.root, initial, &mut buf, stride);
         }
         VideoFrame {
             pts: frame.pts,
             planes: vec![VideoPlane { stride, data: buf }],
         }
+    }
+
+    /// Walk the scene into `buf` (the whole canvas).
+    ///
+    /// With a thread budget the canvas is cut into horizontal bands,
+    /// one worker each. Every worker walks the whole scene with the
+    /// same geometry in the same canvas coordinates — same flattened
+    /// outlines, same edge tables, same offscreen windows — and only
+    /// restricts which rows it scans, composites and blits, skipping
+    /// nodes whose bounds miss its band. A row's pixels depend on
+    /// nothing outside the row's own inputs, so the result is
+    /// byte-identical to the serial walk at every budget.
+    fn draw_scene(&self, root: &Group, transform: Transform2D, buf: &mut [u8], stride: usize) {
+        let workers = self
+            .threads
+            .min((self.height / SCENE_BAND_MIN_ROWS) as usize)
+            .max(1);
+        if workers <= 1 || stride == 0 {
+            self.draw_group(root, transform, 1.0, buf, stride, None);
+            return;
+        }
+        let band_rows = self.height.div_ceil(workers as u32);
+        std::thread::scope(|sc| {
+            for (i, chunk) in buf.chunks_mut(band_rows as usize * stride).enumerate() {
+                let y0 = i as u32 * band_rows;
+                let mut worker = self.clone();
+                worker.band = Some((y0, (y0 + band_rows).min(self.height)));
+                worker.threads = 1;
+                sc.spawn(move || worker.draw_group(root, transform, 1.0, chunk, stride, None));
+            }
+        });
+    }
+
+    /// The canvas rows `y0..y1` this renderer draws (all of them unless
+    /// it is a scene-band worker).
+    fn rows(&self) -> (u32, u32) {
+        self.band.unwrap_or((0, self.height))
+    }
+
+    /// Whether canvas rows `y0..y1` overlap this renderer's rows.
+    fn owns_rows(&self, y0: i64, y1: i64) -> bool {
+        let (b0, b1) = self.rows();
+        y0 < b1 as i64 && y1 > b0 as i64
+    }
+
+    /// [`blit_rgba_at`] onto this renderer's rows of the canvas.
+    #[allow(clippy::too_many_arguments)]
+    fn blit(
+        &self,
+        buf: &mut [u8],
+        stride: usize,
+        src: &[u8],
+        src_width: u32,
+        src_height: u32,
+        offset_x: i64,
+        offset_y: i64,
+        mask: Option<(&AlphaMask, i64, i64)>,
+        extra_alpha: f32,
+        src_rect: Option<(u32, u32, u32, u32)>,
+    ) {
+        let (b0, b1) = self.rows();
+        blit_rgba_at(
+            buf,
+            stride,
+            self.width,
+            b1 - b0,
+            src,
+            src_width,
+            src_height,
+            offset_x,
+            offset_y - b0 as i64,
+            mask.map(|(m, mx, my)| (m, mx, my - b0 as i64)),
+            extra_alpha,
+            src_rect,
+        );
+    }
+
+    /// Composite `paint_at` (device coordinates) through `cov` over the
+    /// inclusive device rectangle `rect`, onto this renderer's rows.
+    fn composite_cov(
+        &self,
+        buf: &mut [u8],
+        stride: usize,
+        cov: &Coverage,
+        extra_alpha: f32,
+        rect: (u32, u32, u32, u32),
+        mut paint_at: impl FnMut(u32, u32) -> Rgba,
+    ) {
+        let (rx0, ry0, rx1, ry1) = rect;
+        if cov.mask.is_empty() || rx1 < cov.x0 || ry1 < cov.y0 {
+            return;
+        }
+        let (b0, b1) = self.rows();
+        composite_rect_in(
+            buf,
+            stride,
+            self.width,
+            b1 - b0,
+            &cov.mask,
+            cov.x0 as i32,
+            cov.y0 as i32 - b0 as i32,
+            extra_alpha,
+            self.blend_mode,
+            matches!(self.compositing_space, InterpolationSpace::LinearRgb),
+            (
+                rx0.saturating_sub(cov.x0),
+                ry0.saturating_sub(cov.y0),
+                rx1 - cov.x0,
+                ry1 - cov.y0,
+            ),
+            // The buffer's row 0 is canvas row `b0`.
+            |x, y| paint_at(x, y + b0),
+        );
     }
 
     /// [`Renderer::render`] behind a scene check: a NaN or ±∞ anywhere
@@ -602,17 +725,23 @@ impl Renderer {
             };
             let (ox, oy) = (window_origin(win.x0), window_origin(win.y0));
             let (w, h) = ((win.x1 - ox) as u32, (win.y1 - oy) as u32);
-            let off = self.render_group_window(g, &local, ox, oy, w, h);
-            blit_rgba_at(
+            // The window rows this renderer owns (all of them unless it
+            // is a scene-band worker).
+            let (b0, b1) = self.rows();
+            let r0 = (b0 as i64 - oy).clamp(0, h as i64) as u32;
+            let r1 = (b1 as i64 - oy).clamp(0, h as i64) as u32;
+            if r0 >= r1 {
+                return;
+            }
+            let off = self.render_group_window(g, &local, ox, oy, w, h, (r0, r1));
+            self.blit(
                 buf,
                 stride,
-                self.width,
-                self.height,
                 &off,
                 w,
-                h,
+                r1 - r0,
                 ox,
-                oy,
+                oy + r0 as i64,
                 clip_mask.map(Coverage::as_blit_mask),
                 opacity,
                 None,
@@ -724,6 +853,10 @@ impl Renderer {
                         // reason to rasterise it now.
                         return None;
                     }
+                    if !self.owns_rows(pb.y0 + iy, pb.y1 + iy) {
+                        // Another scene band's rows: that band draws it.
+                        return None;
+                    }
                     let area = pb.area();
                     if area.saturating_mul(4) > self.cache.max_entry_bytes() as u64
                         || area > visible.saturating_mul(4) + CACHE_OFFCANVAS_SLACK_PX
@@ -736,7 +869,7 @@ impl Renderer {
                         height: h,
                         dx: pb.x0,
                         dy: pb.y0,
-                        rgba: self.render_group_window(g, &snapped, pb.x0, pb.y0, w, h),
+                        rgba: self.render_group_window(g, &snapped, pb.x0, pb.y0, w, h, (0, h)),
                     }
                 };
                 let bitmap = Arc::new(bitmap);
@@ -744,11 +877,9 @@ impl Renderer {
                 bitmap
             }
         };
-        blit_rgba_at(
+        self.blit(
             buf,
             stride,
-            self.width,
-            self.height,
             &bitmap.rgba,
             bitmap.width,
             bitmap.height,
@@ -785,9 +916,10 @@ impl Renderer {
     }
 
     /// Render `g`'s children — at **full opacity**, with only the
-    /// group's own clip path applied — into a fresh `w × h` RGBA buffer
-    /// whose top-left pixel is device pixel `(ox, oy)` of the
-    /// coordinate system `local` maps into.
+    /// group's own clip path applied — into a fresh RGBA buffer holding
+    /// rows `rows.0 .. rows.1` of a `w × h` window whose top-left pixel
+    /// is device pixel `(ox, oy)` of the coordinate system `local` maps
+    /// into.
     ///
     /// Rendering children at full opacity (rather than pre-multiplying
     /// each child by `g.opacity`) is what makes group opacity behave as
@@ -806,11 +938,15 @@ impl Renderer {
         oy: i64,
         w: u32,
         h: u32,
+        rows: (u32, u32),
     ) -> Vec<u8> {
-        let sub = self.window_renderer(w, h);
+        let mut sub = self.window_renderer(w, h);
+        if rows != (0, h) {
+            sub.band = Some(rows);
+        }
         let t = shift_transform(local, ox, oy);
         let stride = (w as usize) * 4;
-        let mut off = vec![0u8; stride * (h as usize)];
+        let mut off = vec![0u8; stride * ((rows.1 - rows.0) as usize)];
         // The group's own clip only — the inherited clip is applied
         // when the window is blitted.
         let clip: Option<Coverage> = g.clip.as_ref().map(|clip_path| {
@@ -828,6 +964,7 @@ impl Renderer {
         let mut sub = self.clone();
         sub.width = w;
         sub.height = h;
+        sub.band = None;
         sub
     }
 
@@ -897,6 +1034,9 @@ impl Renderer {
         };
         let (ox, oy) = (window_origin(win.x0), window_origin(win.y0));
         let (w, h) = ((win.x1 - ox) as u32, (win.y1 - oy) as u32);
+        if !self.owns_rows(oy, oy + h as i64) {
+            return; // another scene band's rows
+        }
         let sub = self.window_renderer(w, h);
         let t = shift_transform(&transform, ox, oy);
         let off_stride = (w as usize) * 4;
@@ -942,11 +1082,9 @@ impl Renderer {
         // Blit content_buf onto buf, modulated by cov (soft-mask
         // coverage, treated as a per-pixel alpha multiplier exactly
         // like a clip mask) + group_opacity.
-        blit_rgba_at(
+        self.blit(
             buf,
             stride,
-            self.width,
-            self.height,
             &content_buf,
             w,
             h,
@@ -967,6 +1105,15 @@ impl Renderer {
         stride: usize,
         clip_mask: Option<&Coverage>,
     ) {
+        // A scene-band worker skips paths that cannot reach its rows
+        // (the bounds are conservative, so nothing it would have drawn
+        // is lost).
+        if self.band.is_some() {
+            match path_node_bounds(node, &transform).pixel_box_on_canvas(self.width, self.height) {
+                Some(pb) if self.owns_rows(pb.y0, pb.y1) => {}
+                _ => return,
+            }
+        }
         // Fill pass.
         if let Some(fill) = &node.fill {
             let contours = self.flatten_fill(&node.path.commands, &transform);
@@ -1063,7 +1210,17 @@ impl Renderer {
                     return;
                 };
                 let win = t.window();
-                let rows = win.y1 - win.y0;
+                // Window-local rows this renderer owns (the whole
+                // window unless it is a scene-band worker); the table
+                // itself is always the full one, so a row's coverage
+                // does not depend on who scans it.
+                let (b0, b1) = self.rows();
+                let r0 = b0.max(win.y0) - win.y0;
+                let r1 = b1.min(win.y1).saturating_sub(win.y0);
+                if r0 >= r1 {
+                    return;
+                }
+                let rows = r1 - r0;
                 let area = rows as u64 * (win.x1 - win.x0) as u64;
                 let workers = if area >= PARALLEL_MIN_AREA {
                     self.threads
@@ -1073,23 +1230,24 @@ impl Renderer {
                     1
                 };
                 if workers <= 1 {
-                    t.scan(fill_rule, |y, x0, row| {
-                        deliver(buf, 0, y, x0, row, &mut tmp, &mut scratch)
+                    t.scan_rows(fill_rule, r0..r1, |y, x0, row| {
+                        deliver(buf, b0, y, x0, row, &mut tmp, &mut scratch)
                     });
                     return;
                 }
                 let band = rows.div_ceil(workers as u32);
-                let region = &mut buf[win.y0 as usize * stride..win.y1 as usize * stride];
+                let first = (win.y0 + r0 - b0) as usize * stride;
+                let region = &mut buf[first..first + rows as usize * stride];
                 std::thread::scope(|sc| {
                     for (k, chunk) in region.chunks_mut(band as usize * stride).enumerate() {
                         let t = &t;
                         let deliver = &deliver;
-                        let r0 = k as u32 * band;
-                        let r1 = (r0 + band).min(rows);
+                        let q0 = r0 + k as u32 * band;
+                        let q1 = (q0 + band).min(r1);
                         sc.spawn(move || {
                             let (mut tmp, mut scratch) = (Vec::new(), Vec::new());
-                            t.scan_rows(fill_rule, r0..r1, |y, x0, row| {
-                                deliver(chunk, win.y0 + r0, y, x0, row, &mut tmp, &mut scratch)
+                            t.scan_rows(fill_rule, q0..q1, |y, x0, row| {
+                                deliver(chunk, win.y0 + q0, y, x0, row, &mut tmp, &mut scratch)
                             });
                         });
                     }
@@ -1101,10 +1259,11 @@ impl Renderer {
                     return;
                 };
                 let mw = cov.mask.width as usize;
-                for y in by0..=by1 {
+                let (b0, b1) = self.rows();
+                for y in by0.max(b0)..=by1.min(b1.saturating_sub(1)) {
                     let off = (y - cov.y0) as usize * mw + (bx0 - cov.x0) as usize;
                     let row = &cov.mask.data[off..off + (bx1 - bx0 + 1) as usize];
-                    deliver(buf, 0, y, bx0, row, &mut tmp, &mut scratch);
+                    deliver(buf, b0, y, bx0, row, &mut tmp, &mut scratch);
                 }
             }
         }
@@ -1246,7 +1405,6 @@ impl Renderer {
         let bounds = img.bounds;
         let frame: &VideoFrame = &img.frame;
         let filter = self.image_filter;
-        let blend = self.blend_mode;
         // Axis-aligned fast path: when the image transform has no
         // rotation / shear component, the texture coordinate `u`
         // depends only on the destination column and `v` only on the
@@ -1271,15 +1429,11 @@ impl Renderer {
             );
             return;
         }
-        composite_coverage_rect(
+        self.composite_cov(
             buf,
             stride,
-            self.width,
-            self.height,
             &mask,
             group_opacity,
-            blend,
-            matches!(self.compositing_space, InterpolationSpace::LinearRgb),
             (bx0, by0, bx1, by1),
             move |x, y| {
                 let user = inv.apply(oxideav_core::Point::new(x as f32 + 0.5, y as f32 + 0.5));
@@ -1332,7 +1486,6 @@ impl Renderer {
             return;
         }
         let data: &[u8] = &plane.data;
-        let blend = self.blend_mode;
 
         // Per-column texture coordinate `u` (independent of y because
         // `local.c == 0`, hence `inv.c == 0`) and per-row `v`
@@ -1387,26 +1540,14 @@ impl Renderer {
                         )
                     })
                     .collect();
-                composite_coverage_rect(
-                    buf,
-                    stride,
-                    self.width,
-                    self.height,
-                    mask,
-                    group_opacity,
-                    blend,
-                    matches!(self.compositing_space, InterpolationSpace::LinearRgb),
-                    rect,
-                    move |x, y| {
-                        let (Some(px), Some(py)) =
-                            (cols[(x - bx0) as usize], rows[(y - by0) as usize])
-                        else {
-                            return Rgba::new(0, 0, 0, 0);
-                        };
-                        let i = py * tex_stride + px * 4;
-                        Rgba::new(data[i], data[i + 1], data[i + 2], data[i + 3])
-                    },
-                );
+                self.composite_cov(buf, stride, mask, group_opacity, rect, move |x, y| {
+                    let (Some(px), Some(py)) = (cols[(x - bx0) as usize], rows[(y - by0) as usize])
+                    else {
+                        return Rgba::new(0, 0, 0, 0);
+                    };
+                    let i = py * tex_stride + px * 4;
+                    Rgba::new(data[i], data[i + 1], data[i + 2], data[i + 3])
+                });
             }
             ImageFilter::Bilinear => self.composite_image_separable::<2>(
                 buf,
@@ -1539,52 +1680,41 @@ impl Renderer {
             (bx0..=bx1).map(|x| Some(taps(col_t(x)?, tex_w))).collect();
         let rows: Vec<Option<([usize; W], [f32; W])>> =
             (by0..=by1).map(|y| Some(taps(row_t(y)?, tex_h))).collect();
-        composite_coverage_rect(
-            buf,
-            stride,
-            self.width,
-            self.height,
-            mask,
-            group_opacity,
-            self.blend_mode,
-            matches!(self.compositing_space, InterpolationSpace::LinearRgb),
-            rect,
-            move |x, y| {
-                let (Some((cpos, cw)), Some((rpos, rw))) =
-                    (&cols[(x - bx0) as usize], &rows[(y - by0) as usize])
-                else {
-                    return Rgba::new(0, 0, 0, 0);
-                };
-                let mut acc = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
-                for j in 0..W {
-                    let py = rpos[j];
-                    let wy = rw[j];
-                    for i in 0..W {
-                        let w = cw[i] * wy;
-                        let (r, g, b, a) = fetch_premul(data, tex_stride, cpos[i], py);
-                        acc.0 += r * w;
-                        acc.1 += g * w;
-                        acc.2 += b * w;
-                        acc.3 += a * w;
-                    }
+        self.composite_cov(buf, stride, mask, group_opacity, rect, move |x, y| {
+            let (Some((cpos, cw)), Some((rpos, rw))) =
+                (&cols[(x - bx0) as usize], &rows[(y - by0) as usize])
+            else {
+                return Rgba::new(0, 0, 0, 0);
+            };
+            let mut acc = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+            for j in 0..W {
+                let py = rpos[j];
+                let wy = rw[j];
+                for i in 0..W {
+                    let w = cw[i] * wy;
+                    let (r, g, b, a) = fetch_premul(data, tex_stride, cpos[i], py);
+                    acc.0 += r * w;
+                    acc.1 += g * w;
+                    acc.2 += b * w;
+                    acc.3 += a * w;
                 }
-                let pa = if clamp_alpha {
-                    acc.3.clamp(0.0, 255.0)
-                } else {
-                    acc.3
-                };
-                if pa <= 0.5 {
-                    return Rgba::new(0, 0, 0, 0);
-                }
-                let inv_a = 255.0 / pa;
-                Rgba::new(
-                    (acc.0 * inv_a).round().clamp(0.0, 255.0) as u8,
-                    (acc.1 * inv_a).round().clamp(0.0, 255.0) as u8,
-                    (acc.2 * inv_a).round().clamp(0.0, 255.0) as u8,
-                    pa.round().clamp(0.0, 255.0) as u8,
-                )
-            },
-        );
+            }
+            let pa = if clamp_alpha {
+                acc.3.clamp(0.0, 255.0)
+            } else {
+                acc.3
+            };
+            if pa <= 0.5 {
+                return Rgba::new(0, 0, 0, 0);
+            }
+            let inv_a = 255.0 / pa;
+            Rgba::new(
+                (acc.0 * inv_a).round().clamp(0.0, 255.0) as u8,
+                (acc.1 * inv_a).round().clamp(0.0, 255.0) as u8,
+                (acc.2 * inv_a).round().clamp(0.0, 255.0) as u8,
+                pa.round().clamp(0.0, 255.0) as u8,
+            )
+        });
     }
 
     /// Fill `path` with a [`GradientPaint`] — a gradient carrying its
@@ -1810,23 +1940,12 @@ impl Renderer {
                 let rows: Vec<usize> = (ry0..=ry1)
                     .map(|y| crate::pattern::tile_nearest_axis(row_v(y), th_px))
                     .collect();
-                composite_coverage_rect(
-                    buf,
-                    stride,
-                    self.width,
-                    self.height,
-                    mask,
-                    group_opacity,
-                    blend,
-                    matches!(self.compositing_space, InterpolationSpace::LinearRgb),
-                    rect,
-                    move |x, y| {
-                        let px = cols[(x - rx0) as usize];
-                        let py = rows[(y - ry0) as usize];
-                        let i = py * tile_stride + px * 4;
-                        Rgba::new(data[i], data[i + 1], data[i + 2], data[i + 3])
-                    },
-                );
+                self.composite_cov(buf, stride, mask, group_opacity, rect, move |x, y| {
+                    let px = cols[(x - rx0) as usize];
+                    let py = rows[(y - ry0) as usize];
+                    let i = py * tile_stride + px * 4;
+                    Rgba::new(data[i], data[i + 1], data[i + 2], data[i + 3])
+                });
             } else {
                 let cols: Vec<(usize, usize, f32)> = (rx0..=rx1)
                     .map(|x| crate::pattern::tile_bilinear_axis(col_u(x), tw_px))

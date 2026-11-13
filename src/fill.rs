@@ -1959,6 +1959,50 @@ mod tests {
     }
 
     #[test]
+    fn scanning_rows_in_pieces_equals_scanning_them_all() {
+        // Random overlapping, self-intersecting polygons: the rows a
+        // partial scan emits must be the rows the full scan emits,
+        // wherever the partial scan starts.
+        let mut st = 0x1234_5678u32;
+        let mut rnd = move || {
+            st = st.wrapping_mul(1664525).wrapping_add(1013904223);
+            (st >> 8) as f32 / (1u32 << 24) as f32
+        };
+        for case in 0..200 {
+            let (w, h) = (48u32, 40u32);
+            let mut contours = Vec::new();
+            for _ in 0..(1 + case % 4) {
+                let n = 3 + (rnd() * 9.0) as usize;
+                let pts = (0..n)
+                    .map(|_| (rnd() * 60.0 - 6.0, rnd() * 52.0 - 6.0))
+                    .collect();
+                contours.push(FlatContour {
+                    points: pts,
+                    closed: true,
+                });
+            }
+            for rule in [FillRule::NonZero, FillRule::EvenOdd] {
+                let Some(t) = EdgeTable::build(&contours, w, h, None) else {
+                    continue;
+                };
+                let rows = t.window().y1 - t.window().y0;
+                let mut full: Vec<(u32, u32, Vec<u8>)> = Vec::new();
+                t.scan(rule, |y, x0, row| full.push((y, x0, row.to_vec())));
+                for step in [1u32, 2, 3, 5, 7, 16] {
+                    let mut pieces: Vec<(u32, u32, Vec<u8>)> = Vec::new();
+                    let mut r = 0;
+                    while r < rows {
+                        let e = (r + step).min(rows);
+                        t.scan_rows(rule, r..e, |y, x0, row| pieces.push((y, x0, row.to_vec())));
+                        r = e;
+                    }
+                    assert_eq!(pieces, full, "case {case}, {rule:?}, step {step}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn analytic_pixel_aligned_rectangle_is_exact() {
         let c = rect_contour(2.0, 2.0, 4.0, 4.0);
         let m = rasterize_fill_analytic(&[c], 8, 8, FillRule::NonZero);

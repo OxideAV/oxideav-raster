@@ -112,3 +112,270 @@ fn band_parallel_render_is_byte_identical() {
 fn default_renderer_is_serial() {
     assert_eq!(Renderer::new(4, 4).threads, 1);
 }
+
+// ---------------------------------------------------------------------
+// Scene bands: every node kind, at every budget.
+// ---------------------------------------------------------------------
+
+mod scene_bands {
+    use oxideav_core::{
+        DashPattern, ExecutionContext, FillRule, GradientStop, Group, ImageRef, LineCap, LineJoin,
+        LinearGradient, MaskKind, Node, Paint, Path, PathNode, Point, Rect, Rgba, SpreadMethod,
+        Stroke, Transform2D, VectorFrame, VideoFrame, VideoPlane,
+    };
+    use oxideav_raster::{BlendMode, CoverageMode, GradientDither, InterpolationSpace, Renderer};
+
+    struct Lcg(u32);
+
+    impl Lcg {
+        fn next(&mut self) -> f32 {
+            self.0 = self.0.wrapping_mul(1664525).wrapping_add(1013904223);
+            (self.0 >> 8) as f32 / (1u32 << 24) as f32
+        }
+        fn byte(&mut self) -> u8 {
+            (self.next() * 255.0) as u8
+        }
+    }
+
+    fn rect(x: f32, y: f32, w: f32, h: f32) -> Path {
+        let mut p = Path::new();
+        p.move_to(Point::new(x, y))
+            .line_to(Point::new(x + w, y))
+            .line_to(Point::new(x + w, y + h))
+            .line_to(Point::new(x, y + h))
+            .close();
+        p
+    }
+
+    fn blob(s: f32) -> Path {
+        let mut p = Path::new();
+        p.move_to(Point::new(1.3 * s, 7.1 * s))
+            .quad_to(Point::new(0.7 * s, 0.9 * s), Point::new(7.2 * s, 1.1 * s))
+            .cubic_to(
+                Point::new(13.9 * s, 1.4 * s),
+                Point::new(13.1 * s, 9.7 * s),
+                Point::new(12.2 * s, 12.6 * s),
+            )
+            .quad_to(Point::new(6.1 * s, 15.3 * s), Point::new(1.3 * s, 7.1 * s))
+            .close();
+        p
+    }
+
+    fn painted(rng: &mut Lcg, path: Path, i: u32) -> Node {
+        let fill = if i % 4 == 1 {
+            Paint::LinearGradient(LinearGradient {
+                start: Point::new(0.0, 0.0),
+                end: Point::new(40.0, 25.0),
+                stops: vec![
+                    GradientStop::new(0.0, Rgba::new(rng.byte(), 40, 200, 255)),
+                    GradientStop::new(1.0, Rgba::new(250, rng.byte(), 30, 180)),
+                ],
+                spread: SpreadMethod::Reflect,
+            })
+        } else {
+            Paint::Solid(Rgba::new(rng.byte(), rng.byte(), 200, 150 + rng.byte() / 3))
+        };
+        let stroke = (i % 3 != 2).then(|| Stroke {
+            width: 0.75 + 4.0 * rng.next(),
+            paint: Paint::Solid(Rgba::new(10, 10, rng.byte(), 220)),
+            cap: [LineCap::Butt, LineCap::Round, LineCap::Square][(i % 3) as usize],
+            join: [LineJoin::Miter, LineJoin::Round, LineJoin::Bevel][(i / 3 % 3) as usize],
+            miter_limit: 4.0,
+            dash: i.is_multiple_of(5).then(|| DashPattern {
+                array: vec![5.0, 3.0, 1.0, 3.0],
+                offset: 1.5,
+            }),
+        });
+        Node::Path(PathNode {
+            path,
+            fill: Some(fill),
+            stroke,
+            fill_rule: if i.is_multiple_of(2) {
+                FillRule::NonZero
+            } else {
+                FillRule::EvenOdd
+            },
+        })
+    }
+
+    fn image() -> Node {
+        let mut data = Vec::new();
+        for i in 0..64u32 {
+            data.extend_from_slice(&[
+                (i * 4) as u8,
+                (255 - i * 3) as u8,
+                (i * 37 % 256) as u8,
+                230,
+            ]);
+        }
+        Node::Image(ImageRef {
+            frame: Box::new(VideoFrame {
+                pts: None,
+                planes: vec![VideoPlane { stride: 32, data }],
+            }),
+            bounds: Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 40.0,
+                height: 40.0,
+            },
+            transform: Transform2D::identity(),
+        })
+    }
+
+    /// Nested groups with every feature the scene walk has: clips,
+    /// translucent and keyed groups, soft masks, images (axis-aligned
+    /// and rotated), gradients, dashed strokes.
+    fn tree(rng: &mut Lcg, depth: u32, w: f32, h: f32) -> Group {
+        let mut g = Group::default();
+        for i in 0..7u32 {
+            let (x, y) = (rng.next() * w - 20.0, rng.next() * h - 15.0);
+            let turn = if i % 2 == 0 { rng.next() * 2.0 } else { 0.0 };
+            let mut child = Group {
+                transform: Transform2D::translate(x, y).compose(&Transform2D::rotate(turn)),
+                clip: (i % 3 == 0).then(|| blob(3.0 + rng.next() * 4.0)),
+                opacity: if i % 3 == 1 { 0.55 } else { 1.0 },
+                cache_key: (i % 4 == 3).then_some(depth as u64 * 16 + (i % 2) as u64),
+                ..Group::default()
+            };
+            if child.cache_key.is_none() {
+                let r = rect(
+                    -6.0,
+                    -4.0,
+                    30.0 + rng.next() * 60.0,
+                    20.0 + rng.next() * 50.0,
+                );
+                child.children.push(painted(rng, r, i));
+                let b = blob(2.0 + rng.next() * 3.0);
+                child.children.push(painted(rng, b, i + 1));
+            } else {
+                // Keyed content must be a function of its key (the
+                // random stream is not consumed, so it is).
+                let mut fixed = Lcg(child.cache_key.unwrap_or(0) as u32 + 7);
+                // (The clip is content too.)
+                child.clip = child.clip.is_some().then(|| blob(4.0));
+                child.children.push(painted(&mut fixed, blob(3.5), 4));
+            }
+            if depth > 0 && child.cache_key.is_none() {
+                child
+                    .children
+                    .push(Node::Group(tree(rng, depth - 1, w * 0.5, h * 0.5)));
+                if i == 2 {
+                    child.children.push(image());
+                }
+                if i == 4 {
+                    child.children.push(Node::SoftMask {
+                        mask: Box::new(painted(rng, blob(6.0), 1)),
+                        mask_kind: if depth.is_multiple_of(2) {
+                            MaskKind::Alpha
+                        } else {
+                            MaskKind::Luminance
+                        },
+                        content: Box::new(Node::Group(tree(rng, 0, 80.0, 60.0))),
+                    });
+                }
+            }
+            g.children.push(Node::Group(child));
+        }
+        g
+    }
+
+    fn frame(seed: u32, w: u32, h: u32) -> VectorFrame {
+        let mut rng = Lcg(seed.wrapping_mul(2654435761) | 1);
+        let mut root = tree(&mut rng, 2, w as f32, h as f32);
+        if seed % 2 == 1 {
+            root.clip = Some(blob(w as f32 / 14.0));
+        }
+        VectorFrame {
+            width: w as f32,
+            height: h as f32,
+            view_box: None,
+            root,
+            pts: None,
+            time_base: oxideav_core::time::TimeBase::new(1, 1),
+        }
+    }
+
+    #[test]
+    fn scene_band_render_is_byte_identical_at_every_budget() {
+        type Configure = Box<dyn Fn(Renderer) -> Renderer>;
+        let configs: Vec<(&str, Configure)> = vec![
+            ("default", Box::new(|r| r)),
+            (
+                "supersampled",
+                Box::new(|r| r.with_coverage(CoverageMode::Supersampled)),
+            ),
+            (
+                "linear, dithered, multiply",
+                Box::new(|mut r| {
+                    r.blend_mode = BlendMode::Multiply;
+                    r.background = Rgba::new(250, 240, 230, 255);
+                    r.with_compositing_space(InterpolationSpace::LinearRgb)
+                        .with_gradient_dither(GradientDither::Ordered)
+                }),
+            ),
+            (
+                "scene supersampling",
+                Box::new(|r| r.with_scene_supersampling(2)),
+            ),
+            (
+                "exact sub-pixel cache",
+                Box::new(|r| r.with_cache_subpixel_grid(0)),
+            ),
+        ];
+        for seed in 0..4u32 {
+            let (w, h) = (230 + seed * 17, 170 + seed * 23);
+            let f = frame(seed, w, h);
+            for (name, make) in &configs {
+                let want = make(Renderer::new(w, h))
+                    .render(&f)
+                    .planes
+                    .swap_remove(0)
+                    .data;
+                assert!(want.iter().any(|&b| b != 0));
+                for threads in [2usize, 3, 4, 7, 16] {
+                    let r = make(Renderer::new(w, h))
+                        .with_execution_context(&ExecutionContext::with_threads(threads));
+                    let got = r.render(&f).planes.swap_remove(0).data;
+                    if got != want {
+                        let first = got.iter().zip(&want).position(|(a, b)| a != b).unwrap();
+                        panic!(
+                            "seed {seed}, {name}, {threads} workers: first difference at \
+                             pixel ({}, {})",
+                            first / 4 % w as usize,
+                            first / 4 / w as usize
+                        );
+                    }
+                    // A warm cache gives the same picture again.
+                    assert!(
+                        r.render(&f).planes[0].data == want,
+                        "{name}: warm, {threads} workers"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tiny_canvases_and_huge_budgets_are_fine() {
+        for (w, h) in [
+            (1u32, 1u32),
+            (3, 15),
+            (40, 16),
+            (40, 31),
+            (40, 33),
+            (5, 200),
+        ] {
+            let f = frame(9, w, h);
+            let want = Renderer::new(w, h).render(&f).planes.swap_remove(0).data;
+            for threads in [2usize, 64] {
+                let r = Renderer::new(w, h)
+                    .with_execution_context(&ExecutionContext::with_threads(threads));
+                assert!(
+                    r.render(&f).planes[0].data == want,
+                    "{w}×{h}, {threads} workers"
+                );
+            }
+        }
+    }
+}

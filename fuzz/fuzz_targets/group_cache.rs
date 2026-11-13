@@ -3,8 +3,8 @@
 //! Group-cache fuzz target: a scene of keyed groups (few distinct keys,
 //! many placements, nesting, clips, opacities, quarter-turn and
 //! power-of-two transforms) rendered through caches in every state —
-//! cold, warm, starved of bytes, disabled, and shared with a renderer
-//! of different settings. Whether a group is blitted from a bitmap,
+//! cold, warm, starved of bytes, disabled, raced by scene-band workers,
+//! and shared with a renderer of different settings. Whether a group is blitted from a bitmap,
 //! rasterised afresh or rendered through a transient window (too large
 //! for the budget, or mostly off-canvas) must never change a byte, so
 //! every render of one renderer configuration has to be identical; an
@@ -27,7 +27,7 @@
 
 use libfuzzer_sys::fuzz_target;
 use oxideav_core::{
-    FillRule, Group, Node, Paint, Path, PathNode, Point, Rgba, Transform2D, VectorFrame,
+    ExecutionContext, FillRule, Group, Node, Paint, Path, PathNode, Point, Rgba, Transform2D, VectorFrame,
 };
 use oxideav_raster::{CoverageMode, GroupCache, Renderer};
 
@@ -142,6 +142,10 @@ fuzz_target!(|data: &[u8]| {
     assert_eq!(px(&starved), reference);
     let s = starved.cache_stats();
     assert!(s.bytes <= s.max_bytes);
+    // Scene bands: workers racing on one cache draw the same picture.
+    let banded = base().with_execution_context(&ExecutionContext::with_threads(3));
+    assert_eq!(px(&banded), reference, "scene bands changed the picture");
+    assert_eq!(px(&banded), reference);
     // Shared with a renderer whose settings differ, and with one on a
     // different canvas: neither may pick up the other's bitmaps.
     let shared: GroupCache = cold.group_cache();
