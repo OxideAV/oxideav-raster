@@ -1034,13 +1034,24 @@ impl Renderer {
         };
         let (ox, oy) = (window_origin(win.x0), window_origin(win.y0));
         let (w, h) = ((win.x1 - ox) as u32, (win.y1 - oy) as u32);
-        if !self.owns_rows(oy, oy + h as i64) {
-            return; // another scene band's rows
+        // The window rows this renderer owns (all of them unless it is
+        // a scene-band worker): only those are rasterised, and the
+        // buffers below hold just them — buffer row 0 is window row
+        // `r0`.
+        let (b0, b1) = self.rows();
+        let r0 = (b0 as i64 - oy).clamp(0, h as i64) as u32;
+        let r1 = (b1 as i64 - oy).clamp(0, h as i64) as u32;
+        if r0 >= r1 {
+            return;
         }
-        let sub = self.window_renderer(w, h);
+        let rows = r1 - r0;
+        let mut sub = self.window_renderer(w, h);
+        if (r0, r1) != (0, h) {
+            sub.band = Some((r0, r1));
+        }
         let t = shift_transform(&transform, ox, oy);
         let off_stride = (w as usize) * 4;
-        let cap = off_stride * (h as usize);
+        let cap = off_stride * (rows as usize);
         // Rasterise the mask subtree.
         let mut mask_buf = vec![0u8; cap];
         sub.draw_node(mask, t, 1.0, &mut mask_buf, off_stride, None);
@@ -1054,10 +1065,10 @@ impl Renderer {
         // outside the mask box the coverage is provably 0 (both mask
         // kinds multiply by / read the mask pixel's alpha), so the
         // blit skips there too.
-        let Some((cx0, cy0, cx1, cy1)) = alpha_bbox(&content_buf, off_stride, w, h) else {
+        let Some((cx0, cy0, cx1, cy1)) = alpha_bbox(&content_buf, off_stride, w, rows) else {
             return; // fully-transparent content — the blit would no-op
         };
-        let Some((mx0, my0, mx1, my1)) = alpha_bbox(&mask_buf, off_stride, w, h) else {
+        let Some((mx0, my0, mx1, my1)) = alpha_bbox(&mask_buf, off_stride, w, rows) else {
             return; // fully-transparent mask — zero coverage everywhere
         };
         let bbox = (cx0.max(mx0), cy0.max(my0), cx1.min(mx1), cy1.min(my1));
@@ -1067,7 +1078,7 @@ impl Renderer {
         // Build a coverage AlphaMask (window coordinates) from the mask
         // buffer, inside the bbox only; everywhere else it stays 0,
         // unread.
-        let mut cov = mask_buffer_to_alpha_rect(&mask_buf, w, h, off_stride, kind, bbox);
+        let mut cov = mask_buffer_to_alpha_rect(&mask_buf, w, rows, off_stride, kind, bbox);
         // Intersect with any inherited clip (canvas coordinates).
         if let Some(c) = clip_mask {
             let (bx0, by0, bx1, by1) = bbox;
@@ -1075,7 +1086,7 @@ impl Renderer {
                 let row = (y * w) as usize;
                 for x in bx0..=bx1 {
                     let i = row + x as usize;
-                    cov.data[i] = cov.data[i].min(c.get(x + ox as u32, y + oy as u32));
+                    cov.data[i] = cov.data[i].min(c.get(x + ox as u32, y + r0 + oy as u32));
                 }
             }
         }
@@ -1087,10 +1098,10 @@ impl Renderer {
             stride,
             &content_buf,
             w,
-            h,
+            rows,
             ox,
-            oy,
-            Some((&cov, ox, oy)),
+            oy + r0 as i64,
+            Some((&cov, ox, oy + r0 as i64)),
             group_opacity,
             Some(bbox),
         );
