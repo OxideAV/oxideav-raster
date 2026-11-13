@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `Renderer::try_render` / `validate_frame`: a typed `RenderError::NonFiniteGeometry` (naming the offending part of the scene) for callers that want a NaN / ±∞ coordinate, transform, stroke parameter, gradient or opacity rejected at the API boundary instead of rendered with the affected segments dropped.
+
+### Fixed
+
+- supersampled fill kernel: edges with a non-finite endpoint or slope are dropped before the edge sort, and both sorts compare with `total_cmp` — a path mixing NaN and `f32::MAX`-scale coordinates used to hand the standard library's sort a comparison that was not a total order (panic found by the scheduled `render_paths` fuzz run).
+- curve flattening: the per-curve chord cap is now an explicit budget. It used to hold only in exact arithmetic — under a 10⁷⁶ px pen, rounding noise in the turning angles of sub-curves re-inflated every subdivision leaf to the maximum step count (2²⁸ points, out of memory).
+- stroked curves get their own chord budget (4 096 per curve): a 10¹⁰ px round-joined pen around an 8 px cubic rendered 20 × 20 pixels in 18 s, now 0.09 s.
+
 ## [0.1.5](https://github.com/OxideAV/oxideav-raster/compare/v0.1.4...v0.1.5) - 2026-11-07
 
 ### Added

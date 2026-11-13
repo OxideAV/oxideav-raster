@@ -37,8 +37,17 @@ pub(crate) const FLATTEN_TOLERANCE_PX: f64 = 1.0 / 32.0;
 /// halves be culled.
 const MAX_UNIFORM_SEGMENTS: u32 = 16;
 
-/// Work bound for one curve (see [`flatten_cubic`]).
-const MAX_SEGMENTS_PER_CURVE: f64 = 65_536.0;
+/// Work bound for one filled curve (see [`flatten_cubic`]).
+const MAX_SEGMENTS_PER_CURVE: u32 = 65_536;
+
+/// Work bound for one stroked curve. Every chord of a stroked curve
+/// becomes an outline quad plus a join, all of which overlap when the
+/// pen is much wider than the curve, so the scan converter's work grows
+/// faster than linearly in the chord count. 4 096 chords keep the
+/// offset outline of a full-turn curve within the flattening tolerance
+/// for pens up to ~10⁵ device pixels wide; beyond that the tolerance
+/// scales with the pen.
+const MAX_SEGMENTS_PER_STROKED_CURVE: u32 = 4_096;
 
 /// Hard cap on subdivision depth — protects against pathological
 /// control points (and bounds the work for astronomically large
@@ -181,7 +190,16 @@ pub(crate) fn flatten_path_with(
                     p3.0 + (q.0 - p3.0) * (2.0 / 3.0),
                     p3.1 + (q.1 - p3.1) * (2.0 / 3.0),
                 );
-                flatten_cubic(&mut cur.points, p0, p1, p2, p3, opts, 0);
+                flatten_cubic(
+                    &mut cur.points,
+                    p0,
+                    p1,
+                    p2,
+                    p3,
+                    opts,
+                    0,
+                    &mut curve_budget(opts),
+                );
                 pen = end;
             }
             PathCommand::CubicCurveTo { c1, c2, end } => {
@@ -199,6 +217,7 @@ pub(crate) fn flatten_path_with(
                     map(end),
                     opts,
                     0,
+                    &mut curve_budget(opts),
                 );
                 pen = end;
             }
@@ -228,6 +247,7 @@ pub(crate) fn flatten_path_with(
                         map(*e),
                         opts,
                         0,
+                        &mut curve_budget(opts),
                     );
                     pen = *e;
                 }
@@ -261,6 +281,16 @@ pub(crate) fn flatten_path_with(
         out.push(cur);
     }
     out
+}
+
+/// A fresh chord budget for one curve.
+#[inline]
+fn curve_budget(opts: &FlattenOptions) -> u32 {
+    if opts.stroke_half > 0.0 {
+        MAX_SEGMENTS_PER_STROKED_CURVE
+    } else {
+        MAX_SEGMENTS_PER_CURVE
+    }
 }
 
 #[inline]
@@ -314,6 +344,7 @@ fn flatten_cubic(
     p3: P64,
     opts: &FlattenOptions,
     depth: u8,
+    budget: &mut u32,
 ) {
     let finite = p0.0.is_finite()
         && p0.1.is_finite()
@@ -358,20 +389,21 @@ fn flatten_cubic(
     };
     if depth == 0 {
         // Bound the work for one curve: a curve that would need more
-        // than MAX_SEGMENTS_PER_CURVE chords at full precision (a
+        // than its chord budget at full precision (a
         // control polygon millions of pixels across with no culling
         // rectangle to discard it, or a stroke pen of astronomical
         // width) is flattened at the tolerance that budget affords —
         // both step counts scale as tol^(-1/2), and a sub-pixel
         // accuracy claim is meaningless at that scale anyway.
         let need = (0.75 * m / tol).sqrt().max(turn_steps(tol));
-        if need > MAX_SEGMENTS_PER_CURVE {
-            tol *= (need / MAX_SEGMENTS_PER_CURVE).powi(2);
+        let cap = *budget as f64;
+        if need > cap {
+            tol *= (need / cap).powi(2);
             let capped = FlattenOptions {
                 tolerance: tol,
                 ..*opts
             };
-            flatten_cubic(out, p0, p1, p2, p3, &capped, depth + 1);
+            flatten_cubic(out, p0, p1, p2, p3, &capped, depth + 1, budget);
             return;
         }
     }
@@ -379,18 +411,25 @@ fn flatten_cubic(
     if !n.is_finite() || n < 1.0 {
         n = 1.0;
     }
-    if n > MAX_UNIFORM_SEGMENTS as f64 && depth < MAX_SUBDIV_DEPTH {
+    if n > MAX_UNIFORM_SEGMENTS as f64 && depth < MAX_SUBDIV_DEPTH && *budget > MAX_UNIFORM_SEGMENTS
+    {
         let q0 = mid(p0, p1);
         let q1 = mid(p1, p2);
         let q2 = mid(p2, p3);
         let r0 = mid(q0, q1);
         let r1 = mid(q1, q2);
         let s = mid(r0, r1);
-        flatten_cubic(out, p0, q0, r0, s, opts, depth + 1);
-        flatten_cubic(out, s, r1, q2, p3, opts, depth + 1);
+        flatten_cubic(out, p0, q0, r0, s, opts, depth + 1, budget);
+        flatten_cubic(out, s, r1, q2, p3, opts, depth + 1, budget);
         return;
     }
-    let n = (n as u32).min(1 << 12);
+    // The analytic step counts bound the work only in exact arithmetic:
+    // on a control polygon ~10¹⁹ px across, rounding noise in the
+    // sub-curves' turning angles dwarfs the capped per-step angle, and
+    // every leaf of the subdivision would ask for the maximum again.
+    // The chord budget makes the per-curve bound unconditional.
+    let n = (n as u32).min(1 << 12).min((*budget).max(1));
+    *budget = budget.saturating_sub(n);
     // Power-basis form B(t) = p0 + t·a + t²·b + t³·c.
     let a = (3.0 * (p1.0 - p0.0), 3.0 * (p1.1 - p0.1));
     let b = (

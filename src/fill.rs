@@ -168,6 +168,12 @@ pub(crate) fn rasterize_fill_with_bounds(
         for i in 0..n {
             let (x0, y0) = c.points[i];
             let (x1, y1) = c.points[(i + 1) % n];
+            // A non-finite endpoint has no position on the raster: the
+            // segment is dropped, exactly as the exact-area kernel does,
+            // so no NaN ever reaches the edge ordering below.
+            if !(x0.is_finite() && y0.is_finite() && x1.is_finite() && y1.is_finite()) {
+                continue;
+            }
             if (x0 - x1).abs() < 1e-6 && (y0 - y1).abs() < 1e-6 {
                 continue;
             }
@@ -186,7 +192,12 @@ pub(crate) fn rasterize_fill_with_bounds(
             } else {
                 (x1, yss1, x0, yss0)
             };
+            // Finite endpoints can still differ by more than `f32::MAX`
+            // (or scale past it); such an edge has no usable slope.
             let dxdy = (mx1 - mx0) / (my1 - my0);
+            if !(dxdy.is_finite() && my0.is_finite() && my1.is_finite()) {
+                continue;
+            }
             edges.push(Edge {
                 y_min: my0,
                 y_max: my1,
@@ -201,11 +212,10 @@ pub(crate) fn rasterize_fill_with_bounds(
         return (AlphaMask::new(width, height), None);
     }
 
-    edges.sort_by(|a, b| {
-        a.y_min
-            .partial_cmp(&b.y_min)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    // `total_cmp` is a total order on every f32 bit pattern, so the
+    // sort contract holds whatever the geometry (the edges are finite
+    // by construction; this is the belt to that pair of braces).
+    edges.sort_by(|a, b| a.y_min.total_cmp(&b.y_min));
 
     // Fractional coverage accumulator for ONE destination row's block
     // of `ss` supersample rows (row-major, stride = width). Each cell
@@ -262,7 +272,10 @@ pub(crate) fn rasterize_fill_with_bounds(
                 continue;
             }
 
-            active.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal));
+            // An active x can overflow to ±inf (finite slope, huge
+            // start) but never to NaN: the slope keeps its sign, so the
+            // per-row increment never forms `inf − inf`.
+            active.sort_by(|a, b| a.x.total_cmp(&b.x));
 
             let row = &mut block[(s as usize) * w..(s as usize + 1) * w];
 

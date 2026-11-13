@@ -110,11 +110,7 @@ fn rasterize_fill_reference(
     if edges.is_empty() {
         return mask;
     }
-    edges.sort_by(|a, b| {
-        a.y_min
-            .partial_cmp(&b.y_min)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    edges.sort_by(|a, b| a.y_min.total_cmp(&b.y_min));
     let mut coverage: Vec<f32> = vec![0.0; (width as usize) * (ss_h as usize)];
     let mut active: Vec<ActiveEdge> = Vec::new();
     let mut next_edge = 0usize;
@@ -137,7 +133,7 @@ fn rasterize_fill_reference(
         if active.is_empty() {
             continue;
         }
-        active.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal));
+        active.sort_by(|a, b| a.x.total_cmp(&b.x));
         let row = &mut coverage
             [(ss_y as usize) * (width as usize)..(ss_y as usize + 1) * (width as usize)];
         match fill_rule {

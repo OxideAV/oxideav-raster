@@ -273,6 +273,7 @@ mod paint;
 mod pattern;
 mod renderer;
 mod stroke;
+mod validate;
 
 pub use blend::{BlendMode, blend_channel, blend_over};
 pub use cache::{CacheStats, RasterizedSubtree};
@@ -314,6 +315,7 @@ pub use paint::{sample_paint, sample_paint_in};
 pub use pattern::{Pattern, view_box_fit_transform};
 pub use renderer::{DEFAULT_CACHE_CAPACITY, ImageFilter, Renderer, rasterize};
 pub use stroke::{ExtendedLineJoin, ExtendedStroke, stroke_to_fill_path, stroke_to_fill_path_ext};
+pub use validate::{GeometryPart, RenderError, validate_frame};
 
 #[cfg(test)]
 use oxideav_core::Rgba;

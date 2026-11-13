@@ -371,6 +371,16 @@ impl Renderer {
         }
     }
 
+    /// [`Renderer::render`] behind a scene check: a NaN or ±∞ anywhere
+    /// in the scene's geometry (coordinates, transforms, stroke
+    /// parameters, gradient geometry, opacities) is reported as a typed
+    /// [`RenderError`](crate::RenderError) instead of being rendered
+    /// with the offending segments dropped.
+    pub fn try_render(&self, frame: &VectorFrame) -> Result<VideoFrame, crate::RenderError> {
+        crate::validate_frame(frame)?;
+        Ok(self.render(frame))
+    }
+
     /// Render whole scenes at `k×` resolution per axis (clamped to
     /// `1..=8`) and box-filter down (builder form of the
     /// [`Renderer::scene_supersampling`] field).
