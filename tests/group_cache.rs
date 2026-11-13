@@ -752,3 +752,52 @@ fn group_opacity_is_position_independent() {
         }
     }
 }
+
+#[test]
+fn a_cold_cache_costs_about_as_much_as_no_cache() {
+    // 300 glyph-sized keyed groups on a 1206 × 2622 canvas, every one a
+    // miss (distinct keys). Each miss used to zero and scan a
+    // canvas-sized buffer — three orders of magnitude over the unkeyed
+    // draw. The bound here is deliberately loose (shared CI runners):
+    // it only has to tell "per-group work" from "per-canvas work".
+    let scene = |keyed: bool| {
+        root_of(
+            (0..300u64)
+                .map(|i| {
+                    placed(
+                        keyed.then_some(i),
+                        20.0 + (i % 60) as f32 * 19.3,
+                        30.0 + (i / 60) as f32 * 41.7,
+                        vec![fill(blob(), INK)],
+                    )
+                })
+                .collect(),
+        )
+    };
+    let time = |keyed: bool| {
+        (0..3)
+            .map(|_| {
+                let r = Renderer::new(1206, 2622);
+                let s = scene(keyed);
+                let t = std::time::Instant::now();
+                let out = render(&r, &s);
+                let dt = t.elapsed();
+                assert!(out.iter().any(|&b| b != 0));
+                if keyed {
+                    let st = r.cache_stats();
+                    assert_eq!((st.misses, st.entries), (300, 300));
+                    // 300 glyph bitmaps, not 300 canvases.
+                    assert!(st.bytes < 300 * 2048, "{} bytes", st.bytes);
+                }
+                dt
+            })
+            .min()
+            .unwrap()
+    };
+    let (plain, keyed) = (time(false), time(true));
+    println!("unkeyed {plain:?}, keyed cold {keyed:?}");
+    assert!(
+        keyed < plain * 10 + std::time::Duration::from_millis(20),
+        "cold keyed frame {keyed:?} vs unkeyed {plain:?}"
+    );
+}

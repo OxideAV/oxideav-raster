@@ -408,9 +408,16 @@ impl LruCache {
 /// safely: the settings that affect pixels are part of every entry's
 /// identity, and bitmaps do not depend on the canvas they were first
 /// drawn on.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct GroupCache {
     inner: Arc<Mutex<LruCache>>,
+}
+
+/// Prints the statistics, not the cached pixels.
+impl std::fmt::Debug for GroupCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("GroupCache").field(&self.stats()).finish()
+    }
 }
 
 impl Default for GroupCache {
@@ -670,6 +677,16 @@ mod tests {
                 assert!((w as f32 + f - v).abs() <= 0.5 / grid as f32 + 1e-4);
             }
         }
+    }
+
+    #[test]
+    fn debug_output_is_the_statistics() {
+        let c = GroupCache::with_max_bytes(1 << 16);
+        c.put(key(1), bitmap(8, 8));
+        let text = format!("{c:?}");
+        assert!(text.starts_with("GroupCache(CacheStats {"), "{text}");
+        assert!(text.contains("entries: 1") && text.contains("max_bytes: 65536"));
+        assert!(text.len() < 300);
     }
 
     #[test]
