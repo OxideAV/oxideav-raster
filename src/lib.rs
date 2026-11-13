@@ -258,6 +258,7 @@
 #![allow(clippy::too_many_arguments)]
 
 mod blend;
+mod bounds;
 mod cache;
 mod composite;
 mod fill;
@@ -276,7 +277,7 @@ mod stroke;
 mod validate;
 
 pub use blend::{BlendMode, blend_channel, blend_over};
-pub use cache::{CacheStats, RasterizedSubtree};
+pub use cache::{CacheStats, DEFAULT_CACHE_BYTES, GroupCache, RasterizedSubtree};
 pub use composite::{composite_rgba_premultiplied, composite_rgba_premultiplied_blend};
 pub use fill::{AlphaMask, CoverageMode, rasterize_fill, rasterize_fill_analytic};
 pub use filter::{
@@ -313,7 +314,9 @@ pub use gradient_paint::{
 pub use gradient_row::GradientDither;
 pub use paint::{sample_paint, sample_paint_in};
 pub use pattern::{Pattern, view_box_fit_transform};
-pub use renderer::{DEFAULT_CACHE_CAPACITY, ImageFilter, Renderer, rasterize};
+pub use renderer::{
+    DEFAULT_CACHE_CAPACITY, DEFAULT_CACHE_SUBPIXEL_GRID, ImageFilter, Renderer, rasterize,
+};
 pub use stroke::{ExtendedLineJoin, ExtendedStroke, stroke_to_fill_path, stroke_to_fill_path_ext};
 pub use validate::{GeometryPart, RenderError, validate_frame};
 

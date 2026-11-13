@@ -11,8 +11,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `Renderer::try_render` / `validate_frame`: a typed `RenderError::NonFiniteGeometry` (naming the offending part of the scene) for callers that want a NaN / ±∞ coordinate, transform, stroke parameter, gradient or opacity rejected at the API boundary instead of rendered with the affected segments dropped.
 
+- `GroupCache`: a shareable, byte-budgeted (`DEFAULT_CACHE_BYTES` = 32 MiB, `with_max_bytes` / `set_max_bytes` / `with_max_entries`) LRU handle for `Group::cache_key` bitmaps, with `stats` / `reset_stats` / `clear`. `Renderer::with_group_cache` / `group_cache` keep one cache across frames and renderers; `Renderer::with_cache_bytes` sizes a private one; `CacheStats` gains `bytes`, `max_bytes`, `evictions`.
+- `Renderer::cache_subpixel_grid` (`with_cache_subpixel_grid`, default `DEFAULT_CACHE_SUBPIXEL_GRID` = 4): keyed groups are placed on a ¼ px lattice so one bitmap serves every position with the same sub-pixel phase.
+- `group_cache` fuzz target and `group_cache` bench.
+
+### Changed
+
+- group cache keys no longer include the whole-pixel part of the translation, and are compared structurally (key, linear transform bits, sub-pixel phase, pixel-affecting renderer settings) instead of through a 64-bit hash. A keyed group is drawn at its translation snapped to the sub-pixel grid (≤ ⅛ px per axis at the default; none on the grid) and is always composited as an isolated group, cached or not.
+- the default cache is bounded by bytes, not by 256 entries; `Renderer::with_cache_capacity` still adds an entry limit. `CacheStats::capacity` reports `usize::MAX` without one.
+- group-opacity and soft-mask offscreen images are rasterised at a window origin instead of the canvas origin, which can move an anti-aliased pixel by one 8-bit step (f32 rounding of device coordinates).
+
+### Performance
+
+- group cache miss: the offscreen bitmap is the size of the group's analytic bounds (control-point hull, stroke reach, clip) instead of the canvas, with no bounding-box scan; hits share the bitmap instead of copying it. 300 keyed 16 px glyph groups on a 1206 × 2622 canvas: first frame 1 245 → 1.1 ms, steady state 1 227 → 0.26 ms (0.18 ms with a renderer per frame around a shared cache); four ~600 px keyed panels: first frame 24.1 → 6.9 ms, steady 2.2 → 1.1 ms (`BENCHMARKS.md`).
+- group opacity and soft masks render into bounds ∩ canvas windows instead of canvas-sized buffers.
+
 ### Fixed
 
+- a cached bitmap could be reused by a renderer whose pixel-affecting settings (coverage kernel, blend mode, …) had changed since it was made.
 - supersampled fill kernel: edges with a non-finite endpoint or slope are dropped before the edge sort, and both sorts compare with `total_cmp` — a path mixing NaN and `f32::MAX`-scale coordinates used to hand the standard library's sort a comparison that was not a total order (panic found by the scheduled `render_paths` fuzz run).
 - curve flattening: the per-curve chord cap is now an explicit budget. It used to hold only in exact arithmetic — under a 10⁷⁶ px pen, rounding noise in the turning angles of sub-curves re-inflated every subdivision leaf to the maximum step count (2²⁸ points, out of memory).
 - stroked curves get their own chord budget (4 096 per curve): a 10¹⁰ px round-joined pen around an 8 px cubic rendered 20 × 20 pixels in 18 s, now 0.09 s.

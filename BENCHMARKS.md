@@ -8,10 +8,41 @@ cargo bench --bench render    # flatten / scanline fill / scene walks
 cargo bench --bench filter    # filter-primitive kernels (r401)
 cargo bench --bench sampling  # image resampling + pattern paint (r449)
 cargo bench --bench scenes    # realistic 1080p / 4K workloads (r484)
+cargo bench --bench group_cache  # keyed groups: cold / warm / shared cache (r488)
 ```
 
 All inputs are synthesised in the setup step (LCG pixel soup +
 procedural scenes); no fixture files.
+
+## Results (r488 group cache)
+
+Apple M5 Max, rustc stable, `--release`, canvas 1206 × 2622. "before" is
+commit `5699a65`; the machine was shared with other builds, so every
+figure is the median of the quietest of five passes and the unkeyed rows
+(whose code path did not change) show the noise floor.
+
+| bench (`group_cache/…`) | before | after |
+| ----------------------- | -----: | ----: |
+| `canvas_clear_only` (empty scene) | 55 µs | 55–97 µs |
+| `glyphs300_unkeyed` | 1.24 ms | 1.2–1.7 ms |
+| `glyphs300_keyed_first_frame` | 1 245 ms | 1.12 ms |
+| `glyphs300_keyed_steady_same_renderer` | 1 227 ms | 0.26 ms |
+| `glyphs300_keyed_steady_shared_cache` (renderer per frame) | n/a | 0.18 ms |
+| `glyphs300_keyed_steady_scrolling` | 1 486 ms | 0.18 ms |
+| `large4_unkeyed` | 6.5 ms | 6.4 ms |
+| `large4_keyed_first_frame` | 24.1 ms | 6.9 ms |
+| `large4_keyed_steady_same_renderer` | 2.2 ms | 1.1 ms |
+| `large4_keyed_steady_shared_cache` | n/a | 1.3 ms |
+
+What changed: a cache miss used to zero a canvas-sized buffer (12.6 MB
+here), rasterise into it and scan all of it for the touched bounding
+box; and it missed almost always, because the key included the
+translation and the default capacity (256 entries) was below one screen
+of glyphs. Now the bitmap is the size of the group's analytic bounds,
+the key excludes the whole-pixel translation, the cache is bounded by
+bytes, a hit shares the bitmap instead of copying it, and the blit runs
+on row slices. Group opacity and soft masks use the same bounded
+offscreen windows.
 
 ## Results (r484 quality + performance pass)
 

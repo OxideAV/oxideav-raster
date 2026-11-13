@@ -42,3 +42,7 @@ harness = false
 [[bench]]
 name = "scenes"
 harness = false
+
+[[bench]]
+name = "group_cache"
+harness = false

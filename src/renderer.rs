@@ -3,13 +3,16 @@
 //!
 //! See the crate-level docs for the overall pipeline.
 
+use std::sync::Arc;
+
 use oxideav_core::{
     ExecutionContext, FillRule, Frame, Group, ImageRef, MaskKind, Node, Paint, Path, PathNode,
     Point, Rect, Rgba, Stroke, Transform2D, VectorFrame, VideoFrame, VideoPlane,
 };
 
 use crate::blend::BlendMode;
-use crate::cache::{CacheStats, RasterizedSubtree, SharedCache, composite_key};
+use crate::bounds::{group_content_bounds, node_bounds};
+use crate::cache::{BitmapKey, CacheStats, CachedBitmap, GroupCache, RenderSettings, snap_axis};
 use crate::composite::{SolidSource, composite_coverage_rect, composite_row};
 use crate::fill::{AlphaMask, Coverage, CoverageMode, EdgeTable, rasterize_fill_with_bounds};
 use crate::filter::PreserveAspectRatio;
@@ -30,11 +33,13 @@ use crate::stroke::stroke_to_fill_path_bounded;
 /// [`VideoFrame`](oxideav_core::VideoFrame) at the end of
 /// [`Renderer::render`].
 ///
-/// Holds a thread-safe bitmap cache shared across `render` calls — when
-/// a [`Group`](oxideav_core::Group) carries a `cache_key` the rendered
-/// children are memoised so a long-lived `Renderer` (subtitle compositor,
-/// scene renderer) avoids re-rasterising the same glyph / decorative
-/// subtree on every frame. See [`Renderer::with_cache_capacity`].
+/// Holds a [`GroupCache`] shared across `render` calls — when a
+/// [`Group`](oxideav_core::Group) carries a `cache_key` its rasterised
+/// children are memoised, so the same glyph or decorative subtree is
+/// rasterised once and blitted wherever it appears again (at any
+/// whole-pixel position). A long-lived `Renderer` keeps its cache by
+/// itself; renderers built per frame share one through
+/// [`Renderer::with_group_cache`].
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct Renderer {
@@ -125,11 +130,23 @@ pub struct Renderer {
     /// [`Renderer::with_execution_context`]. Output bytes never depend
     /// on it.
     pub threads: usize,
-    /// Bitmap cache for memoised group subtrees. Shared via
-    /// `Arc<Mutex<...>>` so the cache survives `Clone`, and so the
-    /// cache lookup remains coherent across the scene walk's
-    /// (otherwise immutable) `&self` borrow.
-    cache: SharedCache,
+    /// Sub-pixel grid of the group cache, in steps per pixel
+    /// (default [`DEFAULT_CACHE_SUBPIXEL_GRID`] = 4, i.e. ¼ px).
+    ///
+    /// A group with a `cache_key` is drawn at its translation snapped
+    /// to this grid, so that every position sharing a sub-pixel phase
+    /// reuses one bitmap: the group moves by at most `1 / (2 · grid)`
+    /// px per axis from where the same group without a key would be
+    /// drawn (⅛ px at the default), and not at all when its translation
+    /// already lies on the grid. `1` snaps to whole pixels (one bitmap
+    /// per glyph, the least anti-aliasing fidelity); larger values
+    /// trade more cache entries for finer placement; `0` keeps the
+    /// exact fractional position (bitmaps are then shared only between
+    /// positions whose fractional parts are bit-identical).
+    pub cache_subpixel_grid: u8,
+    /// Bitmap cache for memoised group subtrees (a shared handle, so
+    /// it survives `Clone` and can be handed to other renderers).
+    cache: GroupCache,
 }
 
 /// Texture sampling filter for `Node::Image` paints.
@@ -216,14 +233,28 @@ const PARALLEL_MIN_AREA: u64 = 1 << 18;
 /// Minimum rows per parallel band.
 const PARALLEL_MIN_ROWS: u32 = 64;
 
-/// Default cache capacity (entries) when none is specified.
+/// Historical default entry count of the group cache.
+///
+/// The cache is now bounded by bytes
+/// ([`DEFAULT_CACHE_BYTES`](crate::DEFAULT_CACHE_BYTES)) with no entry
+/// limit unless [`Renderer::with_cache_capacity`] sets one; this
+/// constant is kept for callers that pass it there.
 pub const DEFAULT_CACHE_CAPACITY: usize = 256;
+
+/// Default [`Renderer::cache_subpixel_grid`]: ¼ px.
+pub const DEFAULT_CACHE_SUBPIXEL_GRID: u8 = 4;
+
+/// A cached group may be rasterised at up to four times its visible
+/// area plus this many pixels; a group that is mostly off-canvas beyond
+/// that is drawn directly (clipped to the canvas) instead.
+const CACHE_OFFCANVAS_SLACK_PX: u64 = 1 << 16;
 
 impl Renderer {
     /// Build a renderer for the given destination size with sane
     /// defaults (exact-area anti-aliasing, `supersampling = 4` for the
     /// supersampled mode, transparent background, no sub-pixel
-    /// positioning, bilinear image filtering, 256-entry bitmap cache).
+    /// positioning, bilinear image filtering, a 32 MiB group cache on a
+    /// ¼ px sub-pixel grid).
     pub fn new(width: u32, height: u32) -> Self {
         Self {
             width,
@@ -240,22 +271,50 @@ impl Renderer {
             compositing_space: InterpolationSpace::default(),
             scene_supersampling: 1,
             threads: 1,
-            cache: SharedCache::with_capacity(DEFAULT_CACHE_CAPACITY),
+            cache_subpixel_grid: DEFAULT_CACHE_SUBPIXEL_GRID,
+            cache: GroupCache::new(),
         }
     }
 
-    /// Build a renderer with the bitmap cache sized to `capacity`
-    /// entries. Useful for long-lived consumers (subtitle compositor,
-    /// scene renderer) that want to widen the cache footprint, or for
-    /// short-lived one-shot renders that want to disable it
-    /// (`capacity = 1` keeps the smallest possible LRU; the cache
-    /// itself never disables — `Group::cache_key = None` is the
-    /// per-node opt-out).
+    /// Build a renderer whose group cache additionally holds at most
+    /// `capacity` entries (the byte budget still applies). Prefer
+    /// [`Renderer::with_cache_bytes`]: bitmaps differ in size by orders
+    /// of magnitude, so a byte budget is the meaningful bound.
     pub fn with_cache_capacity(width: u32, height: u32, capacity: usize) -> Self {
         Self {
-            cache: SharedCache::with_capacity(capacity),
+            cache: GroupCache::new().with_max_entries(capacity),
             ..Self::new(width, height)
         }
+    }
+
+    /// Give this renderer a fresh group cache holding at most
+    /// `max_bytes` of pixel data (`0` disables caching: keyed groups
+    /// are drawn directly).
+    pub fn with_cache_bytes(mut self, max_bytes: usize) -> Self {
+        self.cache = GroupCache::with_max_bytes(max_bytes);
+        self
+    }
+
+    /// Use `cache` — typically one kept by the caller across frames, or
+    /// shared with other renderers — instead of this renderer's own.
+    /// Entries record every setting that affects their pixels, so
+    /// renderers of different sizes or settings can share one cache.
+    pub fn with_group_cache(mut self, cache: GroupCache) -> Self {
+        self.cache = cache;
+        self
+    }
+
+    /// A handle to this renderer's group cache (to keep it past the
+    /// renderer's lifetime, share it, resize or clear it).
+    pub fn group_cache(&self) -> GroupCache {
+        self.cache.clone()
+    }
+
+    /// Set the group cache's sub-pixel grid (builder form of the
+    /// [`Renderer::cache_subpixel_grid`] field).
+    pub fn with_cache_subpixel_grid(mut self, steps_per_pixel: u8) -> Self {
+        self.cache_subpixel_grid = steps_per_pixel;
+        self
     }
 
     /// Snapshot the cache's hit / miss / occupancy statistics. Useful
@@ -507,36 +566,22 @@ impl Renderer {
         stride: usize,
         clip_mask: Option<&AlphaMask>,
     ) {
-        let local = parent_transform.compose(&g.transform);
-        // Bitmap-cache fast path: when the group is tagged with a
-        // `cache_key`, memoise its rendered children under
-        // `composite_key(g.cache_key, local)` so a re-render at the
-        // same effective transform reuses the prior bitmap. The cached
-        // bitmap is the group at *full opacity*; neither `g.opacity` nor
-        // the parent's opacity is baked in, so an opacity change never
-        // invalidates the cache. `g.opacity` and the parent opacity are
-        // both applied uniformly at blit time (along with the parent
-        // clip mask), exactly matching the SVG group-opacity model.
+        let mut local = parent_transform.compose(&g.transform);
+        // Bitmap-cache fast path: a group tagged with a `cache_key` is
+        // rasterised once into a bitmap of its own bounds and blitted
+        // from then on (see `draw_group_cached`). A keyed group that
+        // cannot be cached is still composited the way a cached one is
+        // — isolated, at the position the cache would have drawn it —
+        // so the picture never depends on what the cache holds.
+        let mut isolate = g.opacity < 1.0;
         if let Some(key) = g.cache_key {
-            let composite = composite_key(key, &local);
-            let bitmap = match self.cache.get(composite) {
-                Some(b) => b,
-                None => self.render_group_offscreen(g, local, composite),
-            };
-            blit_rgba_over(
-                buf,
-                stride,
-                self.width,
-                self.height,
-                &bitmap.rgba,
-                bitmap.width,
-                bitmap.height,
-                bitmap.offset_x,
-                bitmap.offset_y,
-                clip_mask,
-                parent_opacity * g.opacity,
-            );
-            return;
+            match self.draw_group_cached(g, key, &local, parent_opacity, buf, stride, clip_mask) {
+                None => return,
+                Some(uncached) => {
+                    local = uncached;
+                    isolate = true;
+                }
+            }
         }
         // Group-opacity isolation (SVG 2 §3.4 "group opacity" / Simple
         // Alpha Compositing): when the group is partially transparent we
@@ -548,20 +593,35 @@ impl Renderer {
         // spec's post-process model forbids. The group's own clip is
         // baked into the offscreen; the inherited parent clip is applied
         // at blit time so it intersects the composited unit.
-        if g.opacity < 1.0 {
-            let bitmap = self.rasterize_group_to_subtree(g, local);
-            blit_rgba_over(
+        //
+        // The offscreen image covers only the part of the canvas the
+        // group can touch (its analytic bounds, see `crate::bounds`).
+        if isolate {
+            let opacity = parent_opacity * g.opacity;
+            if (opacity.clamp(0.0, 1.0) * 255.0).round() as u32 == 0 {
+                return;
+            }
+            let Some(win) =
+                group_content_bounds(g, &local).pixel_box_on_canvas(self.width, self.height)
+            else {
+                return;
+            };
+            let (ox, oy) = (window_origin(win.x0), window_origin(win.y0));
+            let (w, h) = ((win.x1 - ox) as u32, (win.y1 - oy) as u32);
+            let off = self.render_group_window(g, &local, ox, oy, w, h);
+            blit_rgba_at(
                 buf,
                 stride,
                 self.width,
                 self.height,
-                &bitmap.rgba,
-                bitmap.width,
-                bitmap.height,
-                bitmap.offset_x,
-                bitmap.offset_y,
-                clip_mask,
-                parent_opacity * g.opacity,
+                &off,
+                w,
+                h,
+                ox,
+                oy,
+                clip_mask.map(|c| (c, 0, 0)),
+                opacity,
+                None,
             );
             return;
         }
@@ -586,55 +646,195 @@ impl Renderer {
         }
     }
 
-    /// Render `g`'s children onto a fresh canvas-sized RGBA buffer at
-    /// `local` transform — at **full opacity**, with only the group's
-    /// own clip path applied (the inherited parent clip and the group's
-    /// `opacity` are applied uniformly at blit time, per the SVG group-
-    /// opacity rendering model). Then scan the offscreen buffer for the
-    /// touched-pixel bounding box, allocate a tight crop, and return it
-    /// as a [`RasterizedSubtree`].
+    /// Draw a keyed group through the bitmap cache. Returns `None`
+    /// when the group has been drawn, or `Some(transform)` when it
+    /// cannot be cached: the caller then renders it through a transient
+    /// offscreen window under that transform — `local` with its
+    /// translation snapped exactly as the cache would have — so a keyed
+    /// group is always an isolated group at the same position, cached
+    /// or not.
+    ///
+    /// The effective translation is split into a whole-pixel offset and
+    /// a sub-pixel phase snapped to [`Renderer::cache_subpixel_grid`].
+    /// The bitmap is rasterised under the transform with only the phase
+    /// as its translation — so it depends on neither the pen position
+    /// nor the canvas — into a buffer the size of the group's analytic
+    /// bounds, and is blitted at the whole-pixel offset, clipped to the
+    /// canvas. The bitmap holds the group at full opacity with its own
+    /// clip path baked in; the group's opacity, the inherited opacity
+    /// and the inherited clip are applied by the blit, so none of them
+    /// invalidates an entry.
+    ///
+    /// Not cached: a non-finite or astronomically large transform
+    /// (drawn unsnapped);
+    /// bounds that are unbounded (non-finite geometry); a bitmap larger
+    /// than a quarter of the cache budget; and a group whose bounds
+    /// exceed four times their on-canvas part (plus a small slack) —
+    /// rasterising all of it for the cache would cost more than
+    /// rendering the visible part.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_group_cached(
+        &self,
+        g: &Group,
+        key: u64,
+        local: &Transform2D,
+        parent_opacity: f32,
+        buf: &mut [u8],
+        stride: usize,
+        clip_mask: Option<&AlphaMask>,
+    ) -> Option<Transform2D> {
+        let grid = self.cache_subpixel_grid;
+        let (Some((ix, fx)), Some((iy, fy))) = (snap_axis(local.e, grid), snap_axis(local.f, grid))
+        else {
+            return Some(*local);
+        };
+        if ![local.a, local.b, local.c, local.d]
+            .iter()
+            .all(|v| v.is_finite())
+        {
+            return Some(*local);
+        }
+        // Where the group is drawn when it is not blitted from the cache.
+        let direct = Transform2D {
+            e: (ix as f64 + fx as f64) as f32,
+            f: (iy as f64 + fy as f64) as f32,
+            ..*local
+        };
+        let snapped = Transform2D {
+            e: fx,
+            f: fy,
+            ..*local
+        };
+        let bkey = BitmapKey::new(key, &snapped, self.render_settings());
+        let bitmap = match self.cache.get(&bkey) {
+            Some(b) => b,
+            None => {
+                let bounds = group_content_bounds(g, &snapped);
+                let bitmap = if bounds.is_empty() {
+                    CachedBitmap {
+                        width: 0,
+                        height: 0,
+                        dx: 0,
+                        dy: 0,
+                        rgba: Vec::new(),
+                    }
+                } else {
+                    let Some(pb) = bounds.pixel_box() else {
+                        return Some(direct);
+                    };
+                    let visible = pb
+                        .translated(ix, iy)
+                        .area_on_canvas(self.width, self.height);
+                    if visible == 0 {
+                        // Entirely off-canvas: nothing to draw, and no
+                        // reason to rasterise it now.
+                        return None;
+                    }
+                    let area = pb.area();
+                    if area.saturating_mul(4) > self.cache.max_entry_bytes() as u64
+                        || area > visible.saturating_mul(4) + CACHE_OFFCANVAS_SLACK_PX
+                    {
+                        return Some(direct);
+                    }
+                    let (w, h) = (pb.width() as u32, pb.height() as u32);
+                    CachedBitmap {
+                        width: w,
+                        height: h,
+                        dx: pb.x0,
+                        dy: pb.y0,
+                        rgba: self.render_group_window(g, &snapped, pb.x0, pb.y0, w, h),
+                    }
+                };
+                let bitmap = Arc::new(bitmap);
+                self.cache.put(bkey, Arc::clone(&bitmap));
+                bitmap
+            }
+        };
+        blit_rgba_at(
+            buf,
+            stride,
+            self.width,
+            self.height,
+            &bitmap.rgba,
+            bitmap.width,
+            bitmap.height,
+            ix + bitmap.dx,
+            iy + bitmap.dy,
+            clip_mask.map(|c| (c, 0, 0)),
+            parent_opacity * g.opacity,
+            None,
+        );
+        None
+    }
+
+    /// The settings that change a subtree's pixels (part of every
+    /// cache entry's identity).
+    fn render_settings(&self) -> RenderSettings {
+        use std::mem::discriminant;
+        RenderSettings {
+            coverage: discriminant(&self.coverage),
+            // Only the supersampled kernel reads the factor, and it
+            // folds it onto 1 / 2 / 4 / 8.
+            supersampling: match (self.coverage, self.supersampling) {
+                (CoverageMode::Analytic, _) => 0,
+                (_, 0 | 1) => 1,
+                (_, 2) => 2,
+                (_, 3 | 4) => 4,
+                _ => 8,
+            },
+            image_filter: discriminant(&self.image_filter),
+            color_interpolation: discriminant(&self.color_interpolation),
+            blend_mode: discriminant(&self.blend_mode),
+            gradient_dither: discriminant(&self.gradient_dither),
+            compositing_space: discriminant(&self.compositing_space),
+        }
+    }
+
+    /// Render `g`'s children — at **full opacity**, with only the
+    /// group's own clip path applied — into a fresh `w × h` RGBA buffer
+    /// whose top-left pixel is device pixel `(ox, oy)` of the
+    /// coordinate system `local` maps into.
     ///
     /// Rendering children at full opacity (rather than pre-multiplying
     /// each child by `g.opacity`) is what makes group opacity behave as
     /// a *post-process* on the composited group rather than a per-child
-    /// alpha — overlapping children inside the group no longer
+    /// alpha — overlapping children inside the group do not
     /// double-darken in their overlap region (SVG 2 §3.4 / "Simple
     /// Alpha Compositing": "the group ... is rendered into an RGBA
     /// offscreen image[;] the offscreen image as [a] whole is then
     /// blended into the canvas with the specified opacity value used
     /// uniformly across the offscreen image").
-    fn rasterize_group_to_subtree(&self, g: &Group, local: Transform2D) -> RasterizedSubtree {
-        let stride = (self.width as usize) * 4;
-        let mut off = vec![0u8; stride * (self.height as usize)];
-        // Apply the group's own clip mask only — the parent clip is
-        // handled at blit time.
-        let group_clip_storage: Option<AlphaMask> = g.clip.as_ref().map(|clip_path| {
-            let cs = self.flatten_fill(&clip_path.commands, &local);
-            self.rasterize_canvas_mask(&cs, FillRule::NonZero)
-        });
-        let effective_clip = group_clip_storage.as_ref();
-        for child in &g.children {
-            self.draw_node(child, local, 1.0, &mut off, stride, effective_clip);
-        }
-        crop_to_bbox(&off, stride, self.width, self.height, local)
-    }
-
-    /// Cache-aware wrapper around [`Self::rasterize_group_to_subtree`]:
-    /// rasterises the group offscreen and stores the crop in the bitmap
-    /// cache under `composite` (saves significant memory for tiny glyphs
-    /// in large canvases — a 16 px glyph on a 4096 px canvas drops from
-    /// 64 MB to ~1 KB per cache entry). The cached bitmap is the group
-    /// at full opacity; callers apply `g.opacity` at blit time so an
-    /// opacity change never invalidates the cache.
-    fn render_group_offscreen(
+    fn render_group_window(
         &self,
         g: &Group,
-        local: Transform2D,
-        composite: u64,
-    ) -> RasterizedSubtree {
-        let subtree = self.rasterize_group_to_subtree(g, local);
-        self.cache.put(composite, subtree.clone());
-        subtree
+        local: &Transform2D,
+        ox: i64,
+        oy: i64,
+        w: u32,
+        h: u32,
+    ) -> Vec<u8> {
+        let sub = self.window_renderer(w, h);
+        let t = shift_transform(local, ox, oy);
+        let stride = (w as usize) * 4;
+        let mut off = vec![0u8; stride * (h as usize)];
+        // The group's own clip only — the inherited clip is applied
+        // when the window is blitted.
+        let clip: Option<AlphaMask> = g.clip.as_ref().map(|clip_path| {
+            let cs = sub.flatten_fill(&clip_path.commands, &t);
+            sub.rasterize_canvas_mask(&cs, FillRule::NonZero)
+        });
+        for child in &g.children {
+            sub.draw_node(child, t, 1.0, &mut off, stride, clip.as_ref());
+        }
+        off
+    }
+
+    /// This renderer with a `w × h` canvas (same settings, same cache).
+    fn window_renderer(&self, w: u32, h: u32) -> Renderer {
+        let mut sub = self.clone();
+        sub.width = w;
+        sub.height = h;
+        sub
     }
 
     fn draw_node(
@@ -693,73 +893,74 @@ impl Renderer {
         stride: usize,
         clip_mask: Option<&AlphaMask>,
     ) {
-        let off_stride = (self.width as usize) * 4;
-        let cap = off_stride * (self.height as usize);
+        // Both subtrees are rasterised into a window covering only the
+        // pixels where the content *and* the mask can be non-zero
+        // (their analytic bounds, intersected with the canvas): outside
+        // it the composite writes nothing.
+        let bounds = node_bounds(content, &transform).intersect(&node_bounds(mask, &transform));
+        let Some(win) = bounds.pixel_box_on_canvas(self.width, self.height) else {
+            return;
+        };
+        let (ox, oy) = (window_origin(win.x0), window_origin(win.y0));
+        let (w, h) = ((win.x1 - ox) as u32, (win.y1 - oy) as u32);
+        let sub = self.window_renderer(w, h);
+        let t = shift_transform(&transform, ox, oy);
+        let off_stride = (w as usize) * 4;
+        let cap = off_stride * (h as usize);
         // Rasterise the mask subtree.
         let mut mask_buf = vec![0u8; cap];
-        self.draw_node(mask, transform, 1.0, &mut mask_buf, off_stride, None);
+        sub.draw_node(mask, t, 1.0, &mut mask_buf, off_stride, None);
         // Rasterise the content subtree.
         let mut content_buf = vec![0u8; cap];
-        self.draw_node(content, transform, 1.0, &mut content_buf, off_stride, None);
+        sub.draw_node(content, t, 1.0, &mut content_buf, off_stride, None);
         // Restrict the coverage conversion + blit to the intersection
         // of the content's and the mask's touched-alpha bounding
         // boxes: outside the content box the blit skips every pixel
         // (source alpha 0) no matter what the coverage says, and
         // outside the mask box the coverage is provably 0 (both mask
         // kinds multiply by / read the mask pixel's alpha), so the
-        // blit skips there too — the skipped pixels are exactly the
-        // ones the full scan would have skipped, and the output bytes
-        // are unchanged.
-        let Some((cx0, cy0, cx1, cy1)) =
-            alpha_bbox(&content_buf, off_stride, self.width, self.height)
-        else {
+        // blit skips there too.
+        let Some((cx0, cy0, cx1, cy1)) = alpha_bbox(&content_buf, off_stride, w, h) else {
             return; // fully-transparent content — the blit would no-op
         };
-        let Some((mx0, my0, mx1, my1)) = alpha_bbox(&mask_buf, off_stride, self.width, self.height)
-        else {
+        let Some((mx0, my0, mx1, my1)) = alpha_bbox(&mask_buf, off_stride, w, h) else {
             return; // fully-transparent mask — zero coverage everywhere
         };
         let bbox = (cx0.max(mx0), cy0.max(my0), cx1.min(mx1), cy1.min(my1));
         if bbox.0 > bbox.2 || bbox.1 > bbox.3 {
             return; // disjoint content / mask — nothing is composited
         }
-        // Build a coverage AlphaMask from the mask buffer (inside the
-        // content bbox only; everywhere else it stays 0, unread).
-        let cov =
-            mask_buffer_to_alpha_rect(&mask_buf, self.width, self.height, off_stride, kind, bbox);
-        // Intersect with any inherited clip (again only inside the
-        // bbox — the per-pixel min is only ever read there).
-        let cov = match clip_mask {
-            Some(c) => {
-                let mut out = AlphaMask::new(self.width, self.height);
-                let (bx0, by0, bx1, by1) = bbox;
-                for y in by0..=by1 {
-                    let row = (y * self.width) as usize;
-                    for x in bx0..=bx1 {
-                        let i = row + x as usize;
-                        out.data[i] = c.data[i].min(cov.data[i]);
-                    }
+        // Build a coverage AlphaMask (window coordinates) from the mask
+        // buffer, inside the bbox only; everywhere else it stays 0,
+        // unread.
+        let mut cov = mask_buffer_to_alpha_rect(&mask_buf, w, h, off_stride, kind, bbox);
+        // Intersect with any inherited clip (canvas coordinates).
+        if let Some(c) = clip_mask {
+            let (bx0, by0, bx1, by1) = bbox;
+            for y in by0..=by1 {
+                let row = (y * w) as usize;
+                for x in bx0..=bx1 {
+                    let i = row + x as usize;
+                    cov.data[i] = cov.data[i].min(c.get(x + ox as u32, y + oy as u32));
                 }
-                out
             }
-            None => cov,
-        };
+        }
         // Blit content_buf onto buf, modulated by cov (soft-mask
         // coverage, treated as a per-pixel alpha multiplier exactly
         // like a clip mask) + group_opacity.
-        blit_rgba_over_rect(
+        blit_rgba_at(
             buf,
             stride,
             self.width,
             self.height,
             &content_buf,
-            self.width,
-            self.height,
-            0,
-            0,
-            Some(&cov),
+            w,
+            h,
+            ox,
+            oy,
+            Some((&cov, ox, oy)),
             group_opacity,
-            bbox,
+            Some(bbox),
         );
     }
 
@@ -1693,7 +1894,7 @@ impl Renderer {
     /// the user-agent `overflow: hidden` clip for free (including the
     /// overhang a `slice` fitting produces).
     fn rasterize_pattern_tile(&self, pattern: &Pattern, tw: u32, th: u32) -> VideoFrame {
-        let mut tile_renderer = Renderer::with_cache_capacity(tw, th, 1);
+        let mut tile_renderer = Renderer::new(tw, th).with_group_cache(self.cache.clone());
         tile_renderer.supersampling = self.supersampling;
         tile_renderer.coverage = self.coverage;
         tile_renderer.image_filter = self.image_filter;
@@ -1907,55 +2108,42 @@ fn downsample_premultiplied(
     }
 }
 
+/// The origin of an offscreen window whose content starts at canvas
+/// coordinate `v ≥ 0`: `v` rounded down to a multiple of 8, so that the
+/// 8 × 8 ordered-dither lattice of gradient paints has the same phase
+/// inside the window as on the canvas.
+fn window_origin(v: i64) -> i64 {
+    v & !7
+}
+
+/// `t` followed by a translation of `(-ox, -oy)`: the transform that
+/// draws into a window whose top-left pixel is device pixel `(ox, oy)`.
+fn shift_transform(t: &Transform2D, ox: i64, oy: i64) -> Transform2D {
+    Transform2D {
+        e: (t.e as f64 - ox as f64) as f32,
+        f: (t.f as f64 - oy as f64) as f32,
+        ..*t
+    }
+}
+
 /// Blit a packed straight-alpha RGBA source buffer over an RGBA
 /// destination using premultiplied source-over.
 ///
 /// `(offset_x, offset_y)` places the source bitmap's top-left at that
-/// destination pixel. `clip_mask` (when `Some`) further multiplies the
-/// source alpha per-pixel and is sampled in **destination** coordinates
-/// (so a cached-and-cropped subtree blitted at an offset reads its clip
-/// at the matching destination pixel). `extra_alpha` (in `0.0..=1.0`)
-/// modulates the source alpha globally (used for parent group opacity).
-/// The blit touches only pixels where the source alpha (after clip +
-/// extra) is non-zero.
-fn blit_rgba_over(
-    dst: &mut [u8],
-    dst_stride: usize,
-    dst_width: u32,
-    dst_height: u32,
-    src: &[u8],
-    src_width: u32,
-    src_height: u32,
-    offset_x: u32,
-    offset_y: u32,
-    clip_mask: Option<&AlphaMask>,
-    extra_alpha: f32,
-) {
-    if src_width == 0 || src_height == 0 {
-        return;
-    }
-    blit_rgba_over_rect(
-        dst,
-        dst_stride,
-        dst_width,
-        dst_height,
-        src,
-        src_width,
-        src_height,
-        offset_x,
-        offset_y,
-        clip_mask,
-        extra_alpha,
-        (0, 0, src_width - 1, src_height - 1),
-    )
-}
-
-/// [`blit_rgba_over`] restricted to the inclusive **source**-coordinate
-/// rectangle `src_rect = (x0, y0, x1, y1)`. Callers pass a rectangle
-/// outside which every source pixel has zero alpha, so the skipped
-/// pixels are exactly the ones the full scan would have skipped.
+/// destination pixel; it may be negative or beyond the destination, in
+/// which case the blit is clipped to the destination. `mask` (when
+/// `Some((mask, mx, my))`) further multiplies the source alpha
+/// per-pixel: the mask's pixel `(0, 0)` sits at destination pixel
+/// `(mx, my)` and it reads as 0 outside its extent — `(0, 0)` for a
+/// canvas-sized clip mask, the blit offset for a mask in source
+/// coordinates. `extra_alpha` (in `0.0..=1.0`) modulates the source
+/// alpha globally (group opacity). `src_rect`, when given, is an
+/// inclusive source-coordinate rectangle `(x0, y0, x1, y1)` outside
+/// which every source pixel is known to have zero alpha. The blit
+/// touches only pixels where the source alpha (after mask + extra) is
+/// non-zero.
 #[allow(clippy::too_many_arguments)]
-fn blit_rgba_over_rect(
+fn blit_rgba_at(
     dst: &mut [u8],
     dst_stride: usize,
     dst_width: u32,
@@ -1963,16 +2151,13 @@ fn blit_rgba_over_rect(
     src: &[u8],
     src_width: u32,
     src_height: u32,
-    offset_x: u32,
-    offset_y: u32,
-    clip_mask: Option<&AlphaMask>,
+    offset_x: i64,
+    offset_y: i64,
+    mask: Option<(&AlphaMask, i64, i64)>,
     extra_alpha: f32,
-    src_rect: (u32, u32, u32, u32),
+    src_rect: Option<(u32, u32, u32, u32)>,
 ) {
     if src_width == 0 || src_height == 0 {
-        return;
-    }
-    if offset_x >= dst_width || offset_y >= dst_height {
         return;
     }
     let extra = extra_alpha.clamp(0.0, 1.0);
@@ -1980,165 +2165,112 @@ fn blit_rgba_over_rect(
     if extra_q == 0 {
         return;
     }
-    let w = src_width.min(dst_width - offset_x) as usize;
-    let h = src_height.min(dst_height - offset_y) as usize;
     let src_stride = (src_width as usize) * 4;
-    let (rx0, ry0, rx1, ry1) = src_rect;
-    let y_lo = (ry0 as usize).min(h);
-    let y_hi = ((ry1 as usize) + 1).min(h);
-    let x_lo = (rx0 as usize).min(w);
-    let x_hi = ((rx1 as usize) + 1).min(w);
+    let (rx0, ry0, rx1, ry1) = src_rect.unwrap_or((0, 0, src_width - 1, src_height - 1));
+    // Source range that lands on the destination (half-open).
+    let x_lo = (rx0 as i64).max(-offset_x);
+    let x_hi = (rx1 as i64 + 1)
+        .min(src_width as i64)
+        .min(dst_width as i64 - offset_x);
+    let y_lo = (ry0 as i64).max(-offset_y);
+    let y_hi = (ry1 as i64 + 1)
+        .min(src_height as i64)
+        .min(dst_height as i64 - offset_y);
+    if x_lo >= x_hi || y_lo >= y_hi {
+        return;
+    }
+    let (x_lo, x_hi, y_lo, y_hi) = (x_lo as usize, x_hi as usize, y_lo as usize, y_hi as usize);
+    // Destination column of source column `x_lo` (≥ 0 by construction).
+    let dx0 = (offset_x + x_lo as i64) as usize;
     for y in y_lo..y_hi {
-        let dst_row = (offset_y as usize + y) * dst_stride;
-        let src_row = y * src_stride;
-        for x in x_lo..x_hi {
-            let si = src_row + x * 4;
-            let sa_raw = src[si + 3] as u32;
-            if sa_raw == 0 {
-                continue;
+        let dy = (offset_y + y as i64) as usize; // in 0..dst_height
+        let src_row = &src[y * src_stride + x_lo * 4..y * src_stride + x_hi * 4];
+        let dst_row = &mut dst[dy * dst_stride + dx0 * 4..][..src_row.len()];
+        let Some((m, mx, my)) = mask else {
+            for (s, d) in src_row
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .zip(dst_row.as_chunks_mut::<4>().0)
+            {
+                over_pixel(s, d, 255, extra_q);
             }
-            let dx = offset_x + x as u32;
-            let dy = offset_y + y as u32;
-            let cov = match clip_mask {
-                Some(c) => c.get(dx, dy) as u32,
-                None => 255,
-            };
-            if cov == 0 {
-                continue;
-            }
-            // src_alpha = sa_raw * cov * extra / (255 * 255)
-            let combined = (sa_raw * cov * extra_q + (255 * 255 / 2)) / (255 * 255);
-            if combined == 0 {
-                continue;
-            }
-            if combined == 255 {
-                // Fully-opaque source pixel: the over operator reduces
-                // to a plain overwrite (with `sa = 255` the premultiply
-                // is exact, `inv = 0` zeroes every destination term,
-                // and the final un-premultiply divides by 255 giving
-                // the source bytes back verbatim).
-                let pidx = dst_row + (offset_x as usize + x) * 4;
-                dst[pidx] = src[si];
-                dst[pidx + 1] = src[si + 1];
-                dst[pidx + 2] = src[si + 2];
-                dst[pidx + 3] = 255;
-                continue;
-            }
-            let sa = combined;
-            // Promote source RGB into premultiplied space (src is
-            // straight-alpha at sa_raw — re-premultiply with the
-            // *combined* alpha so the over operator behaves).
-            let sr = (src[si] as u32 * sa + 127) / 255;
-            let sg = (src[si + 1] as u32 * sa + 127) / 255;
-            let sb = (src[si + 2] as u32 * sa + 127) / 255;
-
-            let pidx = dst_row + (offset_x as usize + x) * 4;
-            let dr0 = dst[pidx] as u32;
-            let dg0 = dst[pidx + 1] as u32;
-            let db0 = dst[pidx + 2] as u32;
-            let da0 = dst[pidx + 3] as u32;
-            let dr = (dr0 * da0 + 127) / 255;
-            let dg = (dg0 * da0 + 127) / 255;
-            let db = (db0 * da0 + 127) / 255;
-
-            let inv = 255 - sa;
-            let or = sr + (dr * inv + 127) / 255;
-            let og = sg + (dg * inv + 127) / 255;
-            let ob = sb + (db * inv + 127) / 255;
-            let oa = sa + (da0 * inv + 127) / 255;
-            let or_s = (or * 255 + oa / 2)
-                .checked_div(oa)
-                .map_or(0, |v| v.min(255));
-            let og_s = (og * 255 + oa / 2)
-                .checked_div(oa)
-                .map_or(0, |v| v.min(255));
-            let ob_s = (ob * 255 + oa / 2)
-                .checked_div(oa)
-                .map_or(0, |v| v.min(255));
-            dst[pidx] = or_s as u8;
-            dst[pidx + 1] = og_s as u8;
-            dst[pidx + 2] = ob_s as u8;
-            dst[pidx + 3] = oa.min(255) as u8;
+            continue;
+        };
+        // The mask row facing this destination row, cut to the columns
+        // of the blit it covers (it reads as 0 everywhere else, where
+        // nothing is composited).
+        let my = dy as i64 - my;
+        if my < 0 || my >= m.height as i64 {
+            continue;
+        }
+        let c0 = dx0 as i64 - mx; // mask column under blit column 0
+        let n = (x_hi - x_lo) as i64;
+        let k_lo = (-c0).clamp(0, n);
+        let k_hi = (m.width as i64 - c0).clamp(k_lo, n);
+        let (k_lo, k_hi) = (k_lo as usize, k_hi as usize);
+        let m0 = my as usize * m.width as usize + (c0 + k_lo as i64) as usize;
+        let cov_row = &m.data[m0..m0 + (k_hi - k_lo)];
+        for ((s, d), &cov) in src_row[k_lo * 4..k_hi * 4]
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(dst_row[k_lo * 4..k_hi * 4].as_chunks_mut::<4>().0)
+            .zip(cov_row)
+        {
+            over_pixel(s, d, cov as u32, extra_q);
         }
     }
 }
 
-/// Scan a canvas-sized RGBA buffer for the touched-pixel bounding box
-/// (any pixel with non-zero alpha), allocate a tight crop, and return
-/// it as a [`RasterizedSubtree`].
-///
-/// Empty subtrees (no touched pixels) return `width = height = 0` with
-/// an empty `rgba` vec — the blitter treats that as a no-op.
-fn crop_to_bbox(
-    src: &[u8],
-    src_stride: usize,
-    src_width: u32,
-    src_height: u32,
-    transform_at_cache_time: Transform2D,
-) -> RasterizedSubtree {
-    if src_width == 0 || src_height == 0 {
-        return RasterizedSubtree {
-            width: 0,
-            height: 0,
-            offset_x: 0,
-            offset_y: 0,
-            rgba: Vec::new(),
-            transform_at_cache_time,
-        };
+/// Composite one straight-alpha source pixel over one straight-alpha
+/// destination pixel with the source alpha scaled by `cov / 255` and
+/// `extra_q / 255` (premultiplied source-over, rounded to nearest at
+/// each step).
+#[inline(always)]
+fn over_pixel(src: &[u8; 4], dst: &mut [u8; 4], cov: u32, extra_q: u32) {
+    let sa_raw = src[3] as u32;
+    if sa_raw == 0 || cov == 0 {
+        return;
     }
-    let mut min_x = src_width;
-    let mut max_x = 0u32; // inclusive max
-    let mut min_y = src_height;
-    let mut max_y = 0u32;
-    let mut any = false;
-    for y in 0..src_height {
-        let row = (y as usize) * src_stride;
-        for x in 0..src_width {
-            let i = row + (x as usize) * 4;
-            if src[i + 3] != 0 {
-                any = true;
-                if x < min_x {
-                    min_x = x;
-                }
-                if x > max_x {
-                    max_x = x;
-                }
-                if y < min_y {
-                    min_y = y;
-                }
-                if y > max_y {
-                    max_y = y;
-                }
-            }
-        }
+    // src_alpha = sa_raw * cov * extra / (255 * 255)
+    let sa = (sa_raw * cov * extra_q + (255 * 255 / 2)) / (255 * 255);
+    if sa == 0 {
+        return;
     }
-    if !any {
-        return RasterizedSubtree {
-            width: 0,
-            height: 0,
-            offset_x: 0,
-            offset_y: 0,
-            rgba: Vec::new(),
-            transform_at_cache_time,
-        };
+    if sa == 255 {
+        // Fully-opaque source pixel: the over operator reduces to a
+        // plain overwrite (with `sa = 255` the premultiply is exact,
+        // `inv = 0` zeroes every destination term, and the final
+        // un-premultiply divides by 255 giving the source bytes back
+        // verbatim).
+        *dst = [src[0], src[1], src[2], 255];
+        return;
     }
-    let w = max_x - min_x + 1;
-    let h = max_y - min_y + 1;
-    let dst_stride = (w as usize) * 4;
-    let mut rgba = vec![0u8; dst_stride * (h as usize)];
-    for y in 0..h {
-        let src_row = ((min_y + y) as usize) * src_stride + (min_x as usize) * 4;
-        let dst_row = (y as usize) * dst_stride;
-        rgba[dst_row..dst_row + dst_stride].copy_from_slice(&src[src_row..src_row + dst_stride]);
-    }
-    RasterizedSubtree {
-        width: w,
-        height: h,
-        offset_x: min_x,
-        offset_y: min_y,
-        rgba,
-        transform_at_cache_time,
-    }
+    // Promote source RGB into premultiplied space (src is
+    // straight-alpha at sa_raw — re-premultiply with the *combined*
+    // alpha so the over operator behaves).
+    let sr = (src[0] as u32 * sa + 127) / 255;
+    let sg = (src[1] as u32 * sa + 127) / 255;
+    let sb = (src[2] as u32 * sa + 127) / 255;
+
+    let da0 = dst[3] as u32;
+    let dr = (dst[0] as u32 * da0 + 127) / 255;
+    let dg = (dst[1] as u32 * da0 + 127) / 255;
+    let db = (dst[2] as u32 * da0 + 127) / 255;
+
+    let inv = 255 - sa;
+    let or = sr + (dr * inv + 127) / 255;
+    let og = sg + (dg * inv + 127) / 255;
+    let ob = sb + (db * inv + 127) / 255;
+    // `sa ≥ 1`, so the composite alpha is never zero.
+    let oa = sa + (da0 * inv + 127) / 255;
+    *dst = [
+        ((or * 255 + oa / 2) / oa).min(255) as u8,
+        ((og * 255 + oa / 2) / oa).min(255) as u8,
+        ((ob * 255 + oa / 2) / oa).min(255) as u8,
+        oa.min(255) as u8,
+    ];
 }
 
 /// Convert a packed RGBA offscreen buffer (the rasterised mask
@@ -3050,62 +3182,11 @@ mod tests {
     }
 
     #[test]
-    fn crop_to_bbox_extracts_painted_pixels_only() {
-        // 8×8 buffer with a single non-zero pixel at (3, 5).
-        let w = 8u32;
-        let h = 8u32;
-        let stride = (w as usize) * 4;
-        let mut buf = vec![0u8; stride * (h as usize)];
-        let i = 5 * stride + 3 * 4;
-        buf[i] = 11;
-        buf[i + 1] = 22;
-        buf[i + 2] = 33;
-        buf[i + 3] = 44;
-        let s = crop_to_bbox(&buf, stride, w, h, Transform2D::identity());
-        assert_eq!(s.width, 1);
-        assert_eq!(s.height, 1);
-        assert_eq!(s.offset_x, 3);
-        assert_eq!(s.offset_y, 5);
-        assert_eq!(&s.rgba, &[11, 22, 33, 44]);
-    }
-
-    #[test]
-    fn crop_to_bbox_empty_buffer_yields_empty_subtree() {
-        let w = 4u32;
-        let h = 4u32;
-        let stride = (w as usize) * 4;
-        let buf = vec![0u8; stride * (h as usize)];
-        let s = crop_to_bbox(&buf, stride, w, h, Transform2D::identity());
-        assert_eq!(s.width, 0);
-        assert_eq!(s.height, 0);
-        assert!(s.rgba.is_empty());
-    }
-
-    #[test]
-    fn crop_to_bbox_inclusive_bounds_around_two_pixels() {
-        // Two non-zero pixels at (1, 2) and (4, 6) → bbox is 4×5.
-        let w = 8u32;
-        let h = 8u32;
-        let stride = (w as usize) * 4;
-        let mut buf = vec![0u8; stride * (h as usize)];
-        for &(x, y, a) in &[(1u32, 2u32, 100u8), (4u32, 6u32, 200u8)] {
-            let i = (y as usize) * stride + (x as usize) * 4;
-            buf[i + 3] = a;
-        }
-        let s = crop_to_bbox(&buf, stride, w, h, Transform2D::identity());
-        assert_eq!(s.offset_x, 1);
-        assert_eq!(s.offset_y, 2);
-        assert_eq!(s.width, 4);
-        assert_eq!(s.height, 5);
-        assert_eq!(s.rgba.len(), (4 * 5 * 4) as usize);
-    }
-
-    #[test]
     fn blit_with_offset_paints_at_destination_position() {
         // 8×8 destination, 2×2 source of opaque red, blit at (3, 4).
         let mut dst = vec![0u8; 8 * 8 * 4];
         let src: Vec<u8> = (0..2 * 2).flat_map(|_| [255, 0, 0, 255]).collect();
-        blit_rgba_over(&mut dst, 32, 8, 8, &src, 2, 2, 3, 4, None, 1.0);
+        blit_rgba_at(&mut dst, 32, 8, 8, &src, 2, 2, 3, 4, None, 1.0, None);
         // Pixel (3, 4) should be red.
         let i = 4 * 32 + 3 * 4;
         assert_eq!(&dst[i..i + 4], &[255, 0, 0, 255]);
@@ -3125,7 +3206,7 @@ mod tests {
         // top-left 2×2 of the source should land on dst.
         let mut dst = vec![0u8; 4 * 4 * 4];
         let src: Vec<u8> = (0..4 * 4).flat_map(|_| [10, 20, 30, 255]).collect();
-        blit_rgba_over(&mut dst, 16, 4, 4, &src, 4, 4, 2, 2, None, 1.0);
+        blit_rgba_at(&mut dst, 16, 4, 4, &src, 4, 4, 2, 2, None, 1.0, None);
         // Pixel (2, 2): painted.
         let i = 2 * 16 + 2 * 4;
         assert_eq!(&dst[i..i + 4], &[10, 20, 30, 255]);

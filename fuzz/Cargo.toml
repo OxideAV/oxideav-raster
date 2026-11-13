@@ -67,3 +67,13 @@ name = "render_paths"
 path = "fuzz_targets/render_paths.rs"
 test = false
 doc = false
+
+# Group-cache target — keyed groups (few keys, many placements, nesting,
+# clips, opacities) rendered through cold / warm / starved / disabled /
+# shared caches; every render of one configuration must be
+# byte-identical, so a bitmap reused for other content cannot hide.
+[[bin]]
+name = "group_cache"
+path = "fuzz_targets/group_cache.rs"
+test = false
+doc = false
