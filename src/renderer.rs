@@ -760,6 +760,7 @@ impl Renderer {
         let group_clip_storage: Option<Coverage> = g.clip.as_ref().map(|clip_path| {
             let cs = self.flatten_fill(&clip_path.commands, &local);
             let m = self.rasterize_clip(&cs);
+            crate::flatten::recycle(cs);
             match clip_mask {
                 Some(parent) => m.intersect(parent),
                 None => m,
@@ -987,7 +988,9 @@ impl Renderer {
         // when the window is blitted.
         let clip: Option<Coverage> = g.clip.as_ref().map(|clip_path| {
             let cs = sub.flatten_fill(&clip_path.commands, &t);
-            sub.rasterize_clip(&cs)
+            let m = sub.rasterize_clip(&cs);
+            crate::flatten::recycle(cs);
+            m
         });
         for child in &g.children {
             sub.draw_node(child, t, 1.0, &mut off, stride, clip.as_ref());
@@ -1174,6 +1177,7 @@ impl Renderer {
                 &transform,
                 group_opacity,
             );
+            crate::flatten::recycle(contours);
         }
         // Stroke pass.
         if let Some(stroke) = &node.stroke {
@@ -1189,6 +1193,7 @@ impl Renderer {
                 &transform,
                 group_opacity,
             );
+            crate::flatten::recycle(stroke_geom);
         }
     }
 

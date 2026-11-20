@@ -121,8 +121,10 @@ pub(crate) fn flatten_path_with(
     transform: &Transform2D,
     opts: &FlattenOptions,
 ) -> Vec<FlatContour> {
-    let mut out: Vec<FlatContour> = Vec::new();
-    let mut cur: FlatContour = FlatContour::default();
+    let mut out: Vec<FlatContour> = POOL
+        .with(|p| p.borrow_mut().lists.pop())
+        .unwrap_or_default();
+    let mut cur: FlatContour = pooled_contour();
     let mut pen = Point::new(0.0, 0.0);
     let mut subpath_start = Point::new(0.0, 0.0);
     let mut have_subpath = false;
@@ -148,7 +150,7 @@ pub(crate) fn flatten_path_with(
             PathCommand::MoveTo(p) => {
                 // Flush any in-flight subpath before starting a new one.
                 if have_subpath && cur.points.len() >= 2 {
-                    out.push(std::mem::take(&mut cur));
+                    out.push(std::mem::replace(&mut cur, pooled_contour()));
                 } else {
                     cur.points.clear();
                     cur.closed = false;
@@ -264,7 +266,7 @@ pub(crate) fn flatten_path_with(
                     cur.points.push(p);
                 }
                 if cur.points.len() >= 2 {
-                    out.push(std::mem::take(&mut cur));
+                    out.push(std::mem::replace(&mut cur, pooled_contour()));
                 } else {
                     cur.points.clear();
                     cur.closed = false;
@@ -279,8 +281,72 @@ pub(crate) fn flatten_path_with(
     }
     if have_subpath && cur.points.len() >= 2 {
         out.push(cur);
+    } else {
+        recycle_points(cur.points);
     }
     out
+}
+
+/// Point and contour-list buffers of contours the renderer has finished
+/// with, reused by the next [`flatten_path_with`] on the same thread
+/// (a scene of thousands of small paths otherwise allocates, grows and
+/// frees a handful of vectors per path).
+#[derive(Default)]
+struct Pool {
+    points: Vec<Vec<(f32, f32)>>,
+    lists: Vec<Vec<FlatContour>>,
+}
+
+/// Buffers kept per kind, and the largest one worth keeping.
+const POOL_SLOTS: usize = 32;
+const POOL_KEEP_POINTS: usize = 1 << 16;
+
+thread_local! {
+    static POOL: std::cell::RefCell<Pool> = const {
+        std::cell::RefCell::new(Pool {
+            points: Vec::new(),
+            lists: Vec::new(),
+        })
+    };
+}
+
+#[inline]
+fn pooled_contour() -> FlatContour {
+    FlatContour {
+        points: POOL
+            .with(|p| p.borrow_mut().points.pop())
+            .unwrap_or_default(),
+        closed: false,
+    }
+}
+
+fn recycle_points(mut points: Vec<(f32, f32)>) {
+    if points.capacity() == 0 || points.capacity() > POOL_KEEP_POINTS {
+        return;
+    }
+    points.clear();
+    POOL.with(|p| {
+        let pool = &mut p.borrow_mut().points;
+        if pool.len() < POOL_SLOTS {
+            pool.push(points);
+        }
+    });
+}
+
+/// Hand the buffers of contours that are no longer needed back to the
+/// per-thread pool.
+pub(crate) fn recycle(mut contours: Vec<FlatContour>) {
+    for c in contours.drain(..) {
+        recycle_points(c.points);
+    }
+    if contours.capacity() != 0 {
+        POOL.with(|p| {
+            let pool = &mut p.borrow_mut().lists;
+            if pool.len() < POOL_SLOTS {
+                pool.push(contours);
+            }
+        });
+    }
 }
 
 /// A fresh chord budget for one curve.

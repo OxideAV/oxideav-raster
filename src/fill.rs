@@ -719,6 +719,9 @@ pub(crate) struct EdgeTable {
     dxdy: Vec<f32>,
     /// Chains sorted by top y.
     chains: Vec<Chain>,
+    /// The builder's (empty) chain-assembly buffer, kept only so its
+    /// allocation is recycled with the rest.
+    cur: Vec<(f32, f32)>,
     win: Window,
 }
 
@@ -771,6 +774,54 @@ impl ChainBuilder {
             });
         }
         self.cur.clear();
+    }
+}
+
+/// Working storage of [`EdgeTable::scan_rows`], reused across scans on
+/// one thread.
+#[derive(Default)]
+struct ScanScratch {
+    area: Vec<f32>,
+    run: Vec<f32>,
+    out_row: Vec<u8>,
+    active: Vec<(u32, u32)>,
+    events: Vec<f32>,
+    sc: Vec<StripChain>,
+    sub: Vec<f32>,
+    strip: Vec<StripEdge>,
+    spans: Vec<(u32, u32)>,
+}
+
+/// Edge-table storage handed back by a dropped [`EdgeTable`].
+#[derive(Default)]
+struct TableScratch {
+    pts: Vec<(f32, f32)>,
+    dxdy: Vec<f32>,
+    chains: Vec<Chain>,
+    cur: Vec<(f32, f32)>,
+}
+
+/// Scratch sets wider (in cells / vertices) than this are freed rather
+/// than kept for the next shape.
+const SCRATCH_KEEP_CELLS: usize = 1 << 17;
+
+thread_local! {
+    static SCAN_SCRATCH: std::cell::Cell<Option<ScanScratch>> = const { std::cell::Cell::new(None) };
+    static TABLE_SCRATCH: std::cell::Cell<Option<TableScratch>> = const { std::cell::Cell::new(None) };
+}
+
+impl Drop for EdgeTable {
+    fn drop(&mut self) {
+        if self.pts.capacity() <= SCRATCH_KEEP_CELLS {
+            let _ = TABLE_SCRATCH.try_with(|t| {
+                t.set(Some(TableScratch {
+                    pts: std::mem::take(&mut self.pts),
+                    dxdy: std::mem::take(&mut self.dxdy),
+                    chains: std::mem::take(&mut self.chains),
+                    cur: std::mem::take(&mut self.cur),
+                }))
+            });
+        }
     }
 }
 
@@ -837,10 +888,20 @@ impl EdgeTable {
         let (wx0, wy0, wx1, wy1) = (win.x0 as f64, win.y0 as f64, win.x1 as f64, win.y1 as f64);
         let local = |x: f64, y: f64| -> (f32, f32) { ((x - wx0) as f32, (y - wy0) as f32) };
 
+        let TableScratch {
+            mut pts,
+            mut dxdy,
+            mut chains,
+            mut cur,
+        } = TABLE_SCRATCH.take().unwrap_or_default();
+        pts.clear();
+        pts.reserve(count + 8);
+        chains.clear();
+        cur.clear();
         let mut b = ChainBuilder {
-            pts: Vec::with_capacity(count + 8),
-            chains: Vec::new(),
-            cur: Vec::new(),
+            pts,
+            chains,
+            cur,
             cur_w: 0,
         };
         // Top-to-bottom pieces of one segment (at most three after the
@@ -938,13 +999,25 @@ impl EdgeTable {
             b.finish();
         }
         let ChainBuilder {
-            pts, mut chains, ..
+            pts,
+            mut chains,
+            cur,
+            ..
         } = b;
+        dxdy.clear();
         if chains.is_empty() {
+            // Hand the storage straight back.
+            drop(EdgeTable {
+                pts,
+                dxdy,
+                chains,
+                cur,
+                win,
+            });
             return None;
         }
         chains.sort_unstable_by(|a, b| a.y_top.total_cmp(&b.y_top));
-        let mut dxdy = vec![0.0f32; pts.len()];
+        dxdy.resize(pts.len(), 0.0);
         for c in &chains {
             for i in c.start as usize..c.end as usize - 1 {
                 let (p, q) = (pts[i], pts[i + 1]);
@@ -956,6 +1029,7 @@ impl EdgeTable {
             pts,
             dxdy,
             chains,
+            cur,
             win,
         })
     }
@@ -1021,20 +1095,36 @@ impl EdgeTable {
         // directly, `run` is a difference array for fully-covered runs
         // (prefix-summed at row end). Both have one spare slot so a run
         // ending at the window edge can close.
-        let mut area: Vec<f32> = vec![0.0; w + 1];
-        let mut run: Vec<f32> = vec![0.0; w + 1];
-        let mut out_row: Vec<u8> = vec![0; w];
-        // Active chains: (chain index, cursor = vertex index of the
-        // segment containing the row top).
-        let mut active: Vec<(u32, u32)> = Vec::new();
+        //
+        // All of the scan's working storage comes from a per-thread
+        // scratch set, so a scene of thousands of small shapes does not
+        // allocate (and zero) it once per shape. The accumulators are
+        // all-zero whenever a row is finished, hence whenever the set is
+        // handed back.
+        let ScanScratch {
+            mut area,
+            mut run,
+            mut out_row,
+            // Active chains: (chain index, cursor = vertex index of the
+            // segment containing the row top).
+            mut active,
+            mut events,
+            mut sc,
+            mut sub,
+            mut strip,
+            // Column ranges (inclusive) written in the current row, one
+            // per cluster and strip.
+            mut spans,
+        } = SCAN_SCRATCH.take().unwrap_or_default();
+        if area.len() < w + 1 {
+            area.resize(w + 1, 0.0);
+            run.resize(w + 1, 0.0);
+        }
+        if out_row.len() < w {
+            out_row.resize(w, 0);
+        }
+        active.clear();
         let mut next_chain = 0usize;
-        let mut events: Vec<f32> = Vec::new();
-        let mut sc: Vec<StripChain> = Vec::new();
-        let mut sub: Vec<f32> = Vec::new();
-        let mut strip: Vec<StripEdge> = Vec::new();
-        // Column ranges (inclusive) written in the current row, one per
-        // cluster and strip.
-        let mut spans: Vec<(u32, u32)> = Vec::new();
 
         for py in rows.start..height {
             let row_top = py as f32;
@@ -1301,6 +1391,19 @@ impl EdgeTable {
                 area[lo..=hi_marker].fill(0.0);
                 run[lo..=hi_marker].fill(0.0);
             }
+        }
+        if area.capacity() <= SCRATCH_KEEP_CELLS {
+            SCAN_SCRATCH.set(Some(ScanScratch {
+                area,
+                run,
+                out_row,
+                active,
+                events,
+                sc,
+                sub,
+                strip,
+                spans,
+            }));
         }
     }
 
