@@ -336,3 +336,70 @@ fn a_small_byte_budget_bounds_the_cache_without_changing_the_picture() {
         cache.stats().entries
     );
 }
+
+#[test]
+fn large_and_partly_visible_groups_render_the_same_at_every_budget() {
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    // Curved keyed panels of 300–400 px at fractional positions far from
+    // the origin, some hanging off the canvas edges, plus a line of
+    // glyphs. With the default budget they are all cached; with a small
+    // one only the glyphs are; with none nothing is. Whatever is not
+    // stored is rasterised in the frame the stored bitmap would have
+    // had, so every budget — and every thread budget — produces the
+    // same bytes.
+    let mut root = text_page(400, true, (0.4, 0.7)).root;
+    for i in 0..9u32 {
+        let (px, py) = (
+            -90.3 + (i % 3) as f32 * 811.37,
+            -60.9 + (i / 3) as f32 * 447.61,
+        );
+        let mut panel = Path::new();
+        let (w, h) = (300.0 + i as f32 * 11.0, 330.0 - i as f32 * 7.0);
+        panel
+            .move_to(Point::new(0.0, h * 0.5))
+            .quad_to(Point::new(0.0, 0.0), Point::new(w * 0.5, 0.0))
+            .quad_to(Point::new(w, 0.0), Point::new(w, h * 0.5))
+            .quad_to(Point::new(w, h), Point::new(w * 0.5, h))
+            .quad_to(Point::new(0.0, h), Point::new(0.0, h * 0.5))
+            .close();
+        root.children.push(Node::Group(Group {
+            transform: Transform2D::translate(px, py)
+                .compose(&Transform2D::rotate(0.07 * i as f32)),
+            cache_key: Some(0xbead_0000 + i as u64),
+            opacity: 0.85,
+            children: vec![Node::Path(PathNode {
+                path: panel,
+                fill: Some(Paint::Solid(Rgba::new(40 + 20 * i as u8, 120, 200, 210))),
+                stroke: None,
+                fill_rule: FillRule::NonZero,
+            })],
+            ..Group::default()
+        }));
+    }
+    let frame = VectorFrame {
+        width: W as f32,
+        height: H as f32,
+        view_box: None,
+        root,
+        pts: None,
+        time_base: TimeBase::new(1, 1),
+    };
+    let roomy = Renderer::new(W, H);
+    let reference = pixels(&roomy, &frame);
+    let all = roomy.cache_stats().entries;
+    let small = Renderer::new(W, H).with_cache_bytes(256 << 10);
+    assert!(pixels(&small, &frame) == reference, "256 KiB budget");
+    let kept = small.cache_stats().entries;
+    assert!(kept > 0 && kept < all, "{kept} of {all} bitmaps kept");
+    assert!(
+        pixels(&Renderer::new(W, H).with_cache_bytes(0), &frame) == reference,
+        "no cache"
+    );
+    let threaded = Renderer::new(W, H)
+        .with_cache_bytes(0)
+        .with_execution_context(&oxideav_core::ExecutionContext::with_threads(4));
+    assert!(
+        pixels(&threaded, &frame) == reference,
+        "no cache, 4 workers"
+    );
+}

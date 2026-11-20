@@ -258,11 +258,6 @@ pub const DEFAULT_CACHE_SUBPIXEL_GRID: u8 = 4;
 /// that is drawn directly (clipped to the canvas) instead.
 const CACHE_OFFCANVAS_SLACK_PX: u64 = 1 << 16;
 
-/// Off-canvas pixels an uncacheable keyed group may waste (on top of a
-/// quarter of its visible area) and still be rasterised in the cached
-/// bitmap's own frame rather than in a canvas-clipped window.
-const CACHE_TRANSIENT_SLACK_PX: u64 = 1 << 12;
-
 impl Renderer {
     /// Build a renderer for the given destination size with sane
     /// defaults (exact-area anti-aliasing, `supersampling = 4` for the
@@ -795,12 +790,14 @@ impl Renderer {
     /// invalidates an entry.
     ///
     /// Not cached: a non-finite or astronomically large transform
-    /// (drawn unsnapped);
-    /// bounds that are unbounded (non-finite geometry); a bitmap larger
-    /// than a quarter of the cache budget; and a group whose bounds
-    /// exceed four times their on-canvas part (plus a small slack) —
-    /// rasterising all of it for the cache would cost more than
-    /// rendering the visible part.
+    /// (drawn unsnapped); bounds that are unbounded (non-finite
+    /// geometry); and a group whose bounds exceed four times their
+    /// on-canvas part (plus a small slack) — rasterising all of it for
+    /// the cache would cost more than rendering the visible part. Those
+    /// go through the canvas-clipped window of the caller. A bitmap
+    /// larger than a quarter of the cache budget is not stored either,
+    /// but it is still rasterised here, in the cached bitmap's own
+    /// frame, so the picture does not depend on the budget.
     #[allow(clippy::too_many_arguments)]
     fn draw_group_cached(
         &self,
@@ -870,15 +867,14 @@ impl Renderer {
                     let (w, h) = (pb.width() as u32, pb.height() as u32);
                     if area.saturating_mul(4) > self.cache.max_entry_bytes() as u64 {
                         // Too large for the cache (or the cache is
-                        // disabled). When most of the box is visible the
-                        // group is rasterised in exactly the frame a
-                        // cached bitmap would use — same window, same
-                        // coordinates, only the rows this renderer owns
-                        // — so the pixels are those a larger budget
-                        // would have produced, bit for bit.
-                        if area > visible + visible / 4 + CACHE_TRANSIENT_SLACK_PX {
-                            return Some(direct);
-                        }
+                        // disabled): the group is rasterised in exactly
+                        // the frame a cached bitmap would use — same
+                        // window, same coordinates, only the rows this
+                        // renderer owns — so the pixels are those a
+                        // larger budget would have produced, bit for
+                        // bit. (The box is at most four times its
+                        // visible part plus the slack, by the test
+                        // above.)
                         let (b0, b1) = self.rows();
                         let top = pb.y0 + iy;
                         let r0 = (b0 as i64 - top).clamp(0, h as i64) as u32;
