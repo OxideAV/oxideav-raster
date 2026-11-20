@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `tests/text_cache.rs`: a 6 000-glyph page through the keyed-group cache under a counting allocator — a cold frame makes exactly one canvas-scale allocation (the output) and no other above 9 216 bytes; the cache holds at most (glyphs × sub-pixel phases) bitmaps however the page is scrolled; a budget a twelfth of the page's needs stays within its bytes, evicts, and renders the same picture.
 - `Renderer::try_render` / `validate_frame`: a typed `RenderError::NonFiniteGeometry` (naming the offending part of the scene) for callers that want a NaN / ±∞ coordinate, transform, stroke parameter, gradient or opacity rejected at the API boundary instead of rendered with the affected segments dropped.
 
 - `GroupCache`: a shareable, byte-budgeted (`DEFAULT_CACHE_BYTES` = 32 MiB, `with_max_bytes` / `set_max_bytes` / `with_max_entries`) LRU handle for `Group::cache_key` bitmaps, with `stats` / `reset_stats` / `clear`. `Renderer::with_group_cache` / `group_cache` keep one cache across frames and renderers; `Renderer::with_cache_bytes` sizes a private one; `CacheStats` gains `bytes`, `max_bytes`, `evictions`.
@@ -32,6 +33,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- a keyed group that could not be cached (cache disabled with a zero budget, or a bitmap over a quarter of the budget) was rasterised in a canvas-clipped window at another origin than the cached bitmap, so the same scene could differ by one 8-bit coverage step in a few anti-aliased pixels depending on the cache budget (6 000-glyph page, `with_cache_bytes(0)` against the default). Such a group is now rasterised in the cached bitmap's own frame whenever most of its box is visible, which makes the picture independent of the budget bit for bit (`tests/text_cache.rs`); only a group mostly off the canvas still uses the clipped window.
 - `gaussian_blur`: a standard deviation whose square underflows to zero (≈ 10⁻²³ and below) evaluated the centre tap as 0 / 0 and filled the image with NaN-derived pixels (assertion failure in debug builds; found by the scheduled `parse_filter_css` fuzz run through `drop-shadow()`). It is now the identity, the limit of the kernel.
 - a cached bitmap could be reused by a renderer whose pixel-affecting settings (coverage kernel, blend mode, …) had changed since it was made.
 - supersampled fill kernel: edges with a non-finite endpoint or slope are dropped before the edge sort, and both sorts compare with `total_cmp` — a path mixing NaN and `f32::MAX`-scale coordinates used to hand the standard library's sort a comparison that was not a total order (panic found by the scheduled `render_paths` fuzz run).

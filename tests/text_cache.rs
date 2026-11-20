@@ -1,0 +1,338 @@
+//! A page of text through the keyed-group cache: thousands of
+//! glyph-sized groups at arbitrary sub-pixel pen positions on a large
+//! canvas.
+//!
+//! Three properties are pinned down, each by measurement rather than by
+//! timing:
+//!
+//! * **a miss allocates a glyph-sized buffer.** A counting allocator
+//!   records every allocation made while a cold page renders: apart
+//!   from the output canvas itself nothing comes within two orders of
+//!   magnitude of the canvas size.
+//! * **keys are independent of position up to the sub-pixel phase.**
+//!   The number of bitmaps a page needs is bounded by (distinct glyphs)
+//!   × (phases of the sub-pixel grid), whatever the number of glyph
+//!   instances and wherever the page is scrolled to.
+//! * **the cache is bounded in bytes**, evicts least recently used
+//!   bitmaps, and the picture never depends on what it holds.
+
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+use oxideav_core::{
+    FillRule, Group, Node, Paint, Path, PathNode, Point, Rgba, TimeBase, Transform2D, VectorFrame,
+};
+use oxideav_raster::{GroupCache, Renderer};
+
+/// Allocations of at least `THRESHOLD` bytes made while `RECORDING`.
+struct Counting;
+
+static RECORDING: AtomicBool = AtomicBool::new(false);
+static THRESHOLD: AtomicUsize = AtomicUsize::new(usize::MAX);
+static BIG_ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
+static LARGEST_BELOW: AtomicUsize = AtomicUsize::new(0);
+static TOTAL_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+fn note(size: usize) {
+    if RECORDING.load(Ordering::Relaxed) {
+        TOTAL_BYTES.fetch_add(size, Ordering::Relaxed);
+        if size >= THRESHOLD.load(Ordering::Relaxed) {
+            BIG_ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        } else {
+            LARGEST_BELOW.fetch_max(size, Ordering::Relaxed);
+        }
+    }
+}
+
+// SAFETY: defers every request to the system allocator unchanged.
+unsafe impl GlobalAlloc for Counting {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        note(layout.size());
+        unsafe { System.alloc(layout) }
+    }
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        note(layout.size());
+        unsafe { System.alloc_zeroed(layout) }
+    }
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        note(new_size);
+        unsafe { System.realloc(ptr, layout, new_size) }
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        unsafe { System.dealloc(ptr, layout) }
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: Counting = Counting;
+
+/// The counters are process-wide: tests in this file take turns.
+static TURN: Mutex<()> = Mutex::new(());
+
+struct Recorded {
+    /// Allocations of at least the threshold.
+    big: usize,
+    /// Largest allocation below the threshold.
+    largest_below: usize,
+    /// Sum of every requested size.
+    total: usize,
+}
+
+fn record<T>(threshold: usize, f: impl FnOnce() -> T) -> (T, Recorded) {
+    THRESHOLD.store(threshold, Ordering::Relaxed);
+    BIG_ALLOCATIONS.store(0, Ordering::Relaxed);
+    LARGEST_BELOW.store(0, Ordering::Relaxed);
+    TOTAL_BYTES.store(0, Ordering::Relaxed);
+    RECORDING.store(true, Ordering::Relaxed);
+    let out = f();
+    RECORDING.store(false, Ordering::Relaxed);
+    (
+        out,
+        Recorded {
+            big: BIG_ALLOCATIONS.load(Ordering::Relaxed),
+            largest_below: LARGEST_BELOW.load(Ordering::Relaxed),
+            total: TOTAL_BYTES.load(Ordering::Relaxed),
+        },
+    )
+}
+
+const W: u32 = 1920;
+const H: u32 = 1080;
+const GLYPH_KINDS: u32 = 96;
+const SIZES: [f32; 4] = [11.0, 13.0, 16.0, 28.0];
+
+/// A glyph-like outline in font units (Y up): a wobbly ring with a
+/// counter.
+fn glyph_outline(id: u32) -> Path {
+    let mut p = Path::new();
+    let w = 380.0 + (id % 7) as f32 * 35.0;
+    let h = 480.0 + (id % 5) as f32 * 55.0;
+    let ring = |p: &mut Path, rx: f32, ry: f32, n: u32, reverse: bool| {
+        let (cx, cy) = (w * 0.5 + 40.0, h * 0.5);
+        for k in 0..=n {
+            let k = if reverse { n - k } else { k };
+            let a = k as f32 / n as f32 * std::f32::consts::TAU;
+            let wobble = 1.0 + 0.08 * ((id + 3) as f32 * a).sin();
+            let end = Point::new(cx + rx * wobble * a.cos(), cy + ry * wobble * a.sin());
+            if (k == 0 && !reverse) || (k == n && reverse) {
+                p.move_to(end);
+            } else {
+                let am = a + if reverse { 0.5 } else { -0.5 } * std::f32::consts::TAU / n as f32;
+                p.quad_to(
+                    Point::new(cx + rx * 1.12 * am.cos(), cy + ry * 1.12 * am.sin()),
+                    end,
+                );
+            }
+        }
+        p.close();
+    };
+    ring(&mut p, w * 0.5, h * 0.5, 10, false);
+    ring(&mut p, w * 0.27, h * 0.3, 8, true);
+    p
+}
+
+/// `count` glyph groups set in lines with fractional advances and line
+/// spacing, the whole page moved by `scroll`.
+fn text_page(count: usize, keyed: bool, scroll: (f32, f32)) -> VectorFrame {
+    let mut root = Group::default();
+    let (mut pen_x, mut baseline, mut line) = (12.0f32, 24.0f32, 0u32);
+    for i in 0..count {
+        let size_ix = (line as usize / 3) % SIZES.len();
+        let em = SIZES[size_ix];
+        let scale = em / 1000.0;
+        let id = (i as u32 * 17 + (i as u32 / 7) * 5) % GLYPH_KINDS;
+        let advance = (455.0 + (id % 7) as f32 * 35.0) * scale;
+        if pen_x + advance > W as f32 - 12.0 {
+            pen_x = 12.0;
+            baseline += em * 1.23;
+            line += 1;
+            if baseline > H as f32 - 8.0 {
+                baseline = 24.0 + (i % 5) as f32 * 0.37;
+            }
+        }
+        root.children.push(Node::Group(Group {
+            transform: Transform2D {
+                a: scale,
+                b: 0.0,
+                c: 0.0,
+                d: -scale,
+                e: pen_x + scroll.0,
+                f: baseline + scroll.1,
+            },
+            cache_key: keyed.then_some(((size_ix as u64) << 32) | id as u64),
+            children: vec![Node::Path(PathNode {
+                path: glyph_outline(id),
+                fill: Some(Paint::Solid(Rgba::opaque(20, 20, 24))),
+                stroke: None,
+                fill_rule: FillRule::NonZero,
+            })],
+            ..Group::default()
+        }));
+        pen_x += advance;
+    }
+    VectorFrame {
+        width: W as f32,
+        height: H as f32,
+        view_box: None,
+        root,
+        pts: None,
+        time_base: TimeBase::new(1, 1),
+    }
+}
+
+fn pixels(r: &Renderer, f: &VectorFrame) -> Vec<u8> {
+    r.render(f).planes.remove(0).data
+}
+
+const GLYPHS: usize = 6000;
+const CANVAS_BYTES: usize = (W as usize) * (H as usize) * 4;
+/// The largest glyph box on the page is under 40 × 40 px (6 400 bytes
+/// of RGBA); anything of this size or more is "not glyph-sized".
+const NOT_GLYPH_SIZED: usize = CANVAS_BYTES / 100;
+
+#[test]
+fn a_cold_page_allocates_one_canvas_and_glyph_sized_buffers() {
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let page = text_page(GLYPHS, true, (0.0, 0.0));
+    let r = Renderer::new(W, H);
+    // A first frame grows the cache's index tables (a few hundred
+    // kilobytes for thousands of entries, kept by `clear`); the frame
+    // measured is the second cold one.
+    pixels(&r, &page);
+    r.group_cache().clear();
+    r.reset_cache_stats();
+    let (out, rec) = record(NOT_GLYPH_SIZED, || pixels(&r, &page));
+    assert!(out.iter().any(|&b| b != 0));
+    let st = r.cache_stats();
+    assert_eq!(st.misses, st.entries as u64);
+    assert!(st.misses > 2000, "{} misses", st.misses);
+    println!(
+        "cold page: {} misses / {} hits, {} cached bytes; allocations of {} bytes or more: {}, \
+         largest below that: {} bytes, total requested: {} bytes (canvas: {CANVAS_BYTES})",
+        st.misses, st.hits, st.bytes, NOT_GLYPH_SIZED, rec.big, rec.largest_below, rec.total
+    );
+    // Exactly one large allocation: the output canvas.
+    assert_eq!(rec.big, 1, "a miss allocated a canvas-scale buffer");
+    // Everything else is glyph-sized: the largest glyph box on the
+    // page is under 48 × 48 px.
+    assert!(
+        rec.largest_below <= 48 * 48 * 4,
+        "largest non-canvas allocation: {} bytes",
+        rec.largest_below
+    );
+    // All allocations of the frame together stay within a small
+    // multiple of the canvas — 6 000 canvas-sized buffers would be
+    // 50 GB.
+    assert!(
+        rec.total < 4 * CANVAS_BYTES,
+        "{} bytes requested",
+        rec.total
+    );
+    // The cached bitmaps are glyph boxes.
+    assert!(st.bytes / st.entries.max(1) < 8 << 10);
+}
+
+#[test]
+fn bitmaps_are_shared_across_positions_up_to_the_sub_pixel_phase() {
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let kinds = (GLYPH_KINDS as usize) * SIZES.len();
+    for (grid, phases) in [(1u8, 1usize), (2, 4), (4, 16)] {
+        let cache = GroupCache::new();
+        let page = text_page(GLYPHS, true, (0.0, 0.0));
+        let r = Renderer::new(W, H)
+            .with_group_cache(cache.clone())
+            .with_cache_subpixel_grid(grid);
+        pixels(&r, &page);
+        let cold = cache.stats();
+        assert_eq!(cold.hits + cold.misses, GLYPHS as u64);
+        assert_eq!(cold.misses, cold.entries as u64);
+        assert!(
+            cold.entries <= kinds * phases,
+            "grid {grid}: {} bitmaps for {kinds} glyphs × {phases} phases",
+            cold.entries
+        );
+        // The same page again: every glyph is a hit.
+        cache.reset_stats();
+        pixels(&r, &page);
+        let warm = cache.stats();
+        assert_eq!((warm.misses, warm.hits), (0, GLYPHS as u64));
+        // Scrolled by whole pixels: still no miss, by a new renderer.
+        cache.reset_stats();
+        let moved = text_page(GLYPHS, true, (37.0, -12.0));
+        let r2 = Renderer::new(W, H)
+            .with_group_cache(cache.clone())
+            .with_cache_subpixel_grid(grid);
+        pixels(&r2, &moved);
+        let scrolled = cache.stats();
+        assert_eq!(scrolled.misses, 0, "grid {grid}: whole-pixel scroll missed");
+        // Scrolled by arbitrary fractions, many times: the cache
+        // converges on at most one bitmap per glyph and phase.
+        for k in 1..=24 {
+            let f = text_page(GLYPHS, true, (k as f32 * 0.377, k as f32 * 1.913));
+            pixels(&r2, &f);
+        }
+        let after = cache.stats();
+        assert!(
+            after.entries <= kinds * phases,
+            "grid {grid}: {} bitmaps after scrolling",
+            after.entries
+        );
+        println!(
+            "grid {grid}: cold {} misses for {GLYPHS} glyphs; after 24 fractional scrolls \
+             {} bitmaps (bound {}), {} bytes, hit rate {:.1} %",
+            cold.misses,
+            after.entries,
+            kinds * phases,
+            after.bytes,
+            100.0 * after.hits as f64 / (after.hits + after.misses) as f64
+        );
+    }
+}
+
+#[test]
+fn a_small_byte_budget_bounds_the_cache_without_changing_the_picture() {
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let page = text_page(GLYPHS, true, (0.3, 0.6));
+    let roomy = Renderer::new(W, H);
+    let reference = pixels(&roomy, &page);
+    let full = roomy.cache_stats();
+    assert_eq!(full.evictions, 0);
+    // A budget an order of magnitude below what the page wants.
+    let budget = full.bytes / 12;
+    let cache = GroupCache::with_max_bytes(budget);
+    let tight = Renderer::new(W, H).with_group_cache(cache.clone());
+    for round in 0..3 {
+        let got = pixels(&tight, &page);
+        let nd = got.iter().zip(&reference).filter(|(a, b)| a != b).count();
+        let first = got.iter().zip(&reference).position(|(a, b)| a != b);
+        if let Some(i) = first {
+            println!(
+                "round {round}: {nd} differ; first at px ({}, {}) ch {}: {:?} vs {:?}",
+                (i / 4) % W as usize,
+                i / 4 / W as usize,
+                i % 4,
+                &got[i / 4 * 4..i / 4 * 4 + 4],
+                &reference[i / 4 * 4..i / 4 * 4 + 4]
+            );
+        }
+        assert!(got == reference, "round {round}");
+        let st = cache.stats();
+        assert!(
+            st.bytes <= budget,
+            "{} bytes cached over a {budget} budget",
+            st.bytes
+        );
+        assert!(st.evictions > 0);
+    }
+    // No budget at all: every glyph is drawn directly, same picture.
+    let none = Renderer::new(W, H).with_cache_bytes(0);
+    assert!(pixels(&none, &page) == reference);
+    assert_eq!(none.cache_stats().entries, 0);
+    println!(
+        "page wants {} bytes in {} bitmaps; a {budget}-byte budget holds {} of them",
+        full.bytes,
+        full.entries,
+        cache.stats().entries
+    );
+}

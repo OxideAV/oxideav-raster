@@ -31,8 +31,9 @@
 //! The cache is bounded by the **bytes** of pixel data it holds
 //! ([`DEFAULT_CACHE_BYTES`] unless configured), evicting the least
 //! recently used entries first. A single bitmap larger than a quarter
-//! of the budget is never cached — the group is then drawn directly,
-//! exactly as if it had no key.
+//! of the budget is never cached — the group is then rasterised into a
+//! transient bitmap in the very frame the cache would have used, so the
+//! picture does not depend on the budget.
 //!
 //! # Sharing
 //!

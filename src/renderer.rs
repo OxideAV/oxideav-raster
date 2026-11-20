@@ -258,6 +258,11 @@ pub const DEFAULT_CACHE_SUBPIXEL_GRID: u8 = 4;
 /// that is drawn directly (clipped to the canvas) instead.
 const CACHE_OFFCANVAS_SLACK_PX: u64 = 1 << 16;
 
+/// Off-canvas pixels an uncacheable keyed group may waste (on top of a
+/// quarter of its visible area) and still be rasterised in the cached
+/// bitmap's own frame rather than in a canvas-clipped window.
+const CACHE_TRANSIENT_SLACK_PX: u64 = 1 << 12;
+
 impl Renderer {
     /// Build a renderer for the given destination size with sane
     /// defaults (exact-area anti-aliasing, `supersampling = 4` for the
@@ -858,12 +863,43 @@ impl Renderer {
                         return None;
                     }
                     let area = pb.area();
-                    if area.saturating_mul(4) > self.cache.max_entry_bytes() as u64
-                        || area > visible.saturating_mul(4) + CACHE_OFFCANVAS_SLACK_PX
-                    {
+                    if area > visible.saturating_mul(4) + CACHE_OFFCANVAS_SLACK_PX {
                         return Some(direct);
                     }
                     let (w, h) = (pb.width() as u32, pb.height() as u32);
+                    if area.saturating_mul(4) > self.cache.max_entry_bytes() as u64 {
+                        // Too large for the cache (or the cache is
+                        // disabled). When most of the box is visible the
+                        // group is rasterised in exactly the frame a
+                        // cached bitmap would use — same window, same
+                        // coordinates, only the rows this renderer owns
+                        // — so the pixels are those a larger budget
+                        // would have produced, bit for bit.
+                        if area > visible + visible / 4 + CACHE_TRANSIENT_SLACK_PX {
+                            return Some(direct);
+                        }
+                        let (b0, b1) = self.rows();
+                        let top = pb.y0 + iy;
+                        let r0 = (b0 as i64 - top).clamp(0, h as i64) as u32;
+                        let r1 = (b1 as i64 - top).clamp(0, h as i64) as u32;
+                        if r0 < r1 {
+                            let rgba =
+                                self.render_group_window(g, &snapped, pb.x0, pb.y0, w, h, (r0, r1));
+                            self.blit(
+                                buf,
+                                stride,
+                                &rgba,
+                                w,
+                                r1 - r0,
+                                ix + pb.x0,
+                                top + r0 as i64,
+                                clip_mask.map(Coverage::as_blit_mask),
+                                parent_opacity * g.opacity,
+                                None,
+                            );
+                        }
+                        return None;
+                    }
                     CachedBitmap {
                         width: w,
                         height: h,
