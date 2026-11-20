@@ -535,20 +535,14 @@ fn the_byte_budget_bounds_the_cache_and_evicts_least_recently_used() {
 // ---------------------------------------------------------------------
 
 /// The renderer's group blit over a transparent destination, for one
-/// straight-alpha pixel: alpha scaled by `cov / 255 · extra / 255`.
+/// straight-alpha pixel: alpha scaled by `cov / 255 · extra / 255`, the
+/// colour carried over as it is (nothing underneath to mix with).
 fn over_transparent(px: [u8; 4], cov: u32, extra: u32) -> [u8; 4] {
     let sa = (px[3] as u32 * cov * extra + 255 * 255 / 2) / (255 * 255);
     if px[3] == 0 || cov == 0 || sa == 0 {
         return [0; 4];
     }
-    if sa == 255 {
-        return [px[0], px[1], px[2], 255];
-    }
-    let c = |v: u8| {
-        let p = (v as u32 * sa + 127) / 255;
-        ((p * 255 + sa / 2) / sa).min(255) as u8
-    };
-    [c(px[0]), c(px[1]), c(px[2]), sa as u8]
+    [px[0], px[1], px[2], sa as u8]
 }
 
 /// Content that reaches as far from its path as anything the renderer

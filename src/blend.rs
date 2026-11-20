@@ -138,7 +138,7 @@ impl BlendMode {
     /// runs the spec's non-separable formula on the full triple. Alpha
     /// is left untouched here; the composite formula handles alpha
     /// separately. Inputs and outputs are straight-alpha `[0, 1]`.
-    #[inline]
+    #[inline(always)]
     pub fn blend_rgb(self, cb: [f32; 3], cs: [f32; 3]) -> [f32; 3] {
         match self {
             BlendMode::Hue => set_lum(set_sat(cs, sat(cb)), lum(cb)),
@@ -164,7 +164,7 @@ impl BlendMode {
 /// ([`BlendMode::Hue`] / [`BlendMode::Saturation`] / [`BlendMode::Color`]
 /// / [`BlendMode::Luminosity`]) — those depend on all three RGB
 /// channels in concert and must go through [`BlendMode::blend_rgb`].
-#[inline]
+#[inline(always)]
 pub fn blend_channel(mode: BlendMode, cb: f32, cs: f32) -> f32 {
     let cb = cb.clamp(0.0, 1.0);
     let cs = cs.clamp(0.0, 1.0);
@@ -391,6 +391,17 @@ fn set_sat(c: [f32; 3], s: f32) -> [f32; 3] {
 /// [`crate::composite`] which avoids the per-pixel f32 round-trip. This
 /// function is intended for the modes that genuinely depend on `Cb`.
 pub fn blend_over(cb: Rgba, cs: Rgba, mode: BlendMode) -> Rgba {
+    blend_over_with(cb, cs, |b, s| mode.blend_rgb(b, s))
+}
+
+/// [`blend_over`] with the blend function `B(Cb, Cs)` supplied by the
+/// caller (so a row loop can resolve the mode once).
+#[inline(always)]
+pub(crate) fn blend_over_with(
+    cb: Rgba,
+    cs: Rgba,
+    blend_rgb: impl Fn([f32; 3], [f32; 3]) -> [f32; 3],
+) -> Rgba {
     let ab = cb.a as f32 / 255.0;
     let ar_s = cs.a as f32 / 255.0;
     let ar = ar_s + ab * (1.0 - ar_s);
@@ -407,7 +418,7 @@ pub fn blend_over(cb: Rgba, cs: Rgba, mode: BlendMode) -> Rgba {
         cs.g as f32 / 255.0,
         cs.b as f32 / 255.0,
     ];
-    let b = mode.blend_rgb(cb_rgb, cs_rgb);
+    let b = blend_rgb(cb_rgb, cs_rgb);
     let mix = [
         (1.0 - ab) * cs_rgb[0] + ab * b[0],
         (1.0 - ab) * cs_rgb[1] + ab * b[1],

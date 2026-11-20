@@ -2415,30 +2415,17 @@ fn over_pixel(src: &[u8; 4], dst: &mut [u8; 4], cov: u32, extra_q: u32) {
         *dst = [src[0], src[1], src[2], 255];
         return;
     }
-    // Promote source RGB into premultiplied space (src is
-    // straight-alpha at sa_raw — re-premultiply with the *combined*
-    // alpha so the over operator behaves).
-    let sr = (src[0] as u32 * sa + 127) / 255;
-    let sg = (src[1] as u32 * sa + 127) / 255;
-    let sb = (src[2] as u32 * sa + 127) / 255;
-
-    let da0 = dst[3] as u32;
-    let dr = (dst[0] as u32 * da0 + 127) / 255;
-    let dg = (dst[1] as u32 * da0 + 127) / 255;
-    let db = (dst[2] as u32 * da0 + 127) / 255;
-
-    let inv = 255 - sa;
-    let or = sr + (dr * inv + 127) / 255;
-    let og = sg + (dg * inv + 127) / 255;
-    let ob = sb + (db * inv + 127) / 255;
-    // `sa ≥ 1`, so the composite alpha is never zero.
-    let oa = sa + (da0 * inv + 127) / 255;
-    *dst = [
-        ((or * 255 + oa / 2) / oa).min(255) as u8,
-        ((og * 255 + oa / 2) / oa).min(255) as u8,
-        ((ob * 255 + oa / 2) / oa).min(255) as u8,
-        oa.min(255) as u8,
-    ];
+    // Re-premultiply the source with the *combined* alpha and
+    // composite (shared with the path compositor: same rounding, same
+    // transparent-destination rule).
+    crate::composite::over_px(
+        dst,
+        [src[0], src[1], src[2]],
+        crate::composite::div255(src[0] as u32 * sa),
+        crate::composite::div255(src[1] as u32 * sa),
+        crate::composite::div255(src[2] as u32 * sa),
+        sa,
+    );
 }
 
 /// Convert a packed RGBA offscreen buffer (the rasterised mask

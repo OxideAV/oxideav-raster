@@ -16,7 +16,7 @@
 //! source alpha by an extra group-opacity factor without rebuilding
 //! the mask.
 
-use crate::blend::{BlendMode, blend_over};
+use crate::blend::{BlendMode, blend_over_with};
 use crate::fill::{AlphaMask, Coverage};
 use oxideav_core::Rgba;
 
@@ -203,7 +203,7 @@ pub(crate) fn composite_rect_in(
 /// `(x + 127) / 255` there (255 is odd, so `x / 255` never ends in
 /// exactly one half).
 #[inline(always)]
-fn div255(x: u32) -> u32 {
+pub(crate) fn div255(x: u32) -> u32 {
     let t = x + 128;
     (t + (t >> 8)) >> 8
 }
@@ -228,14 +228,25 @@ fn div_small(n: u32, d: u32) -> u32 {
     ((n as u64 * RECIP[d as usize]) >> 32) as u32
 }
 
-/// Source-over of a straight-alpha source whose coverage-folded alpha
-/// is `sa ∈ 1..=254` onto one straight-alpha destination pixel, with
-/// the premultiplied source channels already computed. Integer
-/// arithmetic identical to the reference formulation (premultiply
-/// both, `S + D·(1 − αS)`, un-premultiply rounding to nearest).
+/// Source-over of a straight-alpha source `rgb` whose coverage-folded
+/// alpha is `sa ∈ 1..=254` onto one straight-alpha destination pixel,
+/// with the premultiplied source channels `sr sg sb` already computed.
+/// Integer arithmetic identical to the reference formulation
+/// (premultiply both, `S + D·(1 − αS)`, un-premultiply rounding to
+/// nearest) — except over a fully transparent destination, where the
+/// result *is* the source and its colour is stored as given instead of
+/// being rounded through an 8-bit premultiplied value (which keeps
+/// only `log2(sa)` bits of it).
 #[inline(always)]
-fn over_px(px: &mut [u8], sr: u32, sg: u32, sb: u32, sa: u32) {
+pub(crate) fn over_px(px: &mut [u8], rgb: [u8; 3], sr: u32, sg: u32, sb: u32, sa: u32) {
     let da0 = px[3] as u32;
+    if da0 == 0 {
+        px[0] = rgb[0];
+        px[1] = rgb[1];
+        px[2] = rgb[2];
+        px[3] = sa as u8;
+        return;
+    }
     let inv = 255 - sa;
     if da0 == 255 {
         // Opaque backdrop: the result is opaque and the
@@ -305,45 +316,106 @@ pub(crate) fn composite_row(
     linear: bool,
     paint_at: &mut impl FnMut(u32, u32) -> Rgba,
 ) {
+    if !blend.is_normal() {
+        blend_row_dispatch(dst, cov, x0, y, extra_q, blend, paint_at);
+        return;
+    }
+    // (coverage · extra) / 255² as one multiply and a shift: exact for
+    // every product below 2²⁴ (the rounding constant included).
+    let fold =
+        |a: u8, c: u8| -> u32 { (a as u32 * c as u32 * extra_q + (255 * 255 / 2)) / (255 * 255) };
+    if linear {
+        for (k, (&c, px)) in cov.iter().zip(dst.as_chunks_mut::<4>().0).enumerate() {
+            if c == 0 {
+                continue;
+            }
+            let src = paint_at(x0 + k as u32, y);
+            match fold(src.a, c) {
+                0 => {}
+                255 => *px = [src.r, src.g, src.b, 255],
+                sa => over_px_linear(px, src, sa),
+            }
+        }
+        return;
+    }
     for (k, (&c, px)) in cov.iter().zip(dst.as_chunks_mut::<4>().0).enumerate() {
         if c == 0 {
             continue;
         }
         let src = paint_at(x0 + k as u32, y);
-        // src_alpha = src.a * cov * extra / (255 * 255)
-        let combined = ((src.a as u32) * (c as u32) * extra_q + (255 * 255 / 2)) / (255 * 255);
-        if combined == 0 {
-            continue;
-        }
-        if blend.is_normal() {
-            if combined == 255 {
-                // Fully-opaque source pixel: the over operator reduces
-                // to a plain overwrite.
-                px.copy_from_slice(&[src.r, src.g, src.b, 255]);
-                continue;
-            }
-            let sa = combined;
-            if linear {
-                over_px_linear(px, src, sa);
-                continue;
-            }
-            over_px(
+        match fold(src.a, c) {
+            0 => {}
+            // Fully-opaque source pixel: the over operator reduces to a
+            // plain overwrite.
+            255 => *px = [src.r, src.g, src.b, 255],
+            sa => over_px(
                 px,
+                [src.r, src.g, src.b],
                 div255(src.r as u32 * sa),
                 div255(src.g as u32 * sa),
                 div255(src.b as u32 * sa),
                 sa,
-            );
-        } else {
-            // Full per-pixel separable blend. The backdrop is read
-            // straight-alpha; the source colour's alpha is replaced
-            // with the coverage-folded `combined` value so the spec's
-            // compositing formula sees the already-modulated source.
-            let cb = Rgba::new(px[0], px[1], px[2], px[3]);
-            let cs = Rgba::new(src.r, src.g, src.b, combined.min(255) as u8);
-            let cr = blend_over(cb, cs, blend);
-            px.copy_from_slice(&[cr.r, cr.g, cr.b, cr.a]);
+            ),
         }
+    }
+}
+
+/// One row through a non-normal blend mode: the mode is resolved once
+/// per row, so the per-pixel formula is a straight-line instance of
+/// [`BlendMode::blend_rgb`] for that mode (same arithmetic as
+/// [`blend_over`], pixel for pixel).
+#[inline]
+fn blend_row_dispatch(
+    dst: &mut [u8],
+    cov: &[u8],
+    x0: u32,
+    y: u32,
+    extra_q: u32,
+    blend: BlendMode,
+    paint_at: &mut impl FnMut(u32, u32) -> Rgba,
+) {
+    macro_rules! rows {
+        ($($mode:ident),* $(,)?) => {
+            match blend {
+                $(BlendMode::$mode => blend_row(dst, cov, x0, y, extra_q, paint_at, |cb, cs| {
+                    BlendMode::$mode.blend_rgb(cb, cs)
+                }),)*
+            }
+        };
+    }
+    rows!(
+        Normal, Multiply, Screen, Overlay, Darken, Lighten, ColorDodge, ColorBurn, HardLight,
+        SoftLight, Difference, Exclusion, Hue, Saturation, Color, Luminosity,
+    );
+}
+
+#[inline(always)]
+fn blend_row(
+    dst: &mut [u8],
+    cov: &[u8],
+    x0: u32,
+    y: u32,
+    extra_q: u32,
+    paint_at: &mut impl FnMut(u32, u32) -> Rgba,
+    mix: impl Fn([f32; 3], [f32; 3]) -> [f32; 3],
+) {
+    for (k, (&c, px)) in cov.iter().zip(dst.as_chunks_mut::<4>().0).enumerate() {
+        if c == 0 {
+            continue;
+        }
+        let src = paint_at(x0 + k as u32, y);
+        let combined = ((src.a as u32) * (c as u32) * extra_q + (255 * 255 / 2)) / (255 * 255);
+        if combined == 0 {
+            continue;
+        }
+        // The backdrop is read straight-alpha; the source colour's
+        // alpha is replaced with the coverage-folded `combined` value
+        // so the spec's compositing formula sees the already-modulated
+        // source.
+        let cb = Rgba::new(px[0], px[1], px[2], px[3]);
+        let cs = Rgba::new(src.r, src.g, src.b, combined.min(255) as u8);
+        let cr = blend_over_with(cb, cs, &mix);
+        *px = [cr.r, cr.g, cr.b, cr.a];
     }
 }
 
@@ -405,6 +477,7 @@ impl SolidSource {
                 } else if sa != 0 {
                     over_px(
                         &mut dst[k * 4..k * 4 + 4],
+                        [self.color.r, self.color.g, self.color.b],
                         sr as u32,
                         sg as u32,
                         sb as u32,
@@ -492,6 +565,10 @@ mod tests {
         let sg = (s[1] as u32 * sa + 127) / 255;
         let sb = (s[2] as u32 * sa + 127) / 255;
         let da0 = d[3] as u32;
+        if da0 == 0 {
+            // Nothing underneath: the source itself, colour untouched.
+            return [s[0], s[1], s[2], sa as u8];
+        }
         let dr = (d[0] as u32 * da0 + 127) / 255;
         let dg = (d[1] as u32 * da0 + 127) / 255;
         let db = (d[2] as u32 * da0 + 127) / 255;
@@ -522,6 +599,7 @@ mod tests {
                     let mut px = d;
                     over_px(
                         &mut px,
+                        s,
                         div255(s[0] as u32 * sa),
                         div255(s[1] as u32 * sa),
                         div255(s[2] as u32 * sa),
