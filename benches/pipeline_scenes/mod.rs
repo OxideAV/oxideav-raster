@@ -8,7 +8,7 @@ use oxideav_core::{
     LinearGradient, MaskKind, Node, Paint, Path, PathNode, Point, RadialGradient, Rect, Rgba,
     SpreadMethod, Stroke, TimeBase, Transform2D, VectorFrame, VideoFrame, VideoPlane,
 };
-use oxideav_raster::{BlendMode, GroupCache, Pattern, Renderer};
+use oxideav_raster::{BlendMode, ConicGradient, GradientPaint, GroupCache, Pattern, Renderer};
 
 pub const W: u32 = 1920;
 pub const H: u32 = 1080;
@@ -648,6 +648,26 @@ pub fn cases() -> Vec<Case> {
         )),
     ));
     v.push(render_case("grad_small2000", r(), small_gradients()));
+    {
+        // A conic gradient has no scene paint: it goes through the
+        // gradient-paint entry point (one sampler call per pixel).
+        let rr = r();
+        let path = rect_path(0.0, 0.0, W as f32, H as f32);
+        let paint = GradientPaint::conic(
+            ConicGradient::new(Point::new(900.0, 500.0), 0.3).with_stops(stops(6, 255)),
+        );
+        v.push(Case {
+            name: "grad_conic",
+            run: Box::new(move || {
+                first_byte(&rr.fill_path_with_gradient(
+                    &path,
+                    FillRule::NonZero,
+                    &paint,
+                    Transform2D::identity(),
+                ))
+            }),
+        });
+    }
 
     // Images and patterns.
     v.push(render_case("image_upright24", r(), images(false)));

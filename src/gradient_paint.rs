@@ -42,8 +42,8 @@ use oxideav_core::{LinearGradient, Paint, Path, Point, RadialGradient, Rect, Rgb
 
 use crate::flatten::flatten_path;
 use crate::gradient::{
-    FocalRadialGradient, InterpolationSpace, StopsLut, eval_focal_radial_gradient_lut,
-    eval_linear_gradient_lut, eval_radial_gradient_lut,
+    ConicGradient, FocalRadialGradient, InterpolationSpace, StopsLut, eval_conic_gradient_lut,
+    eval_focal_radial_gradient_lut, eval_linear_gradient_lut, eval_radial_gradient_lut,
 };
 
 /// Coordinate system the gradient geometry is expressed in (SVG 2
@@ -75,6 +75,9 @@ pub enum GradientGeometry {
     /// A two-circle radial gradient with a focal radius (SVG 2
     /// §14.2.3 `fr`).
     FocalRadial(FocalRadialGradient),
+    /// A conic (sweep) gradient: stops laid out by angle around a
+    /// centre.
+    Conic(ConicGradient),
 }
 
 /// A gradient paint server with its own coordinate system.
@@ -113,6 +116,11 @@ impl GradientPaint {
     /// Shorthand for `new(GradientGeometry::FocalRadial(g))`.
     pub fn focal_radial(g: FocalRadialGradient) -> Self {
         Self::new(GradientGeometry::FocalRadial(g))
+    }
+
+    /// Shorthand for `new(GradientGeometry::Conic(g))`.
+    pub fn conic(g: ConicGradient) -> Self {
+        Self::new(GradientGeometry::Conic(g))
     }
 
     /// Lift a gradient [`Paint`] (user-space geometry) into this
@@ -193,8 +201,7 @@ impl GradientPaint {
             GradientGeometry::Linear(g) => &g.stops,
             GradientGeometry::Radial(g) => &g.stops,
             GradientGeometry::FocalRadial(g) => &g.stops,
-            #[allow(unreachable_patterns)]
-            _ => return None,
+            GradientGeometry::Conic(g) => &g.stops,
         };
         Some(GradientSampler {
             inv,
@@ -227,8 +234,7 @@ impl GradientSampler {
             GradientGeometry::FocalRadial(g) => {
                 eval_focal_radial_gradient_lut(g, p.x, p.y, &self.lut)
             }
-            #[allow(unreachable_patterns)]
-            _ => Rgba::new(0, 0, 0, 0),
+            GradientGeometry::Conic(g) => eval_conic_gradient_lut(g, p.x, p.y, &self.lut),
         }
     }
 

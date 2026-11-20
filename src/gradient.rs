@@ -496,6 +496,140 @@ pub fn eval_focal_radial_gradient_lut(
     }
 }
 
+/// A conic (sweep) gradient: the stops are laid out by **angle** around
+/// a centre, the way a radial gradient lays them out by distance.
+///
+/// With `θ` the angle of `(p − center)` measured from the positive x
+/// axis towards the positive y axis of gradient space, the gradient
+/// parameter at `p` is
+///
+/// ```text
+///   t = ((θ − start_angle) mod 2π) / sweep
+/// ```
+///
+/// so `t` runs over `[0, 2π / sweep)` once around the centre. With the
+/// default `sweep` of a full turn that is exactly `[0, 1)`; with a
+/// smaller sweep the stop range covers a wedge and the rest of the turn
+/// is filled by the spread method (the last stop held, the wedge
+/// repeated, or mirrored). The colour is constant along every ray from
+/// the centre; at the centre itself (no direction) `θ` is taken as 0.
+///
+/// Neither `oxideav-core`'s `Paint` nor SVG has this gradient, so it
+/// is modelled here and painted through
+/// [`GradientPaint`](crate::GradientPaint) like the two-circle radial
+/// gradient. Unless the first and last stop agree there is a hard
+/// colour edge along the ray at `start_angle`; like every gradient it
+/// is sampled at pixel centres.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct ConicGradient {
+    /// The point the stops are swept around.
+    pub center: Point,
+    /// Direction of `t = 0`, in radians from the positive x axis
+    /// towards the positive y axis.
+    pub start_angle: f32,
+    /// Angle covered by the stop range `t ∈ [0, 1]`, in radians.
+    /// Defaults to a full turn; non-positive or non-finite values are
+    /// treated as a full turn.
+    pub sweep: f32,
+    /// Colour stops along `t ∈ [0, 1]`, ordered by ascending offset.
+    pub stops: Vec<oxideav_core::GradientStop>,
+    /// What to paint outside the swept wedge when `sweep` is less than
+    /// a full turn.
+    pub spread: SpreadMethod,
+}
+
+impl ConicGradient {
+    /// A full-turn conic gradient around `center` starting at
+    /// `start_angle`, with no stops and `Pad` spread.
+    pub fn new(center: Point, start_angle: f32) -> Self {
+        Self {
+            center,
+            start_angle,
+            sweep: std::f32::consts::TAU,
+            stops: Vec::new(),
+            spread: SpreadMethod::Pad,
+        }
+    }
+
+    /// Replace the gradient stops.
+    pub fn with_stops(mut self, stops: Vec<oxideav_core::GradientStop>) -> Self {
+        self.stops = stops;
+        self
+    }
+
+    /// Set the angle covered by the stop range.
+    pub fn with_sweep(mut self, sweep: f32) -> Self {
+        self.sweep = sweep;
+        self
+    }
+
+    /// Set the spread method.
+    pub fn with_spread(mut self, spread: SpreadMethod) -> Self {
+        self.spread = spread;
+        self
+    }
+}
+
+/// The gradient parameter of a conic gradient at `(px, py)`, before the
+/// spread method.
+fn conic_t(g: &ConicGradient, px: f32, py: f32) -> f32 {
+    use std::f64::consts::TAU;
+    let (dx, dy) = ((px - g.center.x) as f64, (py - g.center.y) as f64);
+    let theta = if dx == 0.0 && dy == 0.0 {
+        0.0
+    } else {
+        dy.atan2(dx)
+    };
+    // Into [0, 2π): the remainder is taken in f64 so an angle a hair
+    // below the start does not round up to a full turn (which would
+    // wrap to 0 and show a pixel of the wrong end of the ramp).
+    let mut turn = (theta - g.start_angle as f64).rem_euclid(TAU);
+    if turn >= TAU {
+        turn = 0.0;
+    }
+    let sweep = if g.sweep.is_finite() && g.sweep > 0.0 {
+        (g.sweep as f64).min(TAU)
+    } else {
+        TAU
+    };
+    (turn / sweep) as f32
+}
+
+/// Evaluate a conic gradient at `(px, py)` (sRGB interpolation).
+pub fn eval_conic_gradient(g: &ConicGradient, px: f32, py: f32) -> Rgba {
+    eval_conic_gradient_in(g, px, py, InterpolationSpace::Srgb)
+}
+
+/// Evaluate a conic gradient at `(px, py)` in the chosen interpolation
+/// space.
+pub fn eval_conic_gradient_in(
+    g: &ConicGradient,
+    px: f32,
+    py: f32,
+    space: InterpolationSpace,
+) -> Rgba {
+    if g.stops.is_empty() {
+        return Rgba::new(0, 0, 0, 0);
+    }
+    if g.stops.len() == 1 {
+        return g.stops[0].color;
+    }
+    sample_stops_in(&g.stops, apply_spread(conic_t(g, px, py), g.spread), space)
+}
+
+/// Evaluate a conic gradient using a pre-built stops LUT (same geometry
+/// as [`eval_conic_gradient_in`]).
+pub fn eval_conic_gradient_lut(g: &ConicGradient, px: f32, py: f32, lut: &StopsLut) -> Rgba {
+    if g.stops.is_empty() {
+        return Rgba::new(0, 0, 0, 0);
+    }
+    if g.stops.len() == 1 {
+        return g.stops[0].color;
+    }
+    lut.sample(apply_spread(conic_t(g, px, py), g.spread))
+}
+
 /// Pull `focal` strictly inside the bounding circle when it lies on
 /// or outside the boundary. SVG normalises this so the gradient
 /// equation always has a real positive root for points inside the

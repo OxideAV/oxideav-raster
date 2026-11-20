@@ -303,7 +303,8 @@ pub use filter_function::{FilterFunction, apply_filter_functions};
 pub use filter_graph::{FilterGraph, FilterInput, FilterPrimitive, FilterStep};
 pub use flatten::{FlatContour, flatten_arc_to_cubics, flatten_path};
 pub use gradient::{
-    FocalRadialGradient, InterpolationSpace, StopsLut, eval_focal_radial_gradient,
+    ConicGradient, FocalRadialGradient, InterpolationSpace, StopsLut, eval_conic_gradient,
+    eval_conic_gradient_in, eval_conic_gradient_lut, eval_focal_radial_gradient,
     eval_focal_radial_gradient_in, eval_focal_radial_gradient_lut, eval_linear_gradient,
     eval_linear_gradient_in, eval_linear_gradient_lut, eval_radial_gradient,
     eval_radial_gradient_in, eval_radial_gradient_lut,

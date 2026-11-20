@@ -24,6 +24,7 @@ produces a packed `Rgba` `VideoFrame`.
 | Linear + radial gradients                 | done — geometry in the node's user space, sampled through the inverse CTM (viewBox scale, group / element transforms, elliptical radial rings under non-uniform scale — SVG 2 §14.2.2.1 / §14.2.3.1) |
 | Off-centre focal radial                   | done                 |
 | Two-circle radial (`fr` focal radius)     | done (SVG 2 §13.2.4 / CSS Images 3) |
+| Conic (sweep) gradient                    | done — `ConicGradient` through `GradientPaint` (start angle, partial sweep completed by the spread method, bbox units, gradientTransform); lacks a core `Paint` variant |
 | Pad / Reflect / Repeat spread             | done                 |
 | `color-interpolation: sRGB` (default)     | done                 |
 | `color-interpolation: linearRGB`          | done                 |
