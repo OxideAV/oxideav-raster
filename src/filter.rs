@@ -6233,11 +6233,19 @@ fn offset_bilinear(src: &[u8], width: u32, height: u32, dx: f32, dy: f32) -> Vec
             return [0.0; 4];
         }
         let p = ((sy * w + sx) * 4) as usize;
+        // Premultiplied (Filter Effects 1 §9.1): the colour of a
+        // transparent neighbour must not leak into the interpolated
+        // sample. An opaque pixel's channels are unchanged.
+        let a = src[p + 3] as f32;
+        if a == 255.0 {
+            return [src[p] as f32, src[p + 1] as f32, src[p + 2] as f32, a];
+        }
+        let k = a / 255.0;
         [
-            src[p] as f32,
-            src[p + 1] as f32,
-            src[p + 2] as f32,
-            src[p + 3] as f32,
+            src[p] as f32 * k,
+            src[p + 1] as f32 * k,
+            src[p + 2] as f32 * k,
+            a,
         ]
     };
 
@@ -6261,12 +6269,26 @@ fn offset_bilinear(src: &[u8], width: u32, height: u32, dx: f32, dy: f32) -> Vec
             let c10 = fetch(x1, y0);
             let c01 = fetch(x0, y1);
             let c11 = fetch(x1, y1);
-            for c in 0..4 {
+            let mut px = [0.0f32; 4];
+            for (c, v) in px.iter_mut().enumerate() {
                 let top = c00[c] + (c10[c] - c00[c]) * tx;
                 let bot = c01[c] + (c11[c] - c01[c]) * tx;
-                let v = top + (bot - top) * ty;
-                out.push(v.clamp(0.0, 255.0).round() as u8);
+                *v = top + (bot - top) * ty;
             }
+            // Back to straight alpha (an opaque result needs no
+            // division; a transparent one has no colour).
+            let a = px[3];
+            let un = if a >= 255.0 {
+                1.0
+            } else if a > 0.0 {
+                255.0 / a
+            } else {
+                0.0
+            };
+            for v in &px[..3] {
+                out.push((v * un).clamp(0.0, 255.0).round() as u8);
+            }
+            out.push(a.clamp(0.0, 255.0).round() as u8);
         }
     }
     out
@@ -7183,20 +7205,25 @@ mod flood_offset_merge_tests {
     fn offset_bilinear_half_pixel_splits_value_evenly() {
         // 2×1 source: opaque red at x=0, transparent at x=1.
         // dx = 0.5 → output[0] reads source(-0.5) = halfway between
-        // source(-1)=oob (transparent black) and source(0)=red. Output
-        // should be premultiplied-equivalent half-red, half-alpha.
+        // source(-1)=oob (transparent black) and source(0)=red. Half of
+        // the sample is red and half is nothing: in the straight-alpha
+        // output that is full red at half alpha (premultiplied
+        // (128, 0, 0, 128)) — not a red darkened towards the colour
+        // bytes of the transparent neighbour.
         let src: Vec<u8> = vec![255, 0, 0, 255, 0, 0, 0, 0];
         let out = offset(&src, 2, 1, 0.5, 0.0, OffsetSampling::Bilinear);
-        // output[0] reads (oob @ x=-1) and source(0)=red, blended 50/50:
-        // r=128, a=128 approximately.
-        assert!((out[0] as i32 - 128).abs() <= 1, "r {}", out[0]);
+        assert_eq!(out[0], 255, "r {}", out[0]);
         assert_eq!(out[1], 0);
         assert_eq!(out[2], 0);
         assert!((out[3] as i32 - 128).abs() <= 1, "a {}", out[3]);
         // output[1] reads source(0)=red and source(1)=transparent,
-        // blended 50/50: r=128, a=128.
-        assert!((out[4] as i32 - 128).abs() <= 1, "r {}", out[4]);
+        // blended 50/50: red at half alpha again.
+        assert_eq!(out[4], 255, "r {}", out[4]);
         assert!((out[7] as i32 - 128).abs() <= 1, "a {}", out[7]);
+        // Whatever the transparent pixel's colour bytes hold.
+        let src: Vec<u8> = vec![255, 0, 0, 255, 0, 255, 255, 0];
+        let out = offset(&src, 2, 1, 0.5, 0.0, OffsetSampling::Bilinear);
+        assert_eq!(&out[4..7], &[255, 0, 0]);
     }
 
     #[test]
