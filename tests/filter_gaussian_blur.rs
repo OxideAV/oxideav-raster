@@ -253,3 +253,19 @@ fn box_branch_blur_smooths_step_edge_monotonically() {
         }
     }
 }
+
+/// A deviation so small that its square underflows to zero is the
+/// `s -> 0` limit of the Gaussian: the kernel is the identity, in both
+/// axes, and the centre tap never evaluates `0 / 0`. (Found by the
+/// scheduled `parse_filter_css` fuzz run through `drop-shadow()`.)
+#[test]
+fn subnormal_stddev_is_identity_not_nan() {
+    let img = build(6, 4, |x, y| {
+        Rgba::new((x * 40) as u8, (y * 60) as u8, 200, 255 - (x * 9) as u8)
+    });
+    for s in [1e-30f32, f32::MIN_POSITIVE, 1e-40, 1e-22] {
+        assert_eq!(gaussian_blur(&img, 6, 4, s, s), img, "s = {s:e}");
+        assert_eq!(gaussian_blur(&img, 6, 4, s, 0.0), img, "s = {s:e}");
+        assert_eq!(gaussian_blur(&img, 6, 4, 0.0, s), img, "s = {s:e}");
+    }
+}

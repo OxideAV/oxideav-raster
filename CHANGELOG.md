@@ -30,6 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `gaussian_blur`: a standard deviation whose square underflows to zero (≈ 10⁻²³ and below) evaluated the centre tap as 0 / 0 and filled the image with NaN-derived pixels (assertion failure in debug builds; found by the scheduled `parse_filter_css` fuzz run through `drop-shadow()`). It is now the identity, the limit of the kernel.
 - a cached bitmap could be reused by a renderer whose pixel-affecting settings (coverage kernel, blend mode, …) had changed since it was made.
 - supersampled fill kernel: edges with a non-finite endpoint or slope are dropped before the edge sort, and both sorts compare with `total_cmp` — a path mixing NaN and `f32::MAX`-scale coordinates used to hand the standard library's sort a comparison that was not a total order (panic found by the scheduled `render_paths` fuzz run).
 - curve flattening: the per-curve chord cap is now an explicit budget. It used to hold only in exact arithmetic — under a 10⁷⁶ px pen, rounding noise in the turning angles of sub-curves re-inflated every subdivision leaf to the maximum step count (2²⁸ points, out of memory).

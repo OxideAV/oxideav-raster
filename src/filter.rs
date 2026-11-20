@@ -1913,7 +1913,17 @@ fn build_gaussian_kernel(std: f32) -> Vec<f32> {
     // The leading 1/sqrt(2π·s²) factor is a constant per-kernel — it
     // drops out cleanly when we renormalise below, so we omit it from
     // the discrete samples.
+    //
+    // The centre tap is exp(0) = 1 by definition; writing it out keeps a
+    // subnormal deviation (whose square underflows to zero) from turning
+    // the centre exponent into 0/0. Every other tap then evaluates
+    // exp(-inf) = 0 and the kernel degenerates to the identity, which is
+    // the limit of the Gaussian as s -> 0.
     for i in 0..len {
+        if i == half {
+            k.push(1.0);
+            continue;
+        }
         let x = i as f32 - half as f32;
         k.push((-x * x / two_sigma_sq).exp());
     }
