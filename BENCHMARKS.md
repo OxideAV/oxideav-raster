@@ -9,10 +9,75 @@ cargo bench --bench filter    # filter-primitive kernels (r401)
 cargo bench --bench sampling  # image resampling + pattern paint (r449)
 cargo bench --bench scenes    # realistic 1080p / 4K workloads (r484)
 cargo bench --bench group_cache  # keyed groups: cold / warm / shared cache (r488)
+cargo bench --bench pipeline  # one workload per rasteriser stage, serial + 4 workers (r491)
 ```
 
 All inputs are synthesised in the setup step (LCG pixel soup +
 procedural scenes); no fixture files.
+
+## Results (r491 pipeline pass)
+
+Apple M5 Max, rustc 1.100, `--release`, canvas 1920 × 1080. "before" is
+commit `38b72ba`. The machine was shared with nine other builds (load
+average 8–13), so the baseline and the new build were run alternately
+seven times, five frames per case and run; each figure is the median
+over the seven runs of the run's median frame. Rows whose code path did
+not change (opaque gradients, images, patterns) show the noise floor.
+
+| scene (`pipeline/…`) | what it is | before | after | × |
+| --- | --- | ---: | ---: | ---: |
+| `text5000_unkeyed` | 5 000 glyph groups (4 sizes, fractional pens), no keys | 16.0 ms | 12.4 ms | 1.29 |
+| `text5000_keyed_cold` | … keyed, empty cache (first frame) | 11.2 ms | 8.52 ms | 1.31 |
+| `text5000_keyed_warm` | … keyed, warm cache, same renderer | 1.77 ms | 1.14 ms | 1.55 |
+| `text5000_keyed_scrolling` | … keyed, renderer per frame around one cache, page scrolled by fractions | 6.65 ms | 4.96 ms | 1.34 |
+| `fill_60k_edges` | one outline of 60 000 edges across the canvas | 30.6 ms | 20.8 ms | 1.47 |
+| `fill_blobs3000` | 3 000 translucent discs, 4–120 px | 48.1 ms | 41.4 ms | 1.16 |
+| `fill_tiny20000` | 20 000 opaque shapes of 3–10 px | 23.6 ms | 19.2 ms | 1.23 |
+| `stroke_thin600` | 600 polylines × 24 segments, 1.5 px, all joins / caps | 59.0 ms | 40.7 ms | 1.45 |
+| `stroke_hairline600` | … 0.35 px hairlines | 54.9 ms | 37.6 ms | 1.46 |
+| `stroke_wide_curved300` | 300 curved polylines, 9 px | 116.3 ms | 94.7 ms | 1.23 |
+| `stroke_dashed600` | 600 polylines, 2 px, dash 7-3-2-3 | 173.6 ms | 138.3 ms | 1.26 |
+| `grad_linear_pad` | full-canvas linear gradient, 6 stops, pad | 8.67 ms | 8.48 ms | 1.02 |
+| `grad_linear_reflect_alpha` | … translucent stops, reflect | 16.3 ms | 9.30 ms | 1.75 |
+| `grad_radial_pad` | full-canvas radial gradient, pad | 10.5 ms | 10.4 ms | 1.01 |
+| `grad_radial_focal_repeat` | … off-centre focus, repeat | 11.3 ms | 11.2 ms | 1.01 |
+| `grad_small2000` | 2 000 small shapes, each with its own gradient | 25.2 ms | 20.8 ms | 1.21 |
+| `image_upright24` | 24 images 256², scaled | 13.7 ms | 13.2 ms | 1.04 |
+| `image_rotated24` | … rotated + non-uniform scale | 17.8 ms | 17.2 ms | 1.04 |
+| `pattern_fill_rotated` | 1 040 px disc filled with a rotated pattern tile | 8.80 ms | 8.71 ms | 1.01 |
+| `clip_nested150` | 150 disc-clipped groups inside a page clip | 19.0 ms | 16.4 ms | 1.16 |
+| `softmask60` | 60 soft-masked groups (radial luminance / alpha masks) | 23.8 ms | 18.7 ms | 1.28 |
+| `opacity_nested120` | 120 three-level translucent group stacks | 40.7 ms | 24.7 ms | 1.65 |
+| `blend_multiply_blobs3000` | 3 000 discs under `BlendMode::Multiply` | 86.7 ms | 53.9 ms | 1.61 |
+| `blend_luminosity_blobs3000` | 3 000 discs under `BlendMode::Luminosity` | 74.1 ms | 70.2 ms | 1.06 |
+
+Four workers (`ExecutionContext::with_threads(4)`; output byte-identical
+to serial):
+
+| scene, 4 workers | before | after | × |
+| --- | ---: | ---: | ---: |
+| `mt4_text5000_unkeyed` | 13.4 ms | 8.03 ms | 1.67 |
+| `mt4_text5000_keyed_warm` | 8.46 ms | 1.04 ms | 8.12 |
+| `mt4_fill_60k_edges` | 11.1 ms | 7.50 ms | 1.47 |
+| `mt4_fill_blobs3000` | 17.9 ms | 14.6 ms | 1.23 |
+| `mt4_stroke_thin600` | 20.6 ms | 14.4 ms | 1.43 |
+| `mt4_stroke_dashed600` | 62.9 ms | 51.6 ms | 1.22 |
+| `mt4_grad_small2000` | 8.97 ms | 6.93 ms | 1.29 |
+| `mt4_clip_nested150` | 12.9 ms | 10.4 ms | 1.25 |
+| `mt4_softmask60` | 12.5 ms | 9.38 ms | 1.33 |
+| `mt4_opacity_nested120` | 16.1 ms | 9.55 ms | 1.68 |
+
+`mt4_text5000_keyed_warm` was slower than its serial form before the
+round because every worker looked every group up behind one mutex (see
+the CHANGELOG); the text of that page sits in the top third of the
+canvas, so one band does nearly all the blitting.
+
+Changes behind the numbers, in the order of their effect: per-row span
+delivery (strokes, hollow shapes), strip order kept across strips and
+rows (many-edge outlines), per-thread scratch reuse (thousands of small
+shapes), per-row blend dispatch + shared blit kernel (translucent
+fills, group stacks, masks, non-normal blend modes), contention-free
+cache lookups (keyed text under a thread budget).
 
 ## Results (r488 group cache)
 
