@@ -434,6 +434,11 @@ pub fn rasterize_fill_analytic(
     rasterize_fill_analytic_with_bounds(contours, width, height, fill_rule).0
 }
 
+/// Column ranges of one row that lie closer together than this are
+/// resolved and emitted as one span (the zero cells between them cost
+/// less than a second emit).
+const SPAN_MERGE_GAP: u32 = 8;
+
 /// Hard cap on crossing-induced strip splits in one pixel row.
 const MAX_CROSSING_SPLITS_PER_ROW: usize = 512;
 
@@ -968,10 +973,12 @@ impl EdgeTable {
         p.0 + (y - p.1) * self.dxdy[i]
     }
 
-    /// Run the exact-area scan, calling `emit(y, x0, coverage)` once
-    /// per device row that received any coverage, with the 8-bit
-    /// coverage of the touched columns `x0 .. x0 + coverage.len()`
-    /// (device coordinates). Rows are emitted top to bottom.
+    /// Run the exact-area scan, calling `emit(y, x0, coverage)` for
+    /// every span of a device row that received coverage, with the
+    /// 8-bit coverage of the columns `x0 .. x0 + coverage.len()` (device
+    /// coordinates). Rows are emitted top to bottom, the spans of a row
+    /// left to right and disjoint; every pixel outside the emitted
+    /// spans has coverage 0.
     ///
     /// # Strips
     ///
@@ -1025,6 +1032,9 @@ impl EdgeTable {
         let mut sc: Vec<StripChain> = Vec::new();
         let mut sub: Vec<f32> = Vec::new();
         let mut strip: Vec<StripEdge> = Vec::new();
+        // Column ranges (inclusive) written in the current row, one per
+        // cluster and strip.
+        let mut spans: Vec<(u32, u32)> = Vec::new();
 
         for py in rows.start..height {
             let row_top = py as f32;
@@ -1065,7 +1075,7 @@ impl EdgeTable {
                 events.sort_unstable_by(f32::total_cmp);
                 events.dedup();
             }
-            let mut touched = Touched { lo: w, hi: 0 };
+            spans.clear();
             let mut splits = 0usize;
             let mut ei = 0usize;
             while ei + 1 < events.len() {
@@ -1113,9 +1123,12 @@ impl EdgeTable {
                 }
                 sort_strip(&mut sc);
                 // Independent clusters: consecutive chains separated by
-                // an x gap with zero winding between them. Each cluster
-                // starts and ends outside, so it can be integrated on its
-                // own — a crossing only costs the cluster it lies in.
+                // an x gap that is outside the shape under the fill rule
+                // (winding zero, or even for even-odd — the parity walk
+                // of a cluster then restarts in the state it would have
+                // had). Each cluster starts and ends outside, so it can
+                // be integrated on its own — a crossing only costs the
+                // cluster it lies in.
                 let mut ca = 0usize;
                 while ca < sc.len() {
                     let mut cb = ca;
@@ -1129,7 +1142,11 @@ impl EdgeTable {
                             break;
                         }
                         let next = &sc[cb + 1];
-                        if wind == 0 && reach <= next.x_min {
+                        let outside = match fill_rule {
+                            FillRule::NonZero => wind == 0,
+                            FillRule::EvenOdd => wind & 1 == 0,
+                        };
+                        if outside && reach <= next.x_min {
                             break;
                         }
                         if ordered
@@ -1145,6 +1162,9 @@ impl EdgeTable {
                     if cluster.len() < 2 {
                         continue;
                     }
+                    // Columns this cluster writes (accumulator cells and
+                    // run markers alike).
+                    let mut touched = Touched { lo: w, hi: 0 };
                     if ordered {
                         self.integrate_chains(
                             cluster,
@@ -1156,6 +1176,7 @@ impl EdgeTable {
                             &mut touched,
                             w,
                         );
+                        push_span(&mut spans, &touched);
                         continue;
                     }
                     // Crossing chains: subdivide at every vertex inside
@@ -1229,24 +1250,57 @@ impl EdgeTable {
                         );
                         k += 1;
                     }
+                    push_span(&mut spans, &touched);
                 }
             }
 
-            if touched.lo > touched.hi {
-                continue;
+            // Every cluster starts and ends outside the shape, so the
+            // coverage is zero between the column ranges the clusters
+            // wrote: resolve and emit each range on its own (ranges
+            // closer than `SPAN_MERGE_GAP` are joined) instead of
+            // walking the gaps.
+            if !spans.is_sorted() {
+                spans.sort_unstable();
+                let mut m = 0usize;
+                for i in 1..spans.len() {
+                    let (lo, hi) = spans[i];
+                    if lo <= spans[m].1 + SPAN_MERGE_GAP {
+                        spans[m].1 = spans[m].1.max(hi);
+                    } else {
+                        m += 1;
+                        spans[m] = (lo, hi);
+                    }
+                }
+                spans.truncate(m + 1);
             }
-            // `touched.hi` may be `w` (a run marker in the spare slot).
-            let lo = touched.lo;
-            let hi = touched.hi.min(w - 1);
-            let mut running = 0.0f32;
-            for x in lo..=hi {
-                running += run[x];
-                let cov = area[x] + running;
-                out_row[x] = (cov.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+            for &(lo, hi_marker) in &spans {
+                // `hi_marker` may be `w` (a run marker in the spare slot).
+                let (lo, hi_marker) = (lo as usize, hi_marker as usize);
+                if lo < w {
+                    let hi = hi_marker.min(w - 1);
+                    let mut running = 0.0f32;
+                    let cells = area[lo..=hi].iter().zip(&run[lo..=hi]);
+                    for (o, (a, r)) in out_row[lo..=hi].iter_mut().zip(cells) {
+                        running += r;
+                        *o = ((a + running).clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+                    }
+                    // The range may end on a run marker or begin on a
+                    // boundary cell that rounds to zero.
+                    let span = &out_row[lo..=hi];
+                    let lead = span.iter().take_while(|&&c| c == 0).count();
+                    let span = &span[lead..];
+                    let keep = span.len() - span.iter().rev().take_while(|&&c| c == 0).count();
+                    if keep > 0 {
+                        emit(
+                            self.win.y0 + py,
+                            self.win.x0 + (lo + lead) as u32,
+                            &span[..keep],
+                        );
+                    }
+                }
+                area[lo..=hi_marker].fill(0.0);
+                run[lo..=hi_marker].fill(0.0);
             }
-            area[lo..=touched.hi].fill(0.0);
-            run[lo..=touched.hi].fill(0.0);
-            emit(self.win.y0 + py, self.win.x0 + lo as u32, &out_row[lo..=hi]);
         }
     }
 
@@ -1530,6 +1584,26 @@ struct StripEdge {
     xa: f32,
     xb: f32,
     winding: i32,
+}
+
+/// Record the column range a cluster wrote. Clusters of one strip
+/// arrive left to right, so a range that starts within
+/// [`SPAN_MERGE_GAP`] of the previous one is folded into it on the
+/// spot; ranges of later strips are sorted and merged at the row end.
+#[inline]
+fn push_span(spans: &mut Vec<(u32, u32)>, t: &Touched) {
+    if t.lo > t.hi {
+        return;
+    }
+    let (lo, hi) = (t.lo as u32, t.hi as u32);
+    if let Some(last) = spans.last_mut()
+        && lo >= last.0
+        && lo <= last.1 + SPAN_MERGE_GAP
+    {
+        last.1 = last.1.max(hi);
+        return;
+    }
+    spans.push((lo, hi));
 }
 
 /// Inclusive touched-column range of one row.
@@ -1956,6 +2030,53 @@ mod tests {
         assert_eq!(a.row(5).map(<[u8]>::len), Some(4));
         assert_eq!(a.get(1, 3), 0);
         assert_eq!(a.get(5, 5), 255);
+    }
+
+    #[test]
+    fn rows_are_emitted_as_disjoint_ordered_spans_that_skip_the_gaps() {
+        // Two slim shapes 150 px apart plus a ring: a row's coverage is
+        // delivered as one span per separate piece, left to right, and
+        // the zero pixels between the pieces are never delivered.
+        let (w, h) = (200u32, 24u32);
+        let contours = vec![
+            rect_contour(3.25, 2.5, 4.0, 18.0),
+            rect_contour(160.5, 4.0, 2.25, 12.0),
+            // Outer and inner boundary of a frame (even-odd ring).
+            rect_contour(60.0, 1.0, 50.0, 22.0),
+            rect_contour(63.0, 4.0, 44.0, 16.0),
+        ];
+        let t = EdgeTable::build(&contours, w, h, None).unwrap();
+        let mut by_row: Vec<Vec<(u32, Vec<u8>)>> = vec![Vec::new(); h as usize];
+        let mut last_y = 0;
+        t.scan(FillRule::EvenOdd, |y, x0, row| {
+            assert!(y >= last_y, "rows out of order");
+            last_y = y;
+            assert!(!row.is_empty());
+            by_row[y as usize].push((x0, row.to_vec()));
+        });
+        let (reference, _) =
+            rasterize_fill_analytic_with_bounds(&contours, w, h, FillRule::EvenOdd);
+        let mut delivered = 0usize;
+        for (y, spans) in by_row.iter().enumerate() {
+            let mut row = vec![0u8; w as usize];
+            let mut end = 0u32;
+            for (i, (x0, cov)) in spans.iter().enumerate() {
+                assert!(i == 0 || *x0 > end, "spans overlap or touch on row {y}");
+                end = x0 + cov.len() as u32;
+                row[*x0 as usize..end as usize].copy_from_slice(cov);
+                delivered += cov.len();
+            }
+            assert_eq!(row, reference.data[y * w as usize..(y + 1) * w as usize]);
+        }
+        // Row 10 crosses all four pieces: the bar, both sides of the
+        // frame, the second bar.
+        assert_eq!(by_row[10].len(), 4, "{:?}", by_row[10]);
+        // Far fewer pixels are delivered than the rows' full extents.
+        let covered = reference.nonzero_pixel_count();
+        assert!(
+            delivered < covered + 24 * 16,
+            "{delivered} delivered for {covered} covered"
+        );
     }
 
     #[test]

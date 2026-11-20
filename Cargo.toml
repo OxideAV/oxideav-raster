@@ -46,3 +46,7 @@ harness = false
 [[bench]]
 name = "group_cache"
 harness = false
+
+[[bench]]
+name = "pipeline"
+harness = false
