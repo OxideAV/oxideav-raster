@@ -4,9 +4,9 @@
 //! offscreens, the keyed-group cache). Everything is procedural.
 
 use oxideav_core::{
-    DashPattern, FillRule, GradientStop, Group, ImageRef, LineCap, LineJoin, LinearGradient,
-    MaskKind, Node, Paint, Path, PathNode, Point, RadialGradient, Rect, Rgba, SpreadMethod, Stroke,
-    TimeBase, Transform2D, VectorFrame, VideoFrame, VideoPlane,
+    DashPattern, ExecutionContext, FillRule, GradientStop, Group, ImageRef, LineCap, LineJoin,
+    LinearGradient, MaskKind, Node, Paint, Path, PathNode, Point, RadialGradient, Rect, Rgba,
+    SpreadMethod, Stroke, TimeBase, Transform2D, VectorFrame, VideoFrame, VideoPlane,
 };
 use oxideav_raster::{BlendMode, GroupCache, Pattern, Renderer};
 
@@ -684,5 +684,40 @@ pub fn cases() -> Vec<Case> {
         rr.background = Rgba::opaque(200, 180, 90);
         v.push(render_case("blend_luminosity_blobs3000", rr, blobs()));
     }
+
+    // The same scenes under a budget of four workers (scene bands; the
+    // output is byte-identical to the serial render).
+    let mt = || Renderer::new(W, H).with_execution_context(&ExecutionContext::with_threads(4));
+    v.push(render_case(
+        "mt4_text5000_unkeyed",
+        mt(),
+        text_page(5000, false, (0.0, 0.0)),
+    ));
+    {
+        let f = text_page(5000, true, (0.0, 0.0));
+        let rr = mt();
+        rr.render(&f);
+        v.push(render_case("mt4_text5000_keyed_warm", rr, f));
+    }
+    v.push(render_case(
+        "mt4_fill_60k_edges",
+        mt(),
+        many_edge_fill(60_000),
+    ));
+    v.push(render_case("mt4_fill_blobs3000", mt(), blobs()));
+    v.push(render_case(
+        "mt4_stroke_thin600",
+        mt(),
+        strokes(600, 1.5, None, false),
+    ));
+    v.push(render_case(
+        "mt4_stroke_dashed600",
+        mt(),
+        strokes(600, 2.0, Some(vec![7.0, 3.0, 2.0, 3.0]), false),
+    ));
+    v.push(render_case("mt4_grad_small2000", mt(), small_gradients()));
+    v.push(render_case("mt4_clip_nested150", mt(), clipped()));
+    v.push(render_case("mt4_softmask60", mt(), soft_masks()));
+    v.push(render_case("mt4_opacity_nested120", mt(), nested_opacity()));
     v
 }

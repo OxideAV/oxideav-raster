@@ -43,9 +43,10 @@
 //! [`Renderer::with_group_cache`](crate::Renderer::with_group_cache) so
 //! it does not start cold.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::mem::Discriminant;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use oxideav_core::Transform2D;
 
@@ -98,9 +99,31 @@ pub(crate) struct CachedBitmap {
     pub dy: i64,
     /// `width * height * 4` bytes.
     pub rgba: Vec<u8>,
+    /// Clock tick of the last lookup or insertion (see [`LruCache`]).
+    stamp: AtomicU64,
 }
 
 impl CachedBitmap {
+    pub(crate) fn new(width: u32, height: u32, dx: i64, dy: i64, rgba: Vec<u8>) -> Self {
+        CachedBitmap {
+            width,
+            height,
+            dx,
+            dy,
+            rgba,
+            stamp: AtomicU64::new(0),
+        }
+    }
+
+    /// Mark the bitmap as used at `tick` unless it already carries a
+    /// stamp at least that recent — in which case nothing is written,
+    /// so the workers of one frame stamp each bitmap once between them.
+    pub(crate) fn touch(&self, tick: u64) {
+        if self.stamp.load(Ordering::Relaxed) < tick {
+            self.stamp.store(tick, Ordering::Relaxed);
+        }
+    }
+
     fn cost(&self) -> usize {
         self.rgba.len() + ENTRY_OVERHEAD_BYTES
     }
@@ -202,56 +225,67 @@ pub struct CacheStats {
     pub evictions: u64,
 }
 
-/// Byte- and entry-bounded LRU over [`BitmapKey`].
+/// Byte- and entry-bounded least-recently-used store over
+/// [`BitmapKey`].
 ///
-/// The list head is the most recently used entry; the tail is evicted
-/// first. Nodes live in a `Vec` with index links and a free list, and a
-/// `HashMap` keyed by the full [`BitmapKey`] finds them in O(1).
+/// A lookup is the hot path — one per keyed group per frame, from every
+/// scene-band worker at once — so it must not serialise the workers: it
+/// runs under a *shared* lock and only stamps the entry with a tick
+/// from an atomic clock. Recency therefore lives in the stamps, not in
+/// a list that every hit would have to relink under an exclusive lock.
+///
+/// The scene-band workers of a frame go one step further and read a
+/// published copy of the map ([`LruCache::snapshot`]) without any lock,
+/// stamping each bitmap they use once per frame.
+///
+/// Eviction (under the exclusive lock an insertion holds anyway) takes
+/// entries in stamp order from `queue`, a snapshot of `(stamp, key)`
+/// pairs sorted oldest first. A pair whose entry has been stamped again
+/// since the snapshot is stale and skipped; everything stamped or
+/// inserted after the snapshot is younger than everything in it, so the
+/// first pair that is not stale is the least recently used entry of the
+/// whole store. The snapshot is rebuilt when it runs out, which makes
+/// an eviction O(log n) amortised.
 #[derive(Debug)]
 struct LruCache {
-    nodes: Vec<Slot>,
-    free: Vec<usize>,
-    head: Option<usize>,
-    tail: Option<usize>,
-    map: HashMap<BitmapKey, usize>,
+    map: HashMap<BitmapKey, Arc<CachedBitmap>>,
+    queue: VecDeque<(u64, BitmapKey)>,
+    /// A read-only copy of `map` for the scene-band workers of a frame
+    /// (see [`GroupCache::snapshot`]); dropped whenever `map` changes.
+    snapshot: Mutex<Option<Arc<Snapshot>>>,
     max_entries: usize,
     max_bytes: usize,
     bytes: usize,
-    hits: u64,
-    misses: u64,
+    clock: AtomicU64,
+    hits: AtomicU64,
+    misses: AtomicU64,
     evictions: u64,
 }
 
-#[derive(Debug)]
-struct Slot {
-    key: BitmapKey,
-    /// `None` only while the slot sits on the free list.
-    value: Option<Arc<CachedBitmap>>,
-    prev: Option<usize>,
-    next: Option<usize>,
-}
+/// The cache's entries at one moment, shared read-only by the workers
+/// of a frame: a lookup in it writes nothing that another worker reads.
+pub(crate) type Snapshot = HashMap<BitmapKey, Arc<CachedBitmap>>;
 
 impl LruCache {
     fn new(max_bytes: usize, max_entries: usize) -> Self {
         Self {
-            nodes: Vec::new(),
-            free: Vec::new(),
-            head: None,
-            tail: None,
             map: HashMap::new(),
+            queue: VecDeque::new(),
+            snapshot: Mutex::new(None),
             max_entries: max_entries.max(1),
             max_bytes,
             bytes: 0,
-            hits: 0,
-            misses: 0,
+            clock: AtomicU64::new(0),
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
             evictions: 0,
         }
     }
 
     fn stats(&self) -> CacheStats {
         CacheStats {
-            hits: self.hits,
-            misses: self.misses,
+            hits: self.hits.load(Ordering::Relaxed),
+            misses: self.misses.load(Ordering::Relaxed),
             entries: self.map.len(),
             capacity: self.max_entries,
             bytes: self.bytes,
@@ -260,14 +294,19 @@ impl LruCache {
         }
     }
 
-    fn get(&mut self, key: &BitmapKey) -> Option<Arc<CachedBitmap>> {
-        let Some(&idx) = self.map.get(key) else {
-            self.misses += 1;
+    fn tick(&self) -> u64 {
+        self.clock.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Look `key` up and mark it used. Needs only shared access.
+    fn get(&self, key: &BitmapKey) -> Option<Arc<CachedBitmap>> {
+        let Some(e) = self.map.get(key) else {
+            self.misses.fetch_add(1, Ordering::Relaxed);
             return None;
         };
-        self.hits += 1;
-        self.move_to_head(idx);
-        self.nodes[idx].value.clone()
+        self.hits.fetch_add(1, Ordering::Relaxed);
+        e.stamp.store(self.tick(), Ordering::Relaxed);
+        Some(Arc::clone(e))
     }
 
     /// Largest bitmap (in bytes of pixel data) worth caching.
@@ -280,108 +319,79 @@ impl LruCache {
         if value.rgba.len() > self.max_entry_bytes() || cost > self.max_bytes {
             return;
         }
-        if let Some(&idx) = self.map.get(&key) {
-            let old = self.nodes[idx].value.replace(value);
-            self.bytes = self.bytes - old.map_or(0, |o| o.cost()) + cost;
-            self.move_to_head(idx);
-        } else {
-            let slot = Slot {
-                key,
-                value: Some(value),
-                prev: None,
-                next: self.head,
-            };
-            let idx = match self.free.pop() {
-                Some(i) => {
-                    self.nodes[i] = slot;
-                    i
-                }
-                None => {
-                    self.nodes.push(slot);
-                    self.nodes.len() - 1
-                }
-            };
-            if let Some(h) = self.head {
-                self.nodes[h].prev = Some(idx);
-            }
-            self.head = Some(idx);
-            if self.tail.is_none() {
-                self.tail = Some(idx);
-            }
-            self.map.insert(key, idx);
-            self.bytes += cost;
+        value.stamp.store(self.tick(), Ordering::Relaxed);
+        if let Some(old) = self.map.insert(key, value) {
+            self.bytes -= old.cost();
         }
+        self.bytes += cost;
+        self.changed();
         self.trim();
     }
 
-    /// Evict from the cold end until both limits hold. The entry just
-    /// inserted is the head, and it fits the budget on its own, so it
-    /// survives.
+    /// Evict least recently used entries until both limits hold. The
+    /// entry just inserted carries the newest stamp and fits the budget
+    /// on its own, so it survives.
     fn trim(&mut self) {
         while (self.bytes > self.max_bytes || self.map.len() > self.max_entries)
-            && self.map.len() > 1
+            && !self.map.is_empty()
         {
             self.evict_lru();
         }
-        if self.bytes > self.max_bytes {
-            self.evict_lru();
+        if self.map.is_empty() {
+            self.queue.clear();
         }
     }
 
     fn evict_lru(&mut self) {
-        let Some(tail_idx) = self.tail else {
+        loop {
+            let Some((stamp, key)) = self.queue.pop_front() else {
+                // Snapshot exhausted: take a new one, oldest first.
+                let mut all: Vec<(u64, BitmapKey)> = self
+                    .map
+                    .iter()
+                    .map(|(k, e)| (e.stamp.load(Ordering::Relaxed), *k))
+                    .collect();
+                if all.is_empty() {
+                    return;
+                }
+                all.sort_unstable_by_key(|&(stamp, _)| stamp);
+                self.queue = all.into();
+                continue;
+            };
+            // Gone, replaced or used since the snapshot: not the oldest
+            // any more.
+            let current = self.map.get(&key).map(|e| e.stamp.load(Ordering::Relaxed));
+            if current != Some(stamp) {
+                continue;
+            }
+            if let Some(e) = self.map.remove(&key) {
+                self.bytes -= e.cost();
+                self.evictions += 1;
+                self.changed();
+            }
             return;
-        };
-        let prev = self.nodes[tail_idx].prev;
-        match prev {
-            Some(p) => self.nodes[p].next = None,
-            None => self.head = None,
         }
-        self.tail = prev;
-        let key = self.nodes[tail_idx].key;
-        self.map.remove(&key);
-        if let Some(v) = self.nodes[tail_idx].value.take() {
-            self.bytes -= v.cost();
-        }
-        self.nodes[tail_idx].prev = None;
-        self.nodes[tail_idx].next = None;
-        self.free.push(tail_idx);
-        self.evictions += 1;
     }
 
     fn clear(&mut self) {
-        self.nodes.clear();
-        self.free.clear();
         self.map.clear();
-        self.head = None;
-        self.tail = None;
+        self.queue.clear();
         self.bytes = 0;
+        self.changed();
     }
 
-    fn move_to_head(&mut self, idx: usize) {
-        if Some(idx) == self.head {
-            return;
-        }
-        let prev = self.nodes[idx].prev;
-        let next = self.nodes[idx].next;
-        if let Some(p) = prev {
-            self.nodes[p].next = next;
-        }
-        if let Some(n) = next {
-            self.nodes[n].prev = prev;
-        }
-        if Some(idx) == self.tail {
-            self.tail = prev;
-        }
-        self.nodes[idx].prev = None;
-        self.nodes[idx].next = self.head;
-        if let Some(h) = self.head {
-            self.nodes[h].prev = Some(idx);
-        }
-        self.head = Some(idx);
-        if self.tail.is_none() {
-            self.tail = Some(idx);
-        }
+    /// The entry set changed: the published copy is out of date.
+    fn changed(&mut self) {
+        *self.snapshot.get_mut().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// The current entries as a shared read-only map, rebuilt only if
+    /// the entry set changed since the last call, together with a fresh
+    /// clock tick to stamp the bitmaps a frame uses.
+    fn snapshot(&self) -> (Arc<Snapshot>, u64) {
+        let mut slot = self.snapshot.lock().unwrap_or_else(|e| e.into_inner());
+        let snap = slot.get_or_insert_with(|| Arc::new(self.map.clone()));
+        (Arc::clone(snap), self.tick())
     }
 }
 
@@ -411,7 +421,7 @@ impl LruCache {
 /// drawn on.
 #[derive(Clone)]
 pub struct GroupCache {
-    inner: Arc<Mutex<LruCache>>,
+    inner: Arc<RwLock<LruCache>>,
 }
 
 /// Prints the statistics, not the cached pixels.
@@ -439,7 +449,7 @@ impl GroupCache {
     /// group is drawn directly.
     pub fn with_max_bytes(max_bytes: usize) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(LruCache::new(max_bytes, usize::MAX))),
+            inner: Arc::new(RwLock::new(LruCache::new(max_bytes, usize::MAX))),
         }
     }
 
@@ -447,7 +457,7 @@ impl GroupCache {
     /// the same handle for chaining.
     pub fn with_max_entries(self, max_entries: usize) -> Self {
         {
-            let mut g = self.lock();
+            let mut g = self.write();
             g.max_entries = max_entries.max(1);
             g.trim();
         }
@@ -457,27 +467,27 @@ impl GroupCache {
     /// Change the byte budget, evicting least recently used entries if
     /// the cache is now over it.
     pub fn set_max_bytes(&self, max_bytes: usize) {
-        let mut g = self.lock();
+        let mut g = self.write();
         g.max_bytes = max_bytes;
         g.trim();
     }
 
     /// Hit / miss / occupancy snapshot.
     pub fn stats(&self) -> CacheStats {
-        self.lock().stats()
+        self.read().stats()
     }
 
     /// Zero the hit / miss / eviction counters, keeping the entries.
     pub fn reset_stats(&self) {
-        let mut g = self.lock();
-        g.hits = 0;
-        g.misses = 0;
+        let mut g = self.write();
+        g.hits.store(0, Ordering::Relaxed);
+        g.misses.store(0, Ordering::Relaxed);
         g.evictions = 0;
     }
 
     /// Drop every cached bitmap (the counters are kept).
     pub fn clear(&self) {
-        self.lock().clear();
+        self.write().clear();
     }
 
     /// `true` when `other` is a handle to this same cache.
@@ -485,24 +495,42 @@ impl GroupCache {
         Arc::ptr_eq(&self.inner, &other.inner)
     }
 
-    /// A panic while the lock is held cannot leave the LRU links half
+    /// A panic while the lock is held cannot leave the store half
     /// updated in a way a later reader would trip on (every mutation is
-    /// index bookkeeping over owned data), so a poisoned lock is simply
-    /// taken over.
-    fn lock(&self) -> MutexGuard<'_, LruCache> {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    /// bookkeeping over owned data, and a stale eviction snapshot is
+    /// tolerated by design), so a poisoned lock is simply taken over.
+    fn read(&self) -> RwLockReadGuard<'_, LruCache> {
+        self.inner.read().unwrap_or_else(|e| e.into_inner())
     }
 
+    fn write(&self) -> RwLockWriteGuard<'_, LruCache> {
+        self.inner.write().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Shared access: concurrent lookups do not wait for each other.
     pub(crate) fn get(&self, key: &BitmapKey) -> Option<Arc<CachedBitmap>> {
-        self.lock().get(key)
+        self.read().get(key)
     }
 
     pub(crate) fn put(&self, key: BitmapKey, value: Arc<CachedBitmap>) {
-        self.lock().put(key, value);
+        self.write().put(key, value);
     }
 
     pub(crate) fn max_entry_bytes(&self) -> usize {
-        self.lock().max_entry_bytes()
+        self.read().max_entry_bytes()
+    }
+
+    /// See [`LruCache::snapshot`].
+    pub(crate) fn snapshot(&self) -> (Arc<Snapshot>, u64) {
+        self.read().snapshot()
+    }
+
+    /// Account for lookups a renderer answered from its own per-frame
+    /// copy of entries of this cache.
+    pub(crate) fn add_hits(&self, hits: u64) {
+        if hits != 0 {
+            self.read().hits.fetch_add(hits, Ordering::Relaxed);
+        }
     }
 }
 
@@ -527,13 +555,13 @@ mod tests {
     }
 
     fn bitmap(width: u32, height: u32) -> Arc<CachedBitmap> {
-        Arc::new(CachedBitmap {
+        Arc::new(CachedBitmap::new(
             width,
             height,
-            dx: 0,
-            dy: 0,
-            rgba: vec![0; (width as usize) * (height as usize) * 4],
-        })
+            0,
+            0,
+            vec![0; (width as usize) * (height as usize) * 4],
+        ))
     }
 
     #[test]
@@ -549,7 +577,7 @@ mod tests {
 
     #[test]
     fn get_misses_when_absent() {
-        let mut c = LruCache::new(1 << 20, 2);
+        let c = LruCache::new(1 << 20, 2);
         assert!(c.get(&key(99)).is_none());
         assert_eq!(c.stats().misses, 1);
     }
@@ -626,6 +654,74 @@ mod tests {
         let mut zero = LruCache::new(0, usize::MAX);
         zero.put(key(1), bitmap(0, 0));
         assert_eq!(zero.stats().entries, 0);
+    }
+
+    #[test]
+    fn eviction_order_is_exactly_least_recently_used() {
+        // Random lookups and insertions against a straightforward model
+        // (a recency-ordered list): the store must hold the same keys
+        // after every step, whatever state its eviction snapshot is in.
+        let mut st = 0x9E37_79B9u32;
+        let mut rnd = move |n: u32| {
+            st = st.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (st >> 8) % n
+        };
+        for cap in [1usize, 2, 3, 7, 16] {
+            let mut c = LruCache::new(1 << 30, cap);
+            let mut model: Vec<u64> = Vec::new(); // most recent last
+            for step in 0..4000 {
+                let k = rnd(24) as u64;
+                if rnd(3) == 0 {
+                    let hit = c.get(&key(k)).is_some();
+                    assert_eq!(hit, model.contains(&k), "cap {cap} step {step}");
+                    if let Some(i) = model.iter().position(|&m| m == k) {
+                        model.remove(i);
+                        model.push(k);
+                    }
+                } else {
+                    c.put(key(k), bitmap(1, 1));
+                    model.retain(|&m| m != k);
+                    model.push(k);
+                    if model.len() > cap {
+                        model.remove(0);
+                    }
+                }
+                assert_eq!(c.stats().entries, model.len());
+                for &m in &model {
+                    assert!(
+                        c.map.contains_key(&key(m)),
+                        "cap {cap} step {step}: {m} gone"
+                    );
+                }
+            }
+            assert_eq!(
+                c.stats().bytes,
+                model.len() * (4 + ENTRY_OVERHEAD_BYTES),
+                "cap {cap}"
+            );
+        }
+    }
+
+    #[test]
+    fn concurrent_lookups_share_the_store() {
+        let cache = GroupCache::new();
+        for k in 0..64 {
+            cache.put(key(k), bitmap(2, 2));
+        }
+        std::thread::scope(|sc| {
+            for t in 0..4u64 {
+                let cache = &cache;
+                sc.spawn(move || {
+                    for i in 0..20_000u64 {
+                        let k = (i * 7 + t) % 80;
+                        assert_eq!(cache.get(&key(k)).is_some(), k < 64);
+                    }
+                });
+            }
+        });
+        let s = cache.stats();
+        assert_eq!(s.hits + s.misses, 80_000);
+        assert_eq!(s.entries, 64);
     }
 
     #[test]

@@ -403,3 +403,88 @@ fn large_and_partly_visible_groups_render_the_same_at_every_budget() {
         "no cache, 4 workers"
     );
 }
+
+/// A page of 60 distinct keyed glyph groups whose keys start at `base`,
+/// spread over the whole canvas height.
+fn keyed_set(base: u64) -> VectorFrame {
+    let mut root = Group::default();
+    for i in 0..60u32 {
+        root.children.push(Node::Group(Group {
+            transform: Transform2D {
+                a: 0.02,
+                b: 0.0,
+                c: 0.0,
+                d: -0.02,
+                e: 30.0 + (i % 10) as f32 * 180.0,
+                f: 60.0 + (i / 10) as f32 * 190.0,
+            },
+            cache_key: Some(base + i as u64),
+            children: vec![Node::Path(PathNode {
+                path: glyph_outline(i),
+                fill: Some(Paint::Solid(Rgba::opaque(20, 20, 24))),
+                stroke: None,
+                fill_rule: FillRule::NonZero,
+            })],
+            ..Group::default()
+        }));
+    }
+    VectorFrame {
+        width: W as f32,
+        height: H as f32,
+        view_box: None,
+        root,
+        pts: None,
+        time_base: TimeBase::new(1, 1),
+    }
+}
+
+#[test]
+fn a_thread_budget_keeps_the_statistics_and_the_recency_order() {
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let threaded = |cache: &GroupCache| {
+        Renderer::new(W, H)
+            .with_group_cache(cache.clone())
+            .with_execution_context(&oxideav_core::ExecutionContext::with_threads(4))
+    };
+    // A warm page under four scene bands: the same picture, no miss,
+    // and every instance still counted as a hit.
+    let page = text_page(GLYPHS, true, (0.0, 0.0));
+    let cache = GroupCache::new();
+    let serial = Renderer::new(W, H).with_group_cache(cache.clone());
+    let reference = pixels(&serial, &page);
+    cache.reset_stats();
+    assert!(pixels(&threaded(&cache), &page) == reference);
+    let st = cache.stats();
+    assert_eq!(st.misses, 0);
+    assert!(st.hits >= GLYPHS as u64, "{} hits", st.hits);
+    // A cold page under four bands, too.
+    let cold = GroupCache::new();
+    assert!(pixels(&threaded(&cold), &page) == reference);
+    assert_eq!(cold.stats().entries, cache.stats().entries);
+
+    // Recency: sets A then B fill a 120-entry cache; A is then used by
+    // a threaded frame, so a third set must push out B, not A.
+    let lru = GroupCache::new().with_max_entries(120);
+    let (a, b, c) = (keyed_set(1000), keyed_set(2000), keyed_set(3000));
+    let plain = Renderer::new(W, H).with_group_cache(lru.clone());
+    pixels(&plain, &a);
+    pixels(&plain, &b);
+    assert_eq!(lru.stats().entries, 120);
+    pixels(&threaded(&lru), &a);
+    pixels(&plain, &c);
+    assert_eq!(lru.stats().entries, 120);
+    lru.reset_stats();
+    pixels(&plain, &a);
+    assert_eq!(
+        lru.stats().misses,
+        0,
+        "the set used by the threaded frame was evicted"
+    );
+    lru.reset_stats();
+    pixels(&plain, &b);
+    assert_eq!(
+        lru.stats().misses,
+        60,
+        "the unused set should have been evicted"
+    );
+}

@@ -3,7 +3,8 @@
 //!
 //! See the crate-level docs for the overall pipeline.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use oxideav_core::{
     ExecutionContext, FillRule, Frame, Group, ImageRef, MaskKind, Node, Paint, Path, PathNode,
@@ -12,7 +13,9 @@ use oxideav_core::{
 
 use crate::blend::BlendMode;
 use crate::bounds::{group_content_bounds, node_bounds, path_node_bounds};
-use crate::cache::{BitmapKey, CacheStats, CachedBitmap, GroupCache, RenderSettings, snap_axis};
+use crate::cache::{
+    BitmapKey, CacheStats, CachedBitmap, GroupCache, RenderSettings, Snapshot, snap_axis,
+};
 use crate::composite::{SolidSource, composite_coverage_rect, composite_rect_in, composite_row};
 use crate::fill::{AlphaMask, Coverage, CoverageMode, EdgeTable, rasterize_fill_with_bounds};
 use crate::filter::PreserveAspectRatio;
@@ -153,6 +156,70 @@ pub struct Renderer {
     /// processed in full canvas coordinates, so every row comes out as
     /// in a serial render.
     band: Option<(u32, u32)>,
+    /// On a scene-band worker: the cached bitmaps this worker has
+    /// already looked up during the current frame (shared with the
+    /// window renderers it derives). See [`FrameMemo`].
+    memo: Option<Arc<FrameMemo>>,
+}
+
+/// One scene-band worker's view of the group cache for one frame.
+///
+/// Every worker walks the whole scene, so every keyed group is looked
+/// up once per worker. The shared cache counts, stamps and hands out a
+/// reference-counted bitmap on each lookup — all writes to memory the
+/// other workers are writing too, which made a warm page of text
+/// *slower* with every worker added. A worker therefore reads the
+/// entries that existed when the frame began from a read-only copy
+/// shared by all workers (`snapshot`: no lock, no counter, the bitmap
+/// borrowed rather than reference-counted, and its recency stamp
+/// written once per frame), and keeps the entries created during the
+/// frame in a private map (`bitmaps`) after the first time it has
+/// fetched or rendered one. The hits it serves are added to the shared
+/// statistics when the worker finishes.
+struct FrameMemo {
+    cache: GroupCache,
+    snapshot: Arc<Snapshot>,
+    /// Stamp for the bitmaps this frame uses.
+    tick: u64,
+    inner: Mutex<MemoInner>,
+}
+
+#[derive(Default)]
+struct MemoInner {
+    bitmaps: HashMap<BitmapKey, Arc<CachedBitmap>>,
+    hits: u64,
+}
+
+impl FrameMemo {
+    fn new(cache: &GroupCache, snapshot: &Arc<Snapshot>, tick: u64) -> Arc<Self> {
+        Arc::new(FrameMemo {
+            cache: cache.clone(),
+            snapshot: Arc::clone(snapshot),
+            tick,
+            inner: Mutex::new(MemoInner::default()),
+        })
+    }
+
+    /// Only this worker's thread takes the lock; a panic while it is
+    /// held leaves the map intact.
+    fn lock(&self) -> std::sync::MutexGuard<'_, MemoInner> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+impl Drop for FrameMemo {
+    fn drop(&mut self) {
+        let hits = self.lock().hits;
+        self.cache.add_hits(hits);
+    }
+}
+
+impl std::fmt::Debug for FrameMemo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FrameMemo")
+            .field("bitmaps", &self.lock().bitmaps.len())
+            .finish()
+    }
 }
 
 /// Texture sampling filter for `Node::Image` paints.
@@ -283,6 +350,7 @@ impl Renderer {
             cache_subpixel_grid: DEFAULT_CACHE_SUBPIXEL_GRID,
             cache: GroupCache::new(),
             band: None,
+            memo: None,
         }
     }
 
@@ -447,12 +515,14 @@ impl Renderer {
             return;
         }
         let band_rows = self.height.div_ceil(workers as u32);
+        let (snapshot, tick) = self.cache.snapshot();
         std::thread::scope(|sc| {
             for (i, chunk) in buf.chunks_mut(band_rows as usize * stride).enumerate() {
                 let y0 = i as u32 * band_rows;
                 let mut worker = self.clone();
                 worker.band = Some((y0, (y0 + band_rows).min(self.height)));
                 worker.threads = 1;
+                worker.memo = Some(FrameMemo::new(&self.cache, &snapshot, tick));
                 sc.spawn(move || worker.draw_group(root, transform, 1.0, chunk, stride, None));
             }
         });
@@ -832,18 +902,44 @@ impl Renderer {
             ..*local
         };
         let bkey = BitmapKey::new(key, &snapped, self.render_settings());
+        let opacity = parent_opacity * g.opacity;
+        let blit = |buf: &mut [u8], bitmap: &CachedBitmap| {
+            self.blit(
+                buf,
+                stride,
+                &bitmap.rgba,
+                bitmap.width,
+                bitmap.height,
+                ix + bitmap.dx,
+                iy + bitmap.dy,
+                clip_mask.map(Coverage::as_blit_mask),
+                opacity,
+                None,
+            );
+        };
+        // A band worker's own copy of the answer, if it has met this
+        // key before in this frame.
+        if let Some(memo) = &self.memo {
+            let mut m = memo.lock();
+            let found = match memo.snapshot.get(&bkey) {
+                Some(bitmap) => {
+                    bitmap.touch(memo.tick);
+                    Some(bitmap)
+                }
+                None => m.bitmaps.get(&bkey),
+            };
+            if let Some(bitmap) = found {
+                blit(buf, bitmap);
+                m.hits += 1;
+                return None;
+            }
+        }
         let bitmap = match self.cache.get(&bkey) {
             Some(b) => b,
             None => {
                 let bounds = group_content_bounds(g, &snapped);
                 let bitmap = if bounds.is_empty() {
-                    CachedBitmap {
-                        width: 0,
-                        height: 0,
-                        dx: 0,
-                        dy: 0,
-                        rgba: Vec::new(),
-                    }
+                    CachedBitmap::new(0, 0, 0, 0, Vec::new())
                 } else {
                     let Some(pb) = bounds.pixel_box() else {
                         return Some(direct);
@@ -891,37 +987,29 @@ impl Renderer {
                                 ix + pb.x0,
                                 top + r0 as i64,
                                 clip_mask.map(Coverage::as_blit_mask),
-                                parent_opacity * g.opacity,
+                                opacity,
                                 None,
                             );
                         }
                         return None;
                     }
-                    CachedBitmap {
-                        width: w,
-                        height: h,
-                        dx: pb.x0,
-                        dy: pb.y0,
-                        rgba: self.render_group_window(g, &snapped, pb.x0, pb.y0, w, h, (0, h)),
-                    }
+                    CachedBitmap::new(
+                        w,
+                        h,
+                        pb.x0,
+                        pb.y0,
+                        self.render_group_window(g, &snapped, pb.x0, pb.y0, w, h, (0, h)),
+                    )
                 };
                 let bitmap = Arc::new(bitmap);
                 self.cache.put(bkey, Arc::clone(&bitmap));
                 bitmap
             }
         };
-        self.blit(
-            buf,
-            stride,
-            &bitmap.rgba,
-            bitmap.width,
-            bitmap.height,
-            ix + bitmap.dx,
-            iy + bitmap.dy,
-            clip_mask.map(Coverage::as_blit_mask),
-            parent_opacity * g.opacity,
-            None,
-        );
+        blit(buf, &bitmap);
+        if let Some(memo) = &self.memo {
+            memo.lock().bitmaps.insert(bkey, bitmap);
+        }
         None
     }
 
