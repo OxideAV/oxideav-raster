@@ -1836,29 +1836,90 @@ pub fn gaussian_blur_edge(
     if width == 0 || height == 0 {
         return Vec::new();
     }
-    if std_x == 0.0 && std_y == 0.0 {
+    // One axis of the blur: nothing, a discrete kernel, or three boxes.
+    enum Pass {
+        Skip,
+        Kernel(Vec<f32>),
+        Boxes([BoxKind; 3]),
+    }
+    let plan = |std: f32| -> Pass {
+        if std <= 0.0 {
+            Pass::Skip
+        } else if std < GAUSSIAN_BLUR_BOX_THRESHOLD {
+            let kernel = build_gaussian_kernel(std);
+            // A deviation so small that every off-centre tap is zero is
+            // the identity.
+            if kernel[(kernel.len() - 1) / 2] == 1.0 {
+                Pass::Skip
+            } else {
+                Pass::Kernel(kernel)
+            }
+        } else {
+            Pass::Boxes(box_sizes_for_std(std))
+        }
+    };
+    let (pass_x, pass_y) = (plan(std_x), plan(std_y));
+    if matches!((&pass_x, &pass_y), (Pass::Skip, Pass::Skip)) {
         return src.to_vec();
     }
 
+    // §9.1 of Filter Effects 1: "Unless otherwise stated, all image
+    // filters operate on premultiplied RGBA samples". The buffers of
+    // this crate are straight-alpha, so the colour channels are
+    // weighted by alpha for the duration of the blur: a transparent
+    // pixel then contributes no colour to its neighbours, instead of
+    // pulling them towards whatever its (meaningless) colour bytes
+    // hold. Opaque images are unaffected.
     let mut buf = src.to_vec();
-
-    if std_x > 0.0 {
-        if std_x < GAUSSIAN_BLUR_BOX_THRESHOLD {
-            let kernel = build_gaussian_kernel(std_x);
-            gaussian_separable_pass(&mut buf, w, h, &kernel, Axis::X, edge);
-        } else {
-            box_blur_three_pass(&mut buf, w, h, box_sizes_for_std(std_x), Axis::X, edge);
+    premultiply_bytes(&mut buf);
+    for (pass, axis) in [(pass_x, Axis::X), (pass_y, Axis::Y)] {
+        match pass {
+            Pass::Skip => {}
+            Pass::Kernel(kernel) => gaussian_separable_pass(&mut buf, w, h, &kernel, axis, edge),
+            Pass::Boxes(sizes) => box_blur_three_pass(&mut buf, w, h, sizes, axis, edge),
         }
     }
-    if std_y > 0.0 {
-        if std_y < GAUSSIAN_BLUR_BOX_THRESHOLD {
-            let kernel = build_gaussian_kernel(std_y);
-            gaussian_separable_pass(&mut buf, w, h, &kernel, Axis::Y, edge);
-        } else {
-            box_blur_three_pass(&mut buf, w, h, box_sizes_for_std(std_y), Axis::Y, edge);
-        }
-    }
+    unpremultiply_bytes(&mut buf);
     buf
+}
+
+/// Straight-alpha RGBA bytes → premultiplied, in place (rounding to
+/// nearest; opaque pixels are untouched).
+pub(crate) fn premultiply_bytes(buf: &mut [u8]) {
+    for px in buf.as_chunks_mut::<4>().0 {
+        let a = px[3] as u32;
+        if a != 255 {
+            for c in &mut px[..3] {
+                *c = ((*c as u32 * a + 127) / 255) as u8;
+            }
+        }
+    }
+}
+
+/// Premultiplied RGBA bytes → straight alpha, in place (rounding to
+/// nearest, saturating; a fully transparent pixel becomes transparent
+/// black).
+pub(crate) fn unpremultiply_bytes(buf: &mut [u8]) {
+    for px in buf.as_chunks_mut::<4>().0 {
+        let a = px[3] as u32;
+        if a == 0 {
+            px[..3].fill(0);
+        } else if a != 255 {
+            for c in &mut px[..3] {
+                *c = ((*c as u32 * 255 + a / 2) / a).min(255) as u8;
+            }
+        }
+    }
+}
+
+/// Run `op` on the premultiplied form of the straight-alpha buffer
+/// `src` and return its result as straight alpha.
+pub(crate) fn on_premultiplied(src: &[u8], op: impl FnOnce(&[u8]) -> Vec<u8>) -> Vec<u8> {
+    let mut pre = src.to_vec();
+    premultiply_bytes(&mut pre);
+    let mut out = op(&pre);
+    unpremultiply_bytes(&mut out);
+    out
 }
 
 /// Convenience wrapper that runs [`gaussian_blur`] on a slice of [`Rgba`]
@@ -2537,20 +2598,24 @@ mod gaussian_blur_tests {
 
         let out = gaussian_blur(&img, w, h, 3.0, 3.0);
 
+        // The impulse is white on transparent: what diffuses is its
+        // alpha (the blur runs on premultiplied samples, so the colour
+        // stays white wherever anything is left of it).
         // Diffusion is monotone non-increasing radially (we only check
         // axis-aligned because box-blur cascades aren't exactly
         // rotation-invariant — but along the axes monotonicity holds).
         for d in 1..=4usize {
-            let a = out[(cy * w as usize + cx + d - 1) * 4];
-            let b = out[(cy * w as usize + cx + d) * 4];
+            let a = out[(cy * w as usize + cx + d - 1) * 4 + 3];
+            let b = out[(cy * w as usize + cx + d) * 4 + 3];
             assert!(b <= a, "horizontal monotonicity broken at d={d}: {a}→{b}");
-            let a = out[((cy + d - 1) * w as usize + cx) * 4];
-            let b = out[((cy + d) * w as usize + cx) * 4];
+            let a = out[((cy + d - 1) * w as usize + cx) * 4 + 3];
+            let b = out[((cy + d) * w as usize + cx) * 4 + 3];
             assert!(b <= a, "vertical monotonicity broken at d={d}: {a}→{b}");
         }
+        assert_eq!(&out[off..off + 3], &[255, 255, 255]);
 
         // Centre got dimmer than the original impulse.
-        let centre = out[off];
+        let centre = out[off + 3];
         assert!(
             centre < 255,
             "centre should diffuse below the impulse but got {centre}"
@@ -2754,8 +2819,9 @@ mod gaussian_blur_tests {
     }
 
     /// `edgeMode = none` (the spec initial value) extends the image with
-    /// transparent black. A solid-opaque image must therefore darken
-    /// toward the border under `none`, while `duplicate` preserves a
+    /// transparent black. A solid-opaque image must therefore fade
+    /// toward the border under `none` — its alpha drops while its colour
+    /// stays what it was (premultiplied samples) — while `duplicate` preserves a
     /// solid image exactly. This holds in BOTH the direct-kernel path
     /// (`s < 2.0`) and the box-blur path (`s >= 2.0`).
     #[test]
@@ -2771,9 +2837,13 @@ mod gaussian_blur_tests {
             // Duplicate leaves a solid image untouched.
             assert_eq!(dup, img, "duplicate must preserve solid at s={s}");
             // None: the interior centre is unchanged but the corner
-            // pixel is pulled toward zero by the implicit black border.
-            let centre = ((h / 2 * w + w / 2) * 4) as usize;
-            let corner = 0usize;
+            // pixel is pulled toward zero by the implicit transparent
+            // border (alpha channel; the colour is preserved).
+            let centre = ((h / 2 * w + w / 2) * 4) as usize + 3;
+            let corner = 3usize;
+            // (to within the 8-bit rounding of a quarter-alpha
+            // premultiplied sample)
+            assert!(none[0].abs_diff(200) <= 4, "corner colour {}", none[0]);
             assert!(
                 none[centre] >= 190,
                 "centre should stay near full at s={s}, got {}",
@@ -2781,16 +2851,16 @@ mod gaussian_blur_tests {
             );
             assert!(
                 none[corner] < img[corner],
-                "corner R must darken under none at s={s}: {} !< {}",
+                "corner alpha must drop under none at s={s}: {} !< {}",
                 none[corner],
                 img[corner]
             );
             // Every corner touches two zero borders, so all four darken
             // under `none` (the even-`d` box passes are asymmetric, so we
             // assert darkening rather than exact corner equality).
-            let tr = ((w - 1) * 4) as usize;
-            let bl = ((h - 1) * w * 4) as usize;
-            let br = ((h * w - 1) * 4) as usize;
+            let tr = ((w - 1) * 4) as usize + 3;
+            let bl = ((h - 1) * w * 4) as usize + 3;
+            let br = ((h * w - 1) * 4) as usize + 3;
             assert!(none[tr] < img[tr], "TR corner must darken at s={s}");
             assert!(none[bl] < img[bl], "BL corner must darken at s={s}");
             assert!(none[br] < img[br], "BR corner must darken at s={s}");

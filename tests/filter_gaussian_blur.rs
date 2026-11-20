@@ -269,3 +269,63 @@ fn subnormal_stddev_is_identity_not_nan() {
         assert_eq!(gaussian_blur(&img, 6, 4, 0.0, s), img, "s = {s:e}");
     }
 }
+
+/// Filter Effects 1 §9.1: filters operate on premultiplied samples. A
+/// coloured shape on a transparent background keeps its colour through
+/// the blur — only its alpha spreads. (Blurring the straight-alpha
+/// bytes channel by channel mixed the shape's colour with the colour
+/// bytes of the transparent pixels around it, and the soft edge came
+/// out darkened: an orange edge pixel at one-third alpha read
+/// (85, 13, 0) instead of (255, 40, 0).)
+#[test]
+fn colour_does_not_bleed_from_transparent_pixels() {
+    let (w, h) = (48u32, 24u32);
+    let ink = Rgba::new(255, 40, 0, 255);
+    for garbage in [Rgba::new(0, 0, 0, 0), Rgba::new(0, 255, 255, 0)] {
+        let img = build(w, h, |x, y| {
+            if (16..32).contains(&x) && (6..18).contains(&y) {
+                ink
+            } else {
+                garbage
+            }
+        });
+        for s in [0.7f32, 1.2, 1.9, 2.0, 3.5, 6.0] {
+            let out = gaussian_blur(&img, w, h, s, s);
+            let mut soft = 0;
+            for px in out.as_chunks::<4>().0 {
+                let a = px[3] as u32;
+                if a == 0 {
+                    assert_eq!(&px[..3], &[0, 0, 0], "s = {s}");
+                    continue;
+                }
+                if a < 255 {
+                    soft += 1;
+                }
+                // Straight colour = the shape's colour, to within the
+                // rounding of an 8-bit premultiplied sample at this
+                // alpha (two passes).
+                let tol = (255 / a + 2).min(255) as u8;
+                assert!(
+                    px[0].abs_diff(ink.r) <= tol && px[1].abs_diff(ink.g) <= tol && px[2] <= tol,
+                    "s = {s}: {px:?} is not the ink colour (tolerance {tol})"
+                );
+            }
+            assert!(soft > 20, "s = {s}: no soft edge");
+        }
+    }
+}
+
+/// A translucent but uniform image is a fixed point of the blur away
+/// from the borders (`duplicate` edges: everywhere).
+#[test]
+fn uniform_translucent_colour_is_preserved() {
+    let c = Rgba::new(90, 200, 30, 128);
+    let img = build(20, 20, |_, _| c);
+    for s in [0.8f32, 2.5, 5.0] {
+        let out = gaussian_blur(&img, 20, 20, s, s);
+        for px in out.as_chunks::<4>().0 {
+            assert_eq!(px[3], 128);
+            assert!(px[0].abs_diff(90) <= 1 && px[1].abs_diff(200) <= 1 && px[2].abs_diff(30) <= 1);
+        }
+    }
+}

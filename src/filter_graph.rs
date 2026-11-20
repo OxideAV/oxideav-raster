@@ -589,7 +589,11 @@ impl FilterGraph {
                         &source_graphic,
                         &mut source_alpha,
                     );
-                    morphology(src, width, height, *radius_x, *radius_y, *op)
+                    // §9.1: on premultiplied samples (`morphology`
+                    // itself is channel-wise on whatever it is given).
+                    crate::filter::on_premultiplied(src, |pre| {
+                        morphology(pre, width, height, *radius_x, *radius_y, *op)
+                    })
                 }
                 FilterPrimitive::Offset { dx, dy, sampling } => {
                     let src = resolve_input(
