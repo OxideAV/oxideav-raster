@@ -452,3 +452,44 @@ fn warp_is_purely_local_and_does_not_invent_pixels() {
         );
     }
 }
+
+/// A half-pixel displacement across the edge between an opaque red
+/// region and a transparent one (whose colour bytes are cyan) samples
+/// premultiplied values: the edge pixel is red at half alpha, not a
+/// red-cyan mix (Filter Effects 1 §9.1 and §9.6 — "the input image in
+/// is to remain premultiplied for this filter primitive").
+#[test]
+fn bilinear_displacement_does_not_bleed_transparent_colour() {
+    let (w, h) = (8u32, 3u32);
+    let in1 = build(w, h, |x, _| {
+        if x < 4 {
+            Rgba::new(255, 0, 0, 255)
+        } else {
+            Rgba::new(0, 255, 255, 0)
+        }
+    });
+    // Map channel 255 → displacement of scale · (1 − ½) = +½ px in x;
+    // channel ~128 in y → none.
+    let in2 = build(w, h, |_, _| Rgba::new(255, 128, 0, 255));
+    let out = displacement_map(
+        &in1,
+        &in2,
+        w,
+        h,
+        1.0,
+        DisplacementChannel::R,
+        DisplacementChannel::G,
+        DisplacementSampling::Bilinear,
+    );
+    let row: Vec<&[u8; 4]> = out.as_chunks::<4>().0[w as usize..2 * w as usize]
+        .iter()
+        .collect();
+    let edge: Vec<&&[u8; 4]> = row.iter().filter(|p| p[3] > 0 && p[3] < 255).collect();
+    assert!(!edge.is_empty(), "no partially covered pixel in {row:?}");
+    for px in row.iter().filter(|p| p[3] > 0) {
+        assert!(
+            px[0] >= 253 && px[1] <= 2 && px[2] <= 2,
+            "{px:?} in {row:?}"
+        );
+    }
+}

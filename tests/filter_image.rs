@@ -242,3 +242,37 @@ fn typed_and_byte_paths_agree_on_an_asymmetric_slice() {
         .collect();
     assert_eq!(bytes_out, from_typed);
 }
+
+/// Filter Effects 1 §9.1: samples are premultiplied when they are
+/// averaged. Magnifying an opaque red pixel next to a transparent one
+/// fades the red out — it does not mix it with the transparent pixel's
+/// colour bytes.
+#[test]
+fn bilinear_magnification_does_not_bleed_transparent_colour() {
+    let src = build(2, 1, |x, _| {
+        if x == 0 {
+            Rgba::new(255, 0, 0, 255)
+        } else {
+            Rgba::new(0, 255, 255, 0)
+        }
+    });
+    let par = PreserveAspectRatio {
+        align: AspectRatioAlign::None,
+        meet_or_slice: MeetOrSlice::Meet,
+    };
+    let out = image_source(&src, 2, 1, 16, 1, par, ImageSourceSampling::Bilinear);
+    let mut soft = 0;
+    for px in out.as_chunks::<4>().0 {
+        if px[3] == 0 {
+            continue;
+        }
+        if px[3] < 255 {
+            soft += 1;
+        }
+        assert!(
+            px[0] >= 253 && px[1] <= 2 && px[2] <= 2,
+            "{px:?} is not red"
+        );
+    }
+    assert!(soft >= 3, "no interpolated pixels");
+}

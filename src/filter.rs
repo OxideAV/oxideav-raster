@@ -6232,21 +6232,7 @@ fn offset_bilinear(src: &[u8], width: u32, height: u32, dx: f32, dy: f32) -> Vec
         if !(0..w).contains(&sx) || !(0..h).contains(&sy) {
             return [0.0; 4];
         }
-        let p = ((sy * w + sx) * 4) as usize;
-        // Premultiplied (Filter Effects 1 §9.1): the colour of a
-        // transparent neighbour must not leak into the interpolated
-        // sample. An opaque pixel's channels are unchanged.
-        let a = src[p + 3] as f32;
-        if a == 255.0 {
-            return [src[p] as f32, src[p + 1] as f32, src[p + 2] as f32, a];
-        }
-        let k = a / 255.0;
-        [
-            src[p] as f32 * k,
-            src[p + 1] as f32 * k,
-            src[p + 2] as f32 * k,
-            a,
-        ]
+        premultiplied_sample(&src[((sy * w + sx) * 4) as usize..])
     };
 
     let mut out = Vec::with_capacity((w * h * 4) as usize);
@@ -6269,29 +6255,50 @@ fn offset_bilinear(src: &[u8], width: u32, height: u32, dx: f32, dy: f32) -> Vec
             let c10 = fetch(x1, y0);
             let c01 = fetch(x0, y1);
             let c11 = fetch(x1, y1);
-            let mut px = [0.0f32; 4];
-            for (c, v) in px.iter_mut().enumerate() {
-                let top = c00[c] + (c10[c] - c00[c]) * tx;
-                let bot = c01[c] + (c11[c] - c01[c]) * tx;
-                *v = top + (bot - top) * ty;
-            }
-            // Back to straight alpha (an opaque result needs no
-            // division; a transparent one has no colour).
-            let a = px[3];
-            let un = if a >= 255.0 {
-                1.0
-            } else if a > 0.0 {
-                255.0 / a
-            } else {
-                0.0
-            };
-            for v in &px[..3] {
-                out.push((v * un).clamp(0.0, 255.0).round() as u8);
-            }
-            out.push(a.clamp(0.0, 255.0).round() as u8);
+            out.extend_from_slice(&bilinear_straight([c00, c10, c01, c11], tx, ty));
         }
     }
     out
+}
+
+/// One straight-alpha RGBA pixel (the first four bytes of `px`) as
+/// premultiplied `f32` channels on the 0..255 scale. Filter Effects 1
+/// §9.1: filters work on premultiplied samples — when neighbouring
+/// pixels are averaged, a transparent one must contribute no colour,
+/// whatever its colour bytes hold. An opaque pixel is returned as is.
+#[inline]
+fn premultiplied_sample(px: &[u8]) -> [f32; 4] {
+    let a = px[3] as f32;
+    if a == 255.0 {
+        return [px[0] as f32, px[1] as f32, px[2] as f32, a];
+    }
+    let k = a / 255.0;
+    [px[0] as f32 * k, px[1] as f32 * k, px[2] as f32 * k, a]
+}
+
+/// Bilinear mix of four premultiplied samples `[c00, c10, c01, c11]`
+/// (see [`premultiplied_sample`]) at fractions `(tx, ty)`, returned as
+/// one straight-alpha pixel.
+#[inline]
+fn bilinear_straight(c: [[f32; 4]; 4], tx: f32, ty: f32) -> [u8; 4] {
+    let mut px = [0.0f32; 4];
+    for (k, v) in px.iter_mut().enumerate() {
+        let top = c[0][k] + (c[1][k] - c[0][k]) * tx;
+        let bot = c[2][k] + (c[3][k] - c[2][k]) * tx;
+        *v = top + (bot - top) * ty;
+    }
+    // Back to straight alpha: an opaque result needs no division, a
+    // transparent one has no colour.
+    let a = px[3];
+    let un = if a >= 255.0 {
+        1.0
+    } else if a > 0.0 {
+        255.0 / a
+    } else {
+        0.0
+    };
+    let q = |v: f32| v.clamp(0.0, 255.0).round() as u8;
+    [q(px[0] * un), q(px[1] * un), q(px[2] * un), q(a)]
 }
 
 // ----------------------------------------------------------------------
@@ -7783,13 +7790,7 @@ pub fn displacement_map(
                         if !(0..wi).contains(&fx) || !(0..hi).contains(&fy) {
                             return [0.0; 4];
                         }
-                        let p = ((fy * wi + fx) as usize) * 4;
-                        [
-                            in1[p] as f32,
-                            in1[p + 1] as f32,
-                            in1[p + 2] as f32,
-                            in1[p + 3] as f32,
-                        ]
+                        premultiplied_sample(&in1[((fy * wi + fx) as usize) * 4..])
                     };
                     // Saturating: a displacement large enough that the
                     // `f32 → i64` floor cast saturated must stay out of
@@ -7800,12 +7801,11 @@ pub fn displacement_map(
                     let c10 = fetch(x1, y0);
                     let c01 = fetch(x0, y1);
                     let c11 = fetch(x1, y1);
-                    for c in 0..4 {
-                        let top = c00[c] + (c10[c] - c00[c]) * tx;
-                        let bot = c01[c] + (c11[c] - c01[c]) * tx;
-                        let v = top + (bot - top) * ty;
-                        out[dst + c] = v.clamp(0.0, 255.0).round() as u8;
-                    }
+                    out[dst..dst + 4].copy_from_slice(&bilinear_straight(
+                        [c00, c10, c01, c11],
+                        tx,
+                        ty,
+                    ));
                 }
             }
         }
@@ -11009,24 +11009,17 @@ pub fn image_source(
                         if !(0..wi).contains(&px) || !(0..hi).contains(&py) {
                             return [0.0; 4];
                         }
-                        let p = ((py * wi + px) as usize) * 4;
-                        [
-                            src[p] as f32,
-                            src[p + 1] as f32,
-                            src[p + 2] as f32,
-                            src[p + 3] as f32,
-                        ]
+                        premultiplied_sample(&src[((py * wi + px) as usize) * 4..])
                     };
                     let c00 = fetch(x0, y0);
                     let c10 = fetch(x0 + 1, y0);
                     let c01 = fetch(x0, y0 + 1);
                     let c11 = fetch(x0 + 1, y0 + 1);
-                    for c in 0..4 {
-                        let top = c00[c] + (c10[c] - c00[c]) * fx;
-                        let bot = c01[c] + (c11[c] - c01[c]) * fx;
-                        let val = top + (bot - top) * fy;
-                        out[dst + c] = val.clamp(0.0, 255.0).round() as u8;
-                    }
+                    out[dst..dst + 4].copy_from_slice(&bilinear_straight(
+                        [c00, c10, c01, c11],
+                        fx,
+                        fy,
+                    ));
                 }
             }
         }
