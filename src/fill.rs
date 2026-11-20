@@ -1562,16 +1562,17 @@ fn accumulate_line(
         run[l0] += sh;
         run[b0] -= sh;
     }
-    let d = x1 - x0;
-    if d.abs() < 1e-6 {
+    let d = hi - lo;
+    if d < STEEP_EPS {
+        let mid = 0.5 * (lo + hi);
         for (c, a) in area[b0..b1].iter_mut().enumerate() {
-            *a += sh * (x0 - (b0 + c) as f32).clamp(0.0, 1.0);
+            *a += sh * (mid - (b0 + c) as f32).clamp(0.0, 1.0);
         }
     } else {
         let inv = sh / d;
         for (c, a) in area[b0..b1].iter_mut().enumerate() {
             let cf = (b0 + c) as f32;
-            *a += inv * (clamp_integral(x1, cf) - clamp_integral(x0, cf));
+            *a += inv * clamp_integral_between(lo - cf, hi - cf);
         }
     }
     touched.add(l0, b1.max(b0));
@@ -1727,17 +1728,30 @@ impl Touched {
     }
 }
 
-/// Antiderivative of `clamp(x − c, 0, 1)` in `x` (up to a constant).
-#[inline]
-fn clamp_integral(x: f32, c: f32) -> f32 {
-    let u = x - c;
-    if u <= 0.0 {
-        0.0
-    } else if u >= 1.0 {
-        u - 0.5
-    } else {
-        0.5 * u * u
-    }
+/// A boundary piece whose two ends are closer in `x` than this is
+/// integrated as a vertical line through its midpoint (the error is
+/// below the difference itself).
+const STEEP_EPS: f32 = 1e-6;
+
+/// `∫ clamp(u, 0, 1) du` over `[ua, ub]` (`ua ≤ ub`): the area, in a
+/// unit cell whose left side is `u = 0`, to the left of a line sweeping
+/// from `ua` to `ub`, times `ub − ua`.
+///
+/// Written as a sum of non-negative pieces — the part of the sweep
+/// inside the cell, where the integrand is `u`, and the part to the
+/// right of it, where it is 1 — instead of as a difference of two
+/// antiderivative values. For a steep edge those two values agree to
+/// six or seven digits while their difference is then divided by the
+/// tiny `ub − ua`: in single precision that loses up to a few 8-bit
+/// coverage levels. Here a sweep that stays inside the cell gives
+/// exactly `(ub − ua) · (ua + ub) / 2`.
+#[inline(always)]
+fn clamp_integral_between(ua: f32, ub: f32) -> f32 {
+    let l = ua.max(0.0);
+    let h = ub.min(1.0);
+    let inside = if h > l { (h - l) * (h + l) * 0.5 } else { 0.0 };
+    let beyond = (ub - ua.max(1.0)).max(0.0);
+    inside + beyond
 }
 
 /// Area of column `[c, c + 1)` over a strip of height `h` that lies to
@@ -1745,11 +1759,12 @@ fn clamp_integral(x: f32, c: f32) -> f32 {
 /// (bottom).
 #[inline]
 fn area_left_of_line(xa: f32, xb: f32, c: f32, h: f32) -> f32 {
-    let d = xb - xa;
-    if d.abs() < 1e-6 {
-        h * (xa - c).clamp(0.0, 1.0)
+    let (lo, hi) = if xa <= xb { (xa, xb) } else { (xb, xa) };
+    let d = hi - lo;
+    if d < STEEP_EPS {
+        h * (0.5 * (lo + hi) - c).clamp(0.0, 1.0)
     } else {
-        h * (clamp_integral(xb, c) - clamp_integral(xa, c)) / d
+        h * clamp_integral_between(lo - c, hi - c) / d
     }
 }
 
