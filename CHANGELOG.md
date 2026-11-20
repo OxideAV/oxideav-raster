@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `tests/stroke_extremes.rs`: miter / bevel / round joins from 0.5° to 179.5° with miter limits from 1 to 100 (including 2 % either side of the limit each angle needs), pens from 5 px to 1/50 px hairlines and all three caps, against a point-membership reference on a 512-point lattice per pixel: worst pixel 3.4 of 255 levels (round joins, chord tolerance), 2.3 for hairlines.
+- `tests/coverage_exact.rs::flattening_error_does_not_grow_with_scale`: a cubic magnified 60× to 10⁷× (device extents up to 10⁷ px) against the true curve clipped per pixel — worst boundary pixel 4.8 / 7.1 / 7.9 / 6.7 / 4.8 levels, mean 0.8 – 3.6, i.e. the 1/32 px chord tolerance at every zoom.
 - `tests/text_cache.rs`: a 6 000-glyph page through the keyed-group cache under a counting allocator — a cold frame makes exactly one canvas-scale allocation (the output) and no other above 9 216 bytes; the cache holds at most (glyphs × sub-pixel phases) bitmaps however the page is scrolled; a budget a twelfth of the page's needs stays within its bytes, evicts, and renders the same picture.
 - `Renderer::try_render` / `validate_frame`: a typed `RenderError::NonFiniteGeometry` (naming the offending part of the scene) for callers that want a NaN / ±∞ coordinate, transform, stroke parameter, gradient or opacity rejected at the API boundary instead of rendered with the affected segments dropped.
 

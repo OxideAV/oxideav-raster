@@ -260,3 +260,148 @@ fn steep_edges_at_arbitrary_offsets() {
     }
     println!("steep edges: worst pixel error {worst_seen:.3} levels");
 }
+
+/// Curve flattening at large scales: a cubic magnified until the canvas
+/// shows a 96-pixel stretch of a curve whose device-space extent is up
+/// to 10⁷ pixels. The reference is the true curve — evaluated in `f64`
+/// at 0.1 px steps across the window — clipped per pixel; the
+/// renderer's chords may deviate from it by the flattening tolerance
+/// (1/32 px, i.e. at most 8 of 255 levels where a chord's worst point
+/// sits in a pixel), whatever the zoom.
+#[test]
+fn flattening_error_does_not_grow_with_scale() {
+    use oxideav_core::{
+        Group, Node, Paint, Path, PathNode, Point, Rgba, TimeBase, Transform2D, VectorFrame,
+    };
+    use oxideav_raster::Renderer;
+
+    const N: u32 = 96;
+    // Control points in user space (an S-bend with unequal handles).
+    let ctrl: [P; 4] = [(0.05, 0.9), (0.45, -0.35), (0.6, 1.3), (0.95, 0.15)];
+    let bezier = |t: f64| -> P {
+        let u = 1.0 - t;
+        let b = [u * u * u, 3.0 * u * u * t, 3.0 * u * t * t, t * t * t];
+        (
+            b.iter().zip(&ctrl).map(|(w, c)| w * c.0).sum(),
+            b.iter().zip(&ctrl).map(|(w, c)| w * c.1).sum(),
+        )
+    };
+    let mut report = Vec::new();
+    for (scale, t_mid) in [
+        (60.0f64, 0.5),
+        (2.0e3, 0.21),
+        (5.0e4, 0.37),
+        (1.0e6, 0.64),
+        (1.0e7, 0.83),
+    ] {
+        // Put the curve point at `t_mid` on the canvas centre.
+        let c = bezier(t_mid);
+        let t = Transform2D {
+            a: scale as f32,
+            b: 0.0,
+            c: 0.0,
+            d: scale as f32,
+            e: (N as f64 / 2.0 - scale * c.0) as f32,
+            f: (N as f64 / 2.0 - scale * c.1) as f32,
+        };
+        // The device map exactly as the renderer evaluates it (f32
+        // coefficients, f64 arithmetic).
+        let dev = |p: P| -> P { (t.a as f64 * p.0 + t.e as f64, t.d as f64 * p.1 + t.f as f64) };
+        // The path: the curve, then far away below-left and back, so
+        // that the window sees "everything on one side of the curve".
+        let far: P = (-3.0, 4.0);
+        let pt = |p: P| Point::new(p.0 as f32, p.1 as f32);
+        let mut path = Path::new();
+        path.move_to(pt(ctrl[0]))
+            .cubic_to(pt(ctrl[1]), pt(ctrl[2]), pt(ctrl[3]))
+            .line_to(pt((ctrl[3].0, far.1)))
+            .line_to(pt(far))
+            .close();
+        let frame = VectorFrame {
+            width: N as f32,
+            height: N as f32,
+            view_box: None,
+            root: Group {
+                transform: t,
+                children: vec![Node::Path(PathNode {
+                    path,
+                    fill: Some(Paint::Solid(Rgba::opaque(0, 0, 0))),
+                    stroke: None,
+                    fill_rule: FillRule::NonZero,
+                })],
+                ..Group::default()
+            },
+            pts: None,
+            time_base: TimeBase::new(1, 1),
+        };
+        let out = Renderer::new(N, N).render(&frame);
+        let alpha: Vec<u8> = out.planes[0].data.chunks(4).map(|p| p[3]).collect();
+
+        // Reference polygon: the true curve sampled densely where it is
+        // near the window, coarsely elsewhere, closed the same way. The
+        // control points are the f32 values the path holds.
+        let ctrl32: Vec<P> = ctrl
+            .iter()
+            .map(|p| (p.0 as f32 as f64, p.1 as f32 as f64))
+            .collect();
+        let bez32 = |t: f64| -> P {
+            let u = 1.0 - t;
+            let b = [u * u * u, 3.0 * u * u * t, 3.0 * u * t * t, t * t * t];
+            (
+                b.iter().zip(&ctrl32).map(|(w, c)| w * c.0).sum(),
+                b.iter().zip(&ctrl32).map(|(w, c)| w * c.1).sum(),
+            )
+        };
+        let near =
+            |p: P| p.0 > -200.0 && p.0 < N as f64 + 200.0 && p.1 > -200.0 && p.1 < N as f64 + 200.0;
+        let mut poly: Vec<P> = Vec::new();
+        let coarse = 4000;
+        for k in 0..coarse {
+            let (ta, tb) = (k as f64 / coarse as f64, (k + 1) as f64 / coarse as f64);
+            let (pa, pb) = (dev(bez32(ta)), dev(bez32(tb)));
+            poly.push(pa);
+            if near(pa) || near(pb) {
+                let len = ((pb.0 - pa.0).powi(2) + (pb.1 - pa.1).powi(2)).sqrt();
+                let fine = ((len / 0.1).ceil() as usize).clamp(1, 400_000);
+                for j in 1..fine {
+                    poly.push(dev(bez32(ta + (tb - ta) * j as f64 / fine as f64)));
+                }
+            }
+        }
+        poly.push(dev(bez32(1.0)));
+        poly.push(dev((ctrl32[3].0, far.1 as f32 as f64)));
+        poly.push(dev((far.0 as f32 as f64, far.1 as f32 as f64)));
+        // Only the part of the polygon near the window matters for the
+        // clip; keep the far vertices (they close it) and clip.
+        let (mut worst, mut sum_abs, mut edge_px) = (0.0f64, 0.0f64, 0usize);
+        for y in 0..N {
+            // Clip to the pixel row once, then to each of its columns.
+            let row = clip_half_plane(&poly, 0.0, -1.0, -(y as f64));
+            let row = clip_half_plane(&row, 0.0, 1.0, y as f64 + 1.0);
+            for x in 0..N {
+                let cell = clip_half_plane(&row, -1.0, 0.0, -(x as f64));
+                let cell = clip_half_plane(&cell, 1.0, 0.0, x as f64 + 1.0);
+                let want = signed_area(&cell).abs() * 255.0;
+                let got = alpha[(y * N + x) as usize] as f64;
+                let e = (got - want).abs();
+                worst = worst.max(e);
+                if want > 0.5 && want < 254.5 {
+                    sum_abs += e;
+                    edge_px += 1;
+                }
+            }
+        }
+        assert!(edge_px > 60, "scale {scale:e}: the curve misses the window");
+        let mean = sum_abs / edge_px as f64;
+        report.push(format!("{scale:e}: worst {worst:.2}, mean {mean:.2}"));
+        assert!(
+            // A chord between two points of a smooth curve deviates
+            // parabolically: two thirds of its worst deviation on
+            // average, so the mean over boundary pixels can approach
+            // 2/3 · 255/32 ≈ 5.3 levels where chords span many pixels.
+            worst <= 8.5 && mean <= 5.8,
+            "scale {scale:e}: boundary pixels off by up to {worst:.2} levels (mean {mean:.2})"
+        );
+    }
+    println!("flattening error by scale — {}", report.join("; "));
+}
