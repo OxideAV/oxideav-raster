@@ -784,7 +784,9 @@ struct ScanScratch {
     area: Vec<f32>,
     run: Vec<f32>,
     out_row: Vec<u8>,
-    active: Vec<(u32, u32)>,
+    live: Vec<u32>,
+    pending: Vec<u32>,
+    cursor: Vec<u32>,
     events: Vec<f32>,
     sc: Vec<StripChain>,
     sub: Vec<f32>,
@@ -838,6 +840,8 @@ struct StripChain {
     seg: u32,
     /// One past the chain's last vertex.
     end: u32,
+    /// Index of the chain (the tie-break of the strip order).
+    chain: u32,
 }
 
 impl EdgeTable {
@@ -1105,9 +1109,14 @@ impl EdgeTable {
             mut area,
             mut run,
             mut out_row,
-            // Active chains: (chain index, cursor = vertex index of the
-            // segment containing the row top).
-            mut active,
+            // Chains crossing the current strip, in the left-to-right
+            // order of the last strip integrated.
+            mut live,
+            // Chains whose top lies inside the current row, by top.
+            mut pending,
+            // Per chain: vertex index of the segment containing the row
+            // top.
+            mut cursor,
             mut events,
             mut sc,
             mut sub,
@@ -1123,27 +1132,40 @@ impl EdgeTable {
         if out_row.len() < w {
             out_row.resize(w, 0);
         }
-        active.clear();
+        live.clear();
+        pending.clear();
+        cursor.clear();
+        cursor.resize(chains.len(), 0);
         let mut next_chain = 0usize;
 
         for py in rows.start..height {
             let row_top = py as f32;
             let row_bot = row_top + 1.0;
 
+            live.retain(|&ci| chains[ci as usize].y_bot > row_top);
+            pending.clear();
             while next_chain < chains.len() && chains[next_chain].y_top < row_bot {
-                active.push((next_chain as u32, chains[next_chain].start));
+                let c = &chains[next_chain];
+                if c.y_bot > row_top {
+                    cursor[next_chain] = c.start;
+                    if c.y_top <= row_top {
+                        live.push(next_chain as u32);
+                    } else {
+                        pending.push(next_chain as u32);
+                    }
+                }
                 next_chain += 1;
             }
-            active.retain(|&(ci, _)| chains[ci as usize].y_bot > row_top);
-            if active.is_empty() {
+            if live.is_empty() && pending.is_empty() {
                 if next_chain >= chains.len() {
                     break;
                 }
                 continue;
             }
             // Advance cursors past segments ending at or above the row top.
-            for (ci, cur) in &mut active {
-                let end = chains[*ci as usize].end;
+            for &ci in &live {
+                let end = chains[ci as usize].end;
+                let cur = &mut cursor[ci as usize];
                 while *cur + 2 < end && self.pts[*cur as usize + 1].1 <= row_top {
                     *cur += 1;
                 }
@@ -1152,7 +1174,7 @@ impl EdgeTable {
             events.clear();
             events.push(row_top);
             events.push(row_bot);
-            for &(ci, _) in &active {
+            for &ci in live.iter().chain(&pending) {
                 let c = &chains[ci as usize];
                 if c.y_top > row_top && c.y_top < row_bot {
                     events.push(c.y_top);
@@ -1168,21 +1190,29 @@ impl EdgeTable {
             spans.clear();
             let mut splits = 0usize;
             let mut ei = 0usize;
+            // How many of `pending` have joined `live`.
+            let mut joined = 0usize;
             while ei + 1 < events.len() {
                 let ya = events[ei];
                 let yb = events[ei + 1];
                 ei += 1;
+                // Chains that start at this height join the walk (they
+                // are placed by the sort below).
+                while joined < pending.len() && chains[pending[joined] as usize].y_top <= ya {
+                    live.push(pending[joined]);
+                    joined += 1;
+                }
                 let h = yb - ya;
                 if h <= 1e-7 {
                     continue;
                 }
+                // Chains that end before the strip's bottom are done for
+                // good (strip bottoms only move down).
+                live.retain(|&ci| chains[ci as usize].y_bot >= yb);
                 sc.clear();
-                for &(ci, cur) in &active {
+                for &ci in &live {
                     let c = &chains[ci as usize];
-                    if !(c.y_top <= ya && c.y_bot >= yb) {
-                        continue;
-                    }
-                    let mut i = cur as usize;
+                    let mut i = cursor[ci as usize] as usize;
                     while i + 2 < c.end as usize && self.pts[i + 1].1 <= ya {
                         i += 1;
                     }
@@ -1206,12 +1236,19 @@ impl EdgeTable {
                         winding: c.winding,
                         seg: seg as u32,
                         end: c.end,
+                        chain: ci,
                     });
                 }
                 if sc.len() < 2 {
                     continue;
                 }
-                sort_strip(&mut sc);
+                sort_chains(&mut sc);
+                // Keep the walk in this strip's left-to-right order: the
+                // next strip (and the next row) then starts from an
+                // almost sorted list.
+                for (slot, c) in live.iter_mut().zip(&sc) {
+                    *slot = c.chain;
+                }
                 // Independent clusters: consecutive chains separated by
                 // an x gap that is outside the shape under the fill rule
                 // (winding zero, or even for even-odd — the parity walk
@@ -1344,6 +1381,9 @@ impl EdgeTable {
                 }
             }
 
+            // (A chain starting within the last, vanishing strip.)
+            live.extend_from_slice(&pending[joined..]);
+
             // Every cluster starts and ends outside the shape, so the
             // coverage is zero between the column ranges the clusters
             // wrote: resolve and emit each range on its own (ranges
@@ -1397,7 +1437,9 @@ impl EdgeTable {
                 area,
                 run,
                 out_row,
-                active,
+                live,
+                pending,
+                cursor,
                 events,
                 sc,
                 sub,
@@ -1627,14 +1669,71 @@ impl StripOrder for StripEdge {
     }
 }
 
-impl StripOrder for StripChain {
-    #[inline(always)]
-    fn top_x(&self) -> f32 {
-        self.xa
+/// Sort a strip's chains left to right.
+///
+/// The result is a function of the *set* of chains only — top `x`
+/// ascending with ties in chain order, then every maximal run of
+/// neighbours whose top `x` values chain within [`COINCIDENT_EPS`]
+/// stably re-sorted by bottom `x` — so a row's coverage does not depend
+/// on the order the scan happened to hold the chains in (which is the
+/// previous strip's, and differs between a full scan and one starting
+/// at this row).
+///
+/// The input is that previous order, i.e. almost sorted: a straight
+/// insertion sort is linear on it. When it turns out not to be (the
+/// insertion's move budget runs out), the rest is done by the standard
+/// library's sort under the same total order.
+#[inline]
+fn sort_chains(sc: &mut [StripChain]) {
+    use std::cmp::Ordering;
+    // `+ 0.0` folds −0.0 onto +0.0, making `total_cmp` agree with `<`
+    // on everything but NaN, where it stays a total order.
+    let order = |a: &StripChain, b: &StripChain| -> Ordering {
+        (a.xa + 0.0)
+            .total_cmp(&(b.xa + 0.0))
+            .then(a.chain.cmp(&b.chain))
+    };
+    let n = sc.len();
+    let mut budget = 8 * n + 64;
+    let mut sorted = true;
+    'insertion: for i in 1..n {
+        let mut j = i;
+        while j > 0 && order(&sc[j], &sc[j - 1]) == Ordering::Less {
+            if budget == 0 {
+                sorted = false;
+                break 'insertion;
+            }
+            budget -= 1;
+            sc.swap(j, j - 1);
+            j -= 1;
+        }
     }
-    #[inline(always)]
-    fn bot_x(&self) -> f32 {
-        self.xb
+    if !sorted {
+        sc.sort_unstable_by(order);
+    }
+    let mut i = 0;
+    while i < n {
+        let mut j = i + 1;
+        while j < n && sc[j].xa - sc[j - 1].xa <= COINCIDENT_EPS {
+            j += 1;
+        }
+        if j - i > 1 {
+            // Stable in both forms, so equal bottoms keep the order of
+            // the first pass.
+            let run = &mut sc[i..j];
+            if run.len() <= 24 {
+                for a in 1..run.len() {
+                    let mut b = a;
+                    while b > 0 && run[b].xb < run[b - 1].xb {
+                        run.swap(b, b - 1);
+                        b -= 1;
+                    }
+                }
+            } else {
+                run.sort_by(|p, q| p.xb.total_cmp(&q.xb));
+            }
+        }
+        i = j;
     }
 }
 
