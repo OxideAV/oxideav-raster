@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.6](https://github.com/OxideAV/oxideav-raster/compare/v0.1.5...v0.1.6) - 2026-11-20
+
+### Added
+
+- *(gradient)* conic (sweep) gradients through the gradient-paint route
+
+### Fixed
+
+- *(renderer)* group, soft-mask and cached-bitmap blits follow the compositing space
+- *(filter)* displacement-map and image-source bilinear samplers work on premultiplied samples
+- *(filter)* bilinear feOffset interpolates premultiplied samples
+- *(cache)* lookups no longer serialise scene-band workers
+- *(cache)* every budget-limited keyed group uses the cached bitmap's frame
+- *(filter)* Gaussian blur and graph morphology run on premultiplied samples
+- *(fill)* cancellation-free boundary-cell area for steep edges
+- *(cache)* uncacheable keyed groups render in the cached bitmap's frame
+- *(filter)* Gaussian kernel for a deviation whose square underflows is the identity
+- *(stroke)* shared chord budget for round joins and caps, merged round dashes drawn solid
+- total edge order in the supersampled kernel, explicit chord budgets, typed scene validation
+
+### Other
+
+- resolve the rustdoc link warnings; Send + Sync contract test
+- r491 throughput tables, accuracy table, text-page cache verification
+- stroke joins and hairlines at their extremes, flattening accuracy up to 10^7x
+- *(fill)* strip chains stay in left-to-right order across strips and rows
+- recycle scan, edge-table and contour buffers through per-thread scratch sets
+- *(composite)* per-row blend dispatch, shared blit kernel, exact colour over transparent
+- *(fill)* deliver each row as spans of covered pixels, skip the gaps
+- *(parallel)* render_node shape bands against serial; trim the scene-band matrix
+- *(renderer)* soft-mask windows render only the rows their scene band owns
+- *(renderer)* scene-band parallelism under ExecutionContext, byte-identical at every budget
+- *(cache)* cold-cache cost bound; GroupCache Debug prints statistics, not pixels
+- *(clip)* windowed clip masks, nested clips intersect over their overlap
+- *(cache)* bounded group offscreens, translation-independent keys, shareable byte-budgeted cache
+
 ### Added
 
 - `ConicGradient` (stops laid out by angle around a centre: `t = ((θ − start_angle) mod 2π) / sweep`, a partial `sweep` completed by the spread method) with `eval_conic_gradient` / `_in` / `_lut`, `GradientGeometry::Conic` and `GradientPaint::conic`, painted through `fill_path_with_gradient` / `stroke_path_with_gradient` with `gradientUnits` and `gradientTransform` like the other paint servers. `oxideav-core`'s `Paint` has no such variant, so scenes cannot carry it yet.
