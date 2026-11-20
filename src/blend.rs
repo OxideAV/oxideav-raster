@@ -388,7 +388,7 @@ fn set_sat(c: [f32; 3], s: f32) -> [f32; 3] {
 ///
 /// The fast `BlendMode::Normal` case is **not** dispatched here — the
 /// caller should prefer the existing source-over path in
-/// [`crate::composite`] which avoids the per-pixel f32 round-trip. This
+/// `composite` module which avoids the per-pixel f32 round-trip. This
 /// function is intended for the modes that genuinely depend on `Cb`.
 pub fn blend_over(cb: Rgba, cs: Rgba, mode: BlendMode) -> Rgba {
     blend_over_with(cb, cs, |b, s| mode.blend_rgb(b, s))

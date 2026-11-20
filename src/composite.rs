@@ -67,7 +67,7 @@ pub fn composite_rgba_premultiplied(
 ///
 /// For [`BlendMode::Normal`] this is the same fast source-over path as
 /// [`composite_rgba_premultiplied`]; non-normal modes route through the
-/// per-pixel `blend_over` evaluation in [`crate::blend`]. Otherwise the
+/// per-pixel [`blend_over`](crate::blend_over) evaluation. Otherwise the
 /// arguments match [`composite_rgba_premultiplied`].
 pub fn composite_rgba_premultiplied_blend(
     dst: &mut [u8],

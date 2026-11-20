@@ -68,7 +68,7 @@ use oxideav_core::{Node, Rgba, Transform2D, VideoFrame, ViewBox};
 
 /// A tiled paint server (SVG `<pattern>`).
 ///
-/// See the [module docs](self) for coordinate-system semantics. Use the
+/// See the pattern module docs for coordinate-system semantics. Use the
 /// builder methods to attach content and a `patternTransform`, then
 /// paint with [`Renderer::fill_path_with_pattern`] /
 /// [`Renderer::stroke_path_with_pattern`].

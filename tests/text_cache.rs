@@ -488,3 +488,12 @@ fn a_thread_budget_keeps_the_statistics_and_the_recency_order() {
         "the unused set should have been evicted"
     );
 }
+
+/// The renderer and the cache handle can be moved to and shared between
+/// threads (auto traits are part of the public contract).
+#[test]
+fn renderer_and_cache_are_send_and_sync() {
+    fn check<T: Send + Sync + Clone>() {}
+    check::<Renderer>();
+    check::<GroupCache>();
+}

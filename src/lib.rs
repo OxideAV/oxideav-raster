@@ -216,7 +216,7 @@
 //!   [`Renderer::stroke_path_with_pattern`].
 //! * filter primitive subregion clip (Filter Effects Module Level 1
 //!   §9.4) — every `fe*` primitive's `x` / `y` / `width` / `height`
-//!   "act[s] as a hard clip clipping rectangle on the filter primitive
+//!   "act\[s\] as a hard clip clipping rectangle on the filter primitive
 //!   result"; [`clip_to_subregion`] (with the typed-pixel wrapper
 //!   [`clip_to_subregion_pixels`]) clears every pixel outside the
 //!   resolved [`Subregion`] to transparent black, keeping any pixel that

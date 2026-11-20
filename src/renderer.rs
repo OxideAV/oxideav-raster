@@ -94,7 +94,7 @@ pub struct Renderer {
     /// `preserveAspectRatio` is not specified, then the effect is as if
     /// a value of xMidYMid meet were specified"): the viewBox is scaled
     /// uniformly to fit entirely within the canvas (letterboxed) and
-    /// centred. Set to [`AspectRatioAlign::None`] for the legacy
+    /// centred. Set to [`AspectRatioAlign::None`](crate::AspectRatioAlign::None) for the legacy
     /// non-uniform stretch (viewBox bounding box mapped exactly onto the
     /// canvas rectangle), or to a `slice` value to cover the whole
     /// canvas with overflow cropped at the canvas edge (§8.6

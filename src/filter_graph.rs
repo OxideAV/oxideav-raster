@@ -94,7 +94,7 @@ pub enum FilterInput {
 /// One filter primitive plus its primitive-specific parameters.
 ///
 /// Each variant wraps the parameter set of the corresponding
-/// standalone function in [`crate::filter`]; the *inputs* it consumes
+/// standalone function in the `filter` module; the *inputs* it consumes
 /// live on the enclosing [`FilterStep`] (`input` for `in`, `input2`
 /// for `in2`), except [`Merge`](Self::Merge), whose per-`feMergeNode`
 /// input list is part of the primitive itself.

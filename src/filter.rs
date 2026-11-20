@@ -5601,7 +5601,7 @@ fn turb_quantise(value: f64, fractal_sum: bool) -> u8 {
 /// random numbers relative to the last generated pseudo random number
 /// and computes the lattice points for G, and so on for B and A." — the
 /// four channels share one LCG advance chain through
-/// [`TurbLattice::init`], which iterates `k = 0, 1, 2, 3`).
+/// `TurbLattice::init`, which iterates `k = 0, 1, 2, 3`).
 ///
 /// The implementation maps a sample at output pixel `(px, py)` to the
 /// §15.24 `point[]` argument as `(px as f64, py as f64)`; the §15.24 C
@@ -7635,7 +7635,7 @@ impl DisplacementChannel {
 /// Sample-reconstruction policy used when [`displacement_map`] reads
 /// from `in1` at the warped source coordinate.
 ///
-/// The §15.15 note "high quality viewers [should] apply an interpolent
+/// The §15.15 note "high quality viewers \[should\] apply an interpolent
 /// on the surrounding pixels, for example bilinear or bicubic, rather
 /// than simply selecting the nearest source pixel" is the spec's
 /// permission to choose between integer-rounded sampling and a

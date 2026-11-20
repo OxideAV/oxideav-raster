@@ -89,7 +89,7 @@ pub struct StopsLut {
 impl StopsLut {
     /// Build a LUT for the given stops in the requested interpolation
     /// space. `stops` must be sorted by `offset` ascending (the same
-    /// contract the underlying [`sample_stops_in`] enforces).
+    /// contract the underlying `sample_stops_in` enforces).
     ///
     /// Empty stops produce an all-transparent LUT.
     pub fn build(stops: &[oxideav_core::GradientStop], space: InterpolationSpace) -> Self {
@@ -106,7 +106,7 @@ impl StopsLut {
 
     /// Sample the LUT at `t ∈ [0, 1]`. Values outside the range are
     /// clamped (`Pad`-equivalent at the LUT boundary — the caller is
-    /// expected to have applied [`apply_spread`] before this call,
+    /// expected to have applied `apply_spread` before this call,
     /// which already normalises `t` into `[0, 1]`).
     ///
     /// The lookup **linearly interpolates between the two bracketing
@@ -114,7 +114,7 @@ impl StopsLut {
     /// nearest-index LUT quantises the gradient into 256 visible colour
     /// steps; over a large fill that bands. Blending the two neighbours
     /// by the sub-entry fraction recovers a continuous ramp, matching the
-    /// exact (non-LUT) [`sample_stops_in`] path to within rounding while
+    /// exact (non-LUT) `sample_stops_in` path to within rounding while
     /// keeping the LUT's per-pixel cost (one extra lerp, no stop scan).
     /// The interpolation is component-wise in the LUT's stored space,
     /// which is already the post-interpolation-space byte value, so no
@@ -448,7 +448,7 @@ fn focal_radial_t(g: &FocalRadialGradient, px: f32, py: f32) -> Option<f32> {
 
 /// Sample a two-circle radial gradient at pixel `(px, py)` in the sRGB
 /// interpolation space. See [`FocalRadialGradient`] for the geometry and
-/// [`focal_radial_t`] for the parameter solve. Pixels with no usable
+/// `focal_radial_t` for the parameter solve. Pixels with no usable
 /// iso-contour return the gradient's transparent default (or, under a
 /// non-`Pad` spread, fall back to the nearest meaningful parameter).
 pub fn eval_focal_radial_gradient(g: &FocalRadialGradient, px: f32, py: f32) -> Rgba {
