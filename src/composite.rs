@@ -278,7 +278,15 @@ fn decode_table() -> &'static [f32; 256] {
 
 /// Linear-light source-over of `src` with folded alpha `sa ∈ 1..=254`.
 #[inline]
-fn over_px_linear(px: &mut [u8], src: Rgba, sa: u32) {
+pub(crate) fn over_px_linear(px: &mut [u8], src: Rgba, sa: u32) {
+    if px[3] == 0 {
+        // Nothing underneath: the source itself (as in `over_px`).
+        px[0] = src.r;
+        px[1] = src.g;
+        px[2] = src.b;
+        px[3] = sa as u8;
+        return;
+    }
     let dec = decode_table();
     let enc = crate::gradient_row::encode_table();
     let a_s = sa as f32 / 255.0;

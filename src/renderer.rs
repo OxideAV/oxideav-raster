@@ -125,8 +125,10 @@ pub struct Renderer {
     /// values. [`InterpolationSpace::LinearRgb`] mixes linear light
     /// instead: edges keep their perceived weight (black text on white
     /// no longer looks heavier than white on black) and translucent
-    /// colours blend like light. Group-opacity, soft-mask and cached
-    /// bitmap blits and non-normal blend modes stay in sRGB.
+    /// colours blend like light — including when a group's offscreen
+    /// image, a soft-masked subtree or a cached bitmap is laid over the
+    /// canvas, so a keyed glyph and the same glyph without a key have
+    /// the same weight. Non-normal blend modes stay in sRGB.
     pub compositing_space: InterpolationSpace,
     /// Worker budget for internal parallelism (row bands of large
     /// shapes). `1` (the default) renders serially; set it through
@@ -569,6 +571,7 @@ impl Renderer {
             mask.map(|(m, mx, my)| (m, mx, my - b0 as i64)),
             extra_alpha,
             src_rect,
+            matches!(self.compositing_space, InterpolationSpace::LinearRgb),
         );
     }
 
@@ -2410,6 +2413,7 @@ fn blit_rgba_at(
     mask: Option<(&AlphaMask, i64, i64)>,
     extra_alpha: f32,
     src_rect: Option<(u32, u32, u32, u32)>,
+    linear: bool,
 ) {
     if src_width == 0 || src_height == 0 {
         return;
@@ -2447,7 +2451,7 @@ fn blit_rgba_at(
                 .iter()
                 .zip(dst_row.as_chunks_mut::<4>().0)
             {
-                over_pixel(s, d, 255, extra_q);
+                over_pixel(s, d, 255, extra_q, linear);
             }
             continue;
         };
@@ -2475,7 +2479,7 @@ fn blit_rgba_at(
             .zip(dst_row[k_lo * 4..k_hi * 4].as_chunks_mut::<4>().0)
             .zip(cov_row)
         {
-            over_pixel(s, d, cov as u32, extra_q);
+            over_pixel(s, d, cov as u32, extra_q, linear);
         }
     }
 }
@@ -2483,9 +2487,10 @@ fn blit_rgba_at(
 /// Composite one straight-alpha source pixel over one straight-alpha
 /// destination pixel with the source alpha scaled by `cov / 255` and
 /// `extra_q / 255` (premultiplied source-over, rounded to nearest at
-/// each step).
+/// each step), mixing linear light instead of encoded values when
+/// `linear`.
 #[inline(always)]
-fn over_pixel(src: &[u8; 4], dst: &mut [u8; 4], cov: u32, extra_q: u32) {
+fn over_pixel(src: &[u8; 4], dst: &mut [u8; 4], cov: u32, extra_q: u32, linear: bool) {
     let sa_raw = src[3] as u32;
     if sa_raw == 0 || cov == 0 {
         return;
@@ -2502,6 +2507,10 @@ fn over_pixel(src: &[u8; 4], dst: &mut [u8; 4], cov: u32, extra_q: u32) {
         // un-premultiply divides by 255 giving the source bytes back
         // verbatim).
         *dst = [src[0], src[1], src[2], 255];
+        return;
+    }
+    if linear {
+        crate::composite::over_px_linear(dst, Rgba::new(src[0], src[1], src[2], 255), sa);
         return;
     }
     // Re-premultiply the source with the *combined* alpha and
@@ -3418,7 +3427,9 @@ mod tests {
         // lower-right 2×3 lands, at the top-left corner.
         let src = [9u8, 8, 7, 255].repeat(16);
         let mut dst = vec![0u8; 6 * 6 * 4];
-        blit_rgba_at(&mut dst, 24, 6, 6, &src, 4, 4, -2, -1, None, 1.0, None);
+        blit_rgba_at(
+            &mut dst, 24, 6, 6, &src, 4, 4, -2, -1, None, 1.0, None, false,
+        );
         let painted: Vec<usize> = (0..36).filter(|i| dst[i * 4 + 3] != 0).collect();
         assert_eq!(painted, vec![0, 1, 6, 7, 12, 13]);
         // A 2×2 mask window at (3, 3) lets through only the pixels it
@@ -3449,6 +3460,7 @@ mod tests {
                 Some((&mask, mx, my)),
                 1.0,
                 None,
+                false,
             );
             let painted: Vec<usize> = (0..36).filter(|i| dst[i * 4 + 3] != 0).collect();
             assert_eq!(painted, want, "mask at ({mx}, {my})");
@@ -3456,7 +3468,9 @@ mod tests {
         // Entirely off the destination: nothing happens.
         let mut dst = vec![0u8; 6 * 6 * 4];
         for (ox, oy) in [(-4, 0), (6, 0), (0, -4), (0, 6), (i64::MIN / 4, 0)] {
-            blit_rgba_at(&mut dst, 24, 6, 6, &src, 4, 4, ox, oy, None, 1.0, None);
+            blit_rgba_at(
+                &mut dst, 24, 6, 6, &src, 4, 4, ox, oy, None, 1.0, None, false,
+            );
         }
         assert!(dst.iter().all(|&b| b == 0));
     }
@@ -3466,7 +3480,7 @@ mod tests {
         // 8×8 destination, 2×2 source of opaque red, blit at (3, 4).
         let mut dst = vec![0u8; 8 * 8 * 4];
         let src: Vec<u8> = (0..2 * 2).flat_map(|_| [255, 0, 0, 255]).collect();
-        blit_rgba_at(&mut dst, 32, 8, 8, &src, 2, 2, 3, 4, None, 1.0, None);
+        blit_rgba_at(&mut dst, 32, 8, 8, &src, 2, 2, 3, 4, None, 1.0, None, false);
         // Pixel (3, 4) should be red.
         let i = 4 * 32 + 3 * 4;
         assert_eq!(&dst[i..i + 4], &[255, 0, 0, 255]);
@@ -3486,7 +3500,7 @@ mod tests {
         // top-left 2×2 of the source should land on dst.
         let mut dst = vec![0u8; 4 * 4 * 4];
         let src: Vec<u8> = (0..4 * 4).flat_map(|_| [10, 20, 30, 255]).collect();
-        blit_rgba_at(&mut dst, 16, 4, 4, &src, 4, 4, 2, 2, None, 1.0, None);
+        blit_rgba_at(&mut dst, 16, 4, 4, &src, 4, 4, 2, 2, None, 1.0, None, false);
         // Pixel (2, 2): painted.
         let i = 2 * 16 + 2 * 4;
         assert_eq!(&dst[i..i + 4], &[10, 20, 30, 255]);

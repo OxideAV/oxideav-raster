@@ -180,3 +180,64 @@ fn hairlines_keep_their_area_at_any_offset() {
         }
     }
 }
+
+/// Linear-light compositing applies to isolated groups too: a group's
+/// offscreen image, a cached bitmap and a soft-masked subtree are laid
+/// over the canvas by mixing light, so the same glyph has the same
+/// weight whether it is drawn directly, through a translucent group or
+/// from the keyed-group cache. (The blits used to mix encoded values:
+/// a half-covered black-on-white edge pixel then read 128 in a keyed
+/// glyph and 188 in an unkeyed one.)
+#[test]
+fn linear_light_compositing_covers_group_and_cache_blits() {
+    let ink = |key: Option<u64>, opacity: f32| {
+        let mut p = Path::new();
+        // A slanted bar: plenty of partially covered pixels.
+        p.move_to(Point::new(6.0, 4.0))
+            .line_to(Point::new(14.5, 4.0))
+            .line_to(Point::new(27.5, 28.0))
+            .line_to(Point::new(19.0, 28.0))
+            .close();
+        Group {
+            children: vec![Node::Group(Group {
+                cache_key: key,
+                opacity,
+                children: vec![Node::Path(PathNode {
+                    path: p,
+                    fill: Some(Paint::Solid(Rgba::opaque(0, 0, 0))),
+                    stroke: None,
+                    fill_rule: FillRule::NonZero,
+                })],
+                ..Group::default()
+            })],
+            ..Group::default()
+        }
+    };
+    let render = |root: Group, space: InterpolationSpace| {
+        let mut r = Renderer::new(32, 32).with_compositing_space(space);
+        r.background = Rgba::opaque(255, 255, 255);
+        r.render(&frame(32, 32, root.children))
+            .planes
+            .remove(0)
+            .data
+    };
+    let worst = |a: &[u8], b: &[u8]| a.iter().zip(b).map(|(x, y)| x.abs_diff(*y)).max().unwrap();
+    for space in [InterpolationSpace::LinearRgb, InterpolationSpace::Srgb] {
+        let direct = render(ink(None, 1.0), space);
+        let keyed = render(ink(Some(7), 1.0), space);
+        assert!(
+            worst(&direct, &keyed) <= 1,
+            "{space:?}: keyed differs from direct by {}",
+            worst(&direct, &keyed)
+        );
+    }
+    // The two spaces do differ on the edge pixels, keyed or not.
+    let lin = render(ink(Some(7), 1.0), InterpolationSpace::LinearRgb);
+    let srgb = render(ink(Some(7), 1.0), InterpolationSpace::Srgb);
+    assert!(worst(&lin, &srgb) > 40);
+    // A translucent group over white in linear light: 50 % black is
+    // half the light, sRGB 188 — not 128.
+    let half = render(ink(None, 128.0 / 255.0), InterpolationSpace::LinearRgb);
+    let inside = ((16 * 32 + 17) * 4) as usize;
+    assert!(half[inside].abs_diff(188) <= 2, "interior {}", half[inside]);
+}
